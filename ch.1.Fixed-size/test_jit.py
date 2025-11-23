@@ -36,7 +36,7 @@ else:
     print("  cmake --build --preset x64-release")
     sys.exit(1)
 
-import ch1_fixed_size as llvm_example
+import ch1_fixed_size
 
 print("Testing JIT-compiled GEMM...")
 print("=" * 60)
@@ -49,7 +49,7 @@ B = np.ones((32, 16), dtype=np.float32)
 
 print("Calling gemm(A, B)...")
 try:
-    C = llvm_example.gemm(A, B)
+    C = ch1_fixed_size.gemm(A, B)
     print(f"✓ Success! Result shape: {C.shape}")
     print(f"✓ C[0,0] = {C[0,0]:.1f} (expected: 32.0)")
     
@@ -72,7 +72,7 @@ B = np.random.randn(32, 16).astype(np.float32)
 
 print("Calling gemm(A, B)...")
 try:
-    C_jit = llvm_example.gemm(A, B)
+    C_jit = ch1_fixed_size.gemm(A, B)
     C_numpy = A @ B  # NumPy's reference implementation
     
     max_error = np.max(np.abs(C_jit - C_numpy))
@@ -90,5 +90,5 @@ except Exception as e:
 print("\n" + "=" * 60)
 print("=== All tests complete ===")
 print("\nTry these commands to explore the MLIR IR:")
-print("  python3 -c 'import llvm_example; print(llvm_example.test_ir_generation())'")
-print("  python3 -c 'import llvm_example; print(llvm_example.test_optimized_ir())'")
+print("  python3 -c 'import ch1_fixed_size; print(ch1_fixed_size.test_ir_generation())'")
+print("  python3 -c 'import ch1_fixed_size; print(ch1_fixed_size.test_optimized_ir())'")

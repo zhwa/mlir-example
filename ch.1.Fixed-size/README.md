@@ -39,12 +39,12 @@ sudo mv /usr/lib/llvm-18/include/cxxabi.h /usr/lib/llvm-18/include/cxxabi.h.back
 ### 3. Build
 
 ```bash
-cd ~/llvm-example
+cd ~/mlir-example
 cmake --preset x64-release
 cmake --build --preset x64-release
 ```
 
-Build output: `build/x64-release/llvm_example.cpython-312-x86_64-linux-gnu.so`
+Build output: `build/x64-release/ch.1.Fixed-size/ch1_fixed_size.cpython-312-x86_64-linux-gnu.so`
 
 ### 4. Test
 
@@ -84,20 +84,6 @@ Demonstrates the MLIR compilation stack:
 
 **Operation:** C = A × B where A is 8×32, B is 32×16, C is 8×16
 
-## Project Structure
-
-```
-llvm-example/
-├── CMakeLists.txt          # Build configuration
-├── CMakePresets.json       # Linux/Ninja presets
-├── test_jit.py             # Python test script
-├── src/
-│   ├── ir.cpp              # MLIR IR generation
-│   ├── lowering.cpp        # Optimization pipeline
-│   ├── jit.cpp             # JIT execution
-│   └── bindings.cpp        # Python bindings
-└── build/x64-release/      # Build output
-```
 
 ## Learning Linalg Dialect
 
@@ -106,13 +92,13 @@ Now that the project is working, you can explore the MLIR linalg dialect:
 ### View Generated MLIR IR
 
 ```python
-import llvm_example
+import ch1_fixed_size
 
 # See the high-level MLIR with linalg.matmul
-print(llvm_example.test_ir_generation())
+print(ch1_fixed_size.test_ir_generation())
 
 # See the optimized/lowered LLVM dialect
-print(llvm_example.test_optimized_ir())
+print(ch1_fixed_size.test_optimized_ir())
 ```
 
 ### Explore the Pipeline
@@ -146,6 +132,22 @@ Try modifying `src/lowering.cpp` to:
 - Experiment with vectorization
 - Change optimization order
 
+
+## Key Design Decisions
+
+- **MemRef-based IR** instead of tensor-based (simpler, avoids bufferization)
+- **Fixed dimensions** (8×16×32) for learning purposes
+- **System LLVM/MLIR** via apt packages (not vcpkg)
+- **g++ compiler** to avoid clang/LLVM header conflicts
+
+## Restoring System Files
+
+If you need to restore the renamed header:
+```bash
+sudo mv /usr/lib/llvm-18/include/cxxabi.h.backup /usr/lib/llvm-18/include/cxxabi.h
+```
+
+
 ## Troubleshooting
 
 ### Build fails with cxxabi.h conflict
@@ -165,38 +167,23 @@ Potential fix (not yet implemented):
 set(LLVM_LINK_LLVM_DYLIB ON CACHE BOOL "" FORCE)
 ```
 
-### Clean build
+### Runtime Errors
+
+Errors made:
+
+1. forgot the entry in ir.cpp
+
+```cpp
+  // Set insertion point to the module body
+  builder.setInsertionPointToStart(module.getBody());
+```
+
+Without this, the JIT will fail and test won't give the right result.
+
+2. function name mismatch
 
 ```bash
-rm -rf build/
-cmake --preset x64-release
-cmake --build --preset x64-release
+ImportError: /home/zhe/mlir-example/ch.1.Fixed-size/../build/x64-release/ch.1.Fixed-size/ch1_fixed_size.cpython-312-x86_64-linux-gnu.so: undefined symbol: _ZN4mlir23applyOptimizationPassesENS_8ModuleOpE
 ```
 
-## Build from Windows PowerShell
-
-```powershell
-wsl bash -c "cd ~/llvm-example && cmake --preset x64-release"
-wsl bash -c "cd ~/llvm-example && cmake --build --preset x64-release"
-wsl bash -c "cd ~/llvm-example && python3 test_jit.py"
-```
-
-## Key Design Decisions
-
-- **MemRef-based IR** instead of tensor-based (simpler, avoids bufferization)
-- **Fixed dimensions** (8×16×32) for learning purposes
-- **System LLVM/MLIR** via apt packages (not vcpkg)
-- **g++ compiler** to avoid clang/LLVM header conflicts
-
-## Restoring System Files
-
-If you need to restore the renamed header:
-```bash
-sudo mv /usr/lib/llvm-18/include/cxxabi.h.backup /usr/lib/llvm-18/include/cxxabi.h
-```
-
-## References
-
-- [MLIR Documentation](https://mlir.llvm.org/)
-- [Linalg Dialect](https://mlir.llvm.org/docs/Dialects/Linalg/)
-- [MLIR Toy Tutorial](https://mlir.llvm.org/docs/Tutorials/Toy/)
+This error is caused by a typo in the function name in lowering.cpp. Ironically, the build was successful, and the error was a runtime error.
