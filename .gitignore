@@ -1,0 +1,65 @@
+# Build artifacts
+[Bb]uild/
+install/
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+
+# Executables
+*.exe
+*.exe~
+*.lib
+*.dll
+*.so
+*.o
+*.a
+
+# Python
+*.pyc
+*.pyd
+*.egg
+__pycache__/
+venv/
+env/
+*.egg-info/
+dist/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Windows metadata files (from WSL)
+*:Zone.Identifier
+*.endpointdlp
+
+# CMake cache (root handles this now)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CMakeLists.txt.user
+CMakeCache.txt
+CMakeScripts
+Testing
+Makefile
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+CMakeUserPresets.json
+
+# Backup files
+*.backup
+*.bak
+*.orig
