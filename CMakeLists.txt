@@ -79,4 +79,4 @@ set(MLIR_COMMON_LIBS
 add_subdirectory(ch.1.Fixed-size)
 add_subdirectory(ch.2.Dynamic-size)
 add_subdirectory(ch.3.JIT-caching)
-#add_subdirectory(ch.4.Tensor-bufferization)
+add_subdirectory(ch.4.Tensor-bufferization)
