@@ -78,5 +78,5 @@ set(MLIR_COMMON_LIBS
 # Add all chapter subdirectories
 add_subdirectory(ch.1.Fixed-size)
 add_subdirectory(ch.2.Dynamic-size)
-#add_subdirectory(ch.3.JIT-caching)
+add_subdirectory(ch.3.JIT-caching)
 #add_subdirectory(ch.4.Tensor-bufferization)
