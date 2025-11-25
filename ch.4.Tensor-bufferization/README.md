@@ -71,30 +71,91 @@ print(gemm.test_optimized_ir())
    - Runtime dimensions passed through memref descriptors
    - Direct function pointer invocation
 
-## Project Structure
+## Where Does Bufferization Fit?
+
+An important insight: **bufferization happens entirely within the MLIR optimization pipeline** and is invisible to the outer layers. The JIT interface and function signatures remain identical between Chapter 2 (direct memref) and Chapter 4 (tensor + bufferization).
+
+### The Complete Picture
 
 ```
-ch.4.Tensor-bufferization/
-├── src/
-│   ├── ir.cpp              # Tensor-based MLIR IR generation
-│   ├── lowering.cpp        # Bufferization and optimization pipeline
-│   ├── jit.cpp             # JIT compilation and execution
-│   └── bindings.cpp        # Python bindings
-├── test_jit.py             # Test script
-├── BUFFERIZATION_GUIDE.md  # Deep dive into bufferization
-└── README.md               # This file
+┌───────────────────────────────────────────────────────────┐
+│                    Python Layer                           │
+│  gemm.gemm(A, B) → calls C++ bindings                     │
+└──────────────────────┬────────────────────────────────────┘
+                       │ (Same in both chapters)
+                       ▼
+┌───────────────────────────────────────────────────────────┐
+│                   C++ Bindings                            │
+│  Allocates output C, extracts M, N, K                     │
+│  Calls: executeGemm(A, B, C, M, N, K)                     │
+└──────────────────────┬────────────────────────────────────┘
+                       │ (Same in both chapters)
+                       ▼
+┌───────────────────────────────────────────────────────────┐
+│                    JIT Layer                              │
+│  Compiles to native function, calls:                      │
+│  gemm_func(A[7], B[7], C[7])  ← 21 params, all memrefs    │
+└──────────────────────┬────────────────────────────────────┘
+                       │ (Same in both chapters!)
+                       ▼
+┌───────────────────────────────────────────────────────────┐
+│          MLIR Optimization Pipeline (DIFFERS!)            │
+│                                                           │
+│  Chapter 2:                    Chapter 4:                 │
+│  ┌──────────────────┐          ┌──────────────────┐       │
+│  │ Generate MemRef  │          │ Generate Tensor  │       │
+│  │    IR directly   │          │   IR (functional)│       │
+│  └────────┬─────────┘          └────────┬─────────┘       │
+│           │                             │                 │
+│           │                             ▼                 │
+│           │                    ┌──────────────────┐       │
+│           │                    │  Bufferization   │       │
+│           │                    │ Tensor→MemRef    │       │
+│           │                    └────────┬─────────┘       │
+│           │                             │                 │
+│           └──────────┬──────────────────┘                 │
+│                      │ Both produce same memref IR        │
+│                      ▼                                    │
+│           ┌──────────────────┐                            │
+│           │ Linalg→Loops→LLVM│                            │
+│           └──────────┬───────┘                            │
+│                      │                                    │
+│                      ▼                                    │
+│           ┌──────────────────┐                            │
+│           │    memref IR     │                            │
+│           │ with out-param   │                            │
+│           └──────────────────┘                            │
+└───────────────────────────────────────────────────────────┘
+                       │ (Same output!)
+                       ▼
+          [Native x86_64 Machine Code]
 ```
 
-## Further Reading
+### Key Insight
 
-- **BUFFERIZATION_GUIDE.md** - Comprehensive guide to MLIR bufferization, including:
-  - API design patterns
-  - Bufferization pipeline details
-  - Common pitfalls and how to avoid them
-  - Troubleshooting guide
+**Both chapters produce the exact same final function signature:**
+```cpp
+void gemm(
+    float* A_ptr, float* A_align, int64_t A_offset, 
+    int64_t A_M, int64_t A_K, int64_t A_stride0, int64_t A_stride1,
+    float* B_ptr, float* B_align, int64_t B_offset, 
+    int64_t B_K, int64_t B_N, int64_t B_stride0, int64_t B_stride1,
+    float* C_ptr, float* C_align, int64_t C_offset, 
+    int64_t C_M, int64_t C_N, int64_t C_stride0, int64_t C_stride1
+);
+```
 
-## References
+The **only** difference is **inside** the optimization pipeline:
+- **Chapter 2:** Generates `memref<?x?xf32>` directly → simple lowering
+- **Chapter 4:** Generates `tensor<?x?xf32>` → bufferization converts to `memref<?x?xf32>` → same lowering
 
-- [MLIR Bufferization Docs](https://mlir.llvm.org/docs/Bufferization/)
-- [One-Shot Bufferize Paper](https://arxiv.org/abs/2202.03293)
-- [Linalg Dialect](https://mlir.llvm.org/docs/Dialects/Linalg/)
+### Why Use Bufferization Then?
+
+Despite producing the same final output, the tensor-based approach with bufferization offers significant advantages:
+
+1. **Better optimization opportunities** - Tensor IR uses functional (immutable) semantics, making it easier for compilers to reason about data dependencies and apply transformations safely
+2. **Production standard** - Real-world MLIR projects (TensorFlow, PyTorch bridges, JAX) use tensor IR as their high-level representation
+3. **Composability** - Tensor operations compose better with other high-level dialects and enable more sophisticated program transformations
+4. **Future-proofing** - Advanced MLIR features (automatic parallelization, polyhedral optimization, distributed execution) work better with tensor IR
+
+**Bottom line:** Bufferization is an internal compiler technique that lets you write cleaner, more optimizable high-level IR while still generating efficient low-level code.
