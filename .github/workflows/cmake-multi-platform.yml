@@ -51,4 +51,4 @@ jobs:
 
     - name: Test
       run: |
-          find . -name "*.py" -exec python3 {} \;
+          find . -path ./build -prune -o -name "*.py" -exec python3 {} \;
