@@ -284,10 +284,6 @@ Always verify:
 
 # Part II: MLIR Bufferization Deep Dive
 
----
-
-# Part II: MLIR Bufferization Deep Dive
-
 ## What is Bufferization?
 
 **Bufferization** is the process of converting MLIR operations from **tensor semantics** (functional/immutable) to **memref semantics** (imperative/mutable).
@@ -771,4 +767,5 @@ Expected progression:
 - **After canonicalization:** `func.func @gemm(%arg0: tensor<?x?xf32>, ...) -> tensor<?x?xf32>`
 - **After one-shot-bufferize:** `func.func @gemm(%arg0: memref<?x?xf32>, ...) -> memref<?x?xf32>`
 - **After buffer-results-to-out-params:** `func.func @gemm(%arg0: memref<?x?xf32>, ..., %arg2: memref<?x?xf32>)`
+
 - **After bufferization-to-memref:** All `bufferization.*` operations replaced with `memref.*` operations
