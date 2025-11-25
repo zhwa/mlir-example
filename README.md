@@ -227,7 +227,7 @@ This is necessary because:
 ```
 ┌─────────────────────────────────────────────────────────┐
 │ Python User Code                                        │
-│   C = llvm_example.gemm(A, B)  ← Clean API!             │
+│   C = gemm.gemm(A, B)  ← Clean API!                     │
 └─────────────────┬───────────────────────────────────────┘
                   │
                   ▼

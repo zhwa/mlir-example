@@ -34,7 +34,7 @@ else:
     print("Build the project first: cmake --preset x64-release && cmake --build --preset x64-release")
     sys.exit(1)
 
-import ch4_tensor_bufferization as llvm_example
+import ch4_tensor_bufferization as gemm
 
 def demo_clean_api():
     """Demonstrate the clean Python API."""
@@ -42,7 +42,7 @@ def demo_clean_api():
     print("CLEAN API DEMO")
     print("="*70)
     print("\nThe API is clean and user-friendly:")
-    print("  C = llvm_example.gemm(A, B)")
+    print("  C = gemm.gemm(A, B)")
     print("\n✓ No manual allocation needed")
     print("✓ Works with any matrix size")
     print("✓ Returns new NumPy array")
@@ -57,7 +57,7 @@ def demo_clean_api():
                   [11.0, 12.0]], dtype=np.float32)
     
     # Clean API: Just write C = gemm(A, B)!
-    C = llvm_example.gemm(A, B)
+    C = gemm.gemm(A, B)
     expected = A @ B
     
     print(f"A shape: {A.shape}, B shape: {B.shape}")
@@ -68,7 +68,7 @@ def demo_clean_api():
     print("\n--- Example 2: Rectangular matrices (3×5 @ 5×2) ---")
     A = np.random.randn(3, 5).astype(np.float32)
     B = np.random.randn(5, 2).astype(np.float32)
-    C = llvm_example.gemm(A, B)
+    C = gemm.gemm(A, B)
     expected = A @ B
     print(f"A shape: {A.shape}, B shape: {B.shape}, C shape: {C.shape}")
     print(f"✓ Correct: {np.allclose(C, expected, rtol=1e-5)}")
@@ -85,7 +85,7 @@ def test_correctness():
     A = np.ones((8, 32), dtype=np.float32)
     B = np.ones((32, 16), dtype=np.float32)
     
-    C = llvm_example.gemm(A, B)
+    C = gemm.gemm(A, B)
     print(f"✓ Result shape: {C.shape}")
     print(f"✓ C[0,0] = {C[0,0]:.1f} (expected: 32.0)")
     
@@ -102,7 +102,7 @@ def test_correctness():
     A = np.random.randn(8, 32).astype(np.float32)
     B = np.random.randn(32, 16).astype(np.float32)
     
-    C_jit = llvm_example.gemm(A, B)
+    C_jit = gemm.gemm(A, B)
     C_numpy = A @ B
     
     max_error = np.max(np.abs(C_jit - C_numpy))
@@ -125,7 +125,7 @@ def test_correctness():
     for (m, k1), (k2, n) in test_shapes:
         A = np.random.randn(m, k1).astype(np.float32)
         B = np.random.randn(k2, n).astype(np.float32)
-        C_jit = llvm_example.gemm(A, B)
+        C_jit = gemm.gemm(A, B)
         C_numpy = A @ B
         max_error = np.max(np.abs(C_jit - C_numpy))
         status = "✓" if max_error < 1e-5 else "✗"
@@ -157,7 +157,7 @@ def test_performance():
         times = []
         for i in range(5):
             start = time.perf_counter()
-            C = llvm_example.gemm(A, B)
+            C = gemm.gemm(A, B)
             elapsed_ms = (time.perf_counter() - start) * 1000
             times.append(elapsed_ms)
             
@@ -212,8 +212,8 @@ def main():
     print("✓ ALL TESTS PASSED!")
     print("="*70)
     print("\nExplore the generated MLIR IR:")
-    print("  python3 -c 'import llvm_example; print(llvm_example.test_ir_generation())'")
-    print("  python3 -c 'import llvm_example; print(llvm_example.test_optimized_ir())'")
+    print("  python3 -c 'import gemm; print(gemm.test_ir_generation())'")
+    print("  python3 -c 'import gemm; print(gemm.test_optimized_ir())'")
     print()
 
 if __name__ == "__main__":

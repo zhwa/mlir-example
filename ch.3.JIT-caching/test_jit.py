@@ -33,7 +33,7 @@ else:
     print("Build the project first: cmake --preset x64-release && cmake --build --preset x64-release")
     sys.exit(1)
 
-import ch3_jit_caching as llvm_example
+import ch3_jit_caching as gemm
 
 def test_correctness():
     """Test numerical correctness against NumPy."""
@@ -47,7 +47,7 @@ def test_correctness():
     A = np.ones((8, 32), dtype=np.float32)
     B = np.ones((32, 16), dtype=np.float32)
     
-    C = llvm_example.gemm(A, B)
+    C = gemm.gemm(A, B)
     print(f"✓ Result shape: {C.shape}")
     print(f"✓ C[0,0] = {C[0,0]:.1f} (expected: 32.0)")
     
@@ -64,7 +64,7 @@ def test_correctness():
     A = np.random.randn(8, 32).astype(np.float32)
     B = np.random.randn(32, 16).astype(np.float32)
     
-    C_jit = llvm_example.gemm(A, B)
+    C_jit = gemm.gemm(A, B)
     C_numpy = A @ B
     
     max_error = np.max(np.abs(C_jit - C_numpy))
@@ -87,7 +87,7 @@ def test_correctness():
     for (m, k1), (k2, n) in test_shapes:
         A = np.random.randn(m, k1).astype(np.float32)
         B = np.random.randn(k2, n).astype(np.float32)
-        C_jit = llvm_example.gemm(A, B)
+        C_jit = gemm.gemm(A, B)
         C_numpy = A @ B
         max_error = np.max(np.abs(C_jit - C_numpy))
         status = "✓" if max_error < 1e-5 else "✗"
@@ -119,7 +119,7 @@ def test_performance():
         times = []
         for i in range(5):
             start = time.perf_counter()
-            C = llvm_example.gemm(A, B)
+            C = gemm.gemm(A, B)
             elapsed_ms = (time.perf_counter() - start) * 1000
             times.append(elapsed_ms)
             
@@ -171,8 +171,8 @@ def main():
     print("✓ ALL TESTS PASSED!")
     print("="*70)
     print("\nExplore the generated MLIR IR:")
-    print("  python3 -c 'import llvm_example; print(llvm_example.test_ir_generation())'")
-    print("  python3 -c 'import llvm_example; print(llvm_example.test_optimized_ir())'")
+    print("  python3 -c 'import gemm; print(gemm.test_ir_generation())'")
+    print("  python3 -c 'import gemm; print(gemm.test_optimized_ir())'")
     print()
 
 if __name__ == "__main__":
