@@ -1,4 +1,4 @@
-# MLIR-JIT GEMM: Implementation Guide
+# MLIR-JIT GEMM: Bufferization Implementation Guide
 
 This comprehensive guide covers both the high-level API design and the low-level bufferization implementation details.
 
@@ -26,10 +26,10 @@ This comprehensive guide covers both the high-level API design and the low-level
 The Python API is clean and user-friendly:
 
 ```python
-import llvm_example
+import ch4_tensor_bufferization as gemm
 
 # Clean API - No manual allocation needed!
-C = llvm_example.gemm(A, B)
+C = gemm.gemm(A, B)
 ```
 
 Users **never** need to manually allocate memory for the output matrix. The allocation happens transparently inside the C++ binding code.
@@ -38,7 +38,7 @@ Users **never** need to manually allocate memory for the output matrix. The allo
 
 ```python
 import numpy as np
-import llvm_example
+import ch4_tensor_bufferization as gemm
 
 # Small matrices
 A = np.array([[1.0, 2.0, 3.0],
@@ -47,12 +47,12 @@ B = np.array([[7.0, 8.0],
               [9.0, 10.0],
               [11.0, 12.0]], dtype=np.float32)
 
-C = llvm_example.gemm(A, B)  # Returns [[58, 64], [139, 154]]
+C = gemm.gemm(A, B)  # Returns [[58, 64], [139, 154]]
 
 # Large matrices - same API!
 A_large = np.random.randn(1000, 1000).astype(np.float32)
 B_large = np.random.randn(1000, 1000).astype(np.float32)
-C_large = llvm_example.gemm(A_large, B_large)  # Works with any size!
+C_large = gemm.gemm(A_large, B_large)  # Works with any size!
 ```
 
 ### Key Features
@@ -68,7 +68,7 @@ C_large = llvm_example.gemm(A_large, B_large)  # Works with any size!
 ```
 ┌─────────────────────────────────────────────────────────┐
 │ Python User Code                                        │
-│   C = llvm_example.gemm(A, B)  ← Clean API!            │
+│   C = gemm.gemm(A, B)  ← Clean API!                     │
 └─────────────────┬───────────────────────────────────────┘
                   │
                   ▼
@@ -76,7 +76,7 @@ C_large = llvm_example.gemm(A_large, B_large)  # Works with any size!
 │ Python Binding (bindings.cpp)                           │
 │   • Validates inputs (2D, float32, compatible shapes)   │
 │   • Allocates output array C                            │
-│   • Calls executeGemm(A, B, C, M, N, K)                │
+│   • Calls executeGemm(A, B, C, M, N, K)                 │
 │   • Returns C to Python                                 │
 └─────────────────┬───────────────────────────────────────┘
                   │
@@ -86,29 +86,29 @@ C_large = llvm_example.gemm(A_large, B_large)  # Works with any size!
 │   • Checks if function is cached                        │
 │   • If not cached: Compile once and cache               │
 │   • Expands memrefs to 21 parameters                    │
-│   • Calls: gemm(A[7], B[7], C[7])                      │
+│   • Calls: gemm(A[7], B[7], C[7])                       │
 │   • C is out-parameter (void return)                    │
 └─────────────────┬───────────────────────────────────────┘
                   │
                   ▼
 ┌─────────────────────────────────────────────────────────┐
-│ MLIR Optimization Pipeline (lowering.cpp)              │
+│ MLIR Optimization Pipeline (lowering.cpp)               │
 │   1. Canonicalization (simplify IR)                     │
-│   2. One-Shot Bufferize (tensor → memref)              │
+│   2. One-Shot Bufferize (tensor → memref)               │
 │   3. Buffer-Results-To-Out-Params (return → out-param)  │
-│   4. Bufferization-To-MemRef (finalize memrefs)        │
-│   5. Linalg to Loops (linalg.matmul → scf.for)         │
-│   6. SCF to Control Flow (scf.for → cf.br)             │
+│   4. Bufferization-To-MemRef (finalize memrefs)         │
+│   5. Linalg to Loops (linalg.matmul → scf.for)          │
+│   6. SCF to Control Flow (scf.for → cf.br)              │
 │   7. Convert to LLVM Dialect                            │
 └─────────────────┬───────────────────────────────────────┘
                   │
                   ▼
 ┌─────────────────────────────────────────────────────────┐
-│ Generated Machine Code (x86_64 assembly)               │
+│ Generated Machine Code (x86_64 assembly)                │
 │   • malloc buffer for result                            │
-│   • memset(buffer, 0) - zero initialization            │
+│   • memset(buffer, 0) - zero initialization             │
 │   • Triple-nested loop for matmul                       │
-│   • memcpy(buffer, C_out_param) - copy to output       │
+│   • memcpy(buffer, C_out_param) - copy to output        │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -611,35 +611,7 @@ MLIR's bufferization is split across multiple passes for good reasons:
 - Each pass has a single, well-defined responsibility
 - Makes debugging easier (can inspect IR between passes)
 
----
 
-## Verification
-
-To verify bufferization is working correctly:
-
-### 1. **Check Compilation Succeeds**
-```bash
-cmake --build build/x64-release
-```
-
-### 2. **Run Tests**
-```bash
-python3 test_jit.py
-```
-Expected: All tests pass with `0.00e+00` error
-
-### 3. **Inspect IR at Each Stage**
-
-Enable IR printing in `lowering.cpp`:
-```cpp
-pm.enableIRPrinting();
-```
-
-Then run and check:
-- **After canonicalization**: Should see tensor IR
-- **After one-shot-bufferize**: Should see memref args/results
-- **After buffer-results-to-out-params**: Should see out-parameter signature
-- **After bufferization-to-memref**: Should see no `bufferization.*` ops
 
 ---
 
@@ -675,39 +647,21 @@ This is the **minimum viable bufferization pipeline** for tensor→memref conver
 
 ## Quick Reference
 
-### Running the Code
+### Example Usage
 
-```bash
-# Build the project
-cmake --build build/x64-release
-
-# Run the comprehensive test suite (includes API demo)
-python3 test_jit.py
+```python
+import ch4_tensor_bufferization as gemm
+import numpy as np
 
 # Quick test
-python3 -c "import llvm_example; import numpy as np; \
-A = np.ones((2,3), dtype=np.float32); \
-B = np.ones((3,2), dtype=np.float32); \
-C = llvm_example.gemm(A, B); \
-print('Result:', C)"
+A = np.ones((2,3), dtype=np.float32)
+B = np.ones((3,2), dtype=np.float32)
+C = gemm.gemm(A, B)
+print('Result:', C)
 
 # Inspect generated IR
-python3 -c "import llvm_example; print(llvm_example.test_ir_generation())"
-python3 -c "import llvm_example; print(llvm_example.test_optimized_ir())"
-```
-
-### File Organization
-
-```
-llvm-example/
-├── src/
-│   ├── ir.cpp           - MLIR IR generation (tensor-based)
-│   ├── lowering.cpp     - Optimization pipeline (bufferization!)
-│   ├── jit.cpp          - JIT compilation and execution
-│   └── bindings.cpp     - Python bindings (clean API)
-├── test_jit.py          - Comprehensive test suite
-├── BUFFERIZATION_GUIDE.md  - This document
-└── README.md            - Project overview
+print(gemm.test_ir_generation())
+print(gemm.test_optimized_ir())
 ```
 
 ### Key Concepts Checklist
@@ -722,36 +676,99 @@ When working with MLIR bufferization, remember:
 - ✅ **Pass ordering matters** - Bufferize → out-params → lower bufferization ops
 - ✅ **Clean API for users** - Hide implementation details in bindings
 
-### Debugging Tips
+---
 
-**If compilation fails:**
-1. Check IR at each pass stage (`pm.enableIRPrinting()`)
-2. Verify all dialect interfaces are registered
-3. Ensure passes are in correct order
+## Troubleshooting
 
-**If runtime produces garbage:**
-1. Check function typedef matches lowered signature (void vs struct return)
-2. Verify memref descriptor expansion (7 params per memref)
-3. Test parameter passing with debug prints
-4. Check calling convention (System V AMD64 ABI on Linux)
+### Compilation Issues
 
-**If tests fail with wrong values:**
-1. Compare against NumPy with `np.allclose()`
+**Problem: Compilation fails during bufferization passes**
+
+Solutions:
+1. Check IR at each pass stage by enabling IR printing in `lowering.cpp`:
+   ```cpp
+   pm.enableIRPrinting();
+   ```
+2. Verify all dialect interfaces are registered before One-Shot Bufferize
+3. Ensure passes are in correct order:
+   - Register interfaces → One-Shot Bufferize → Buffer-Results-To-Out-Params → Lower bufferization ops
+
+**Problem: `to_tensor ops without 'restrict' are not supported`**
+
+- **Cause:** Using `func-bufferize` before One-Shot Bufferize
+- **Solution:** Don't use `func-bufferize`. Let One-Shot Bufferize handle function boundaries with `bufferizeFunctionBoundaries = true`
+
+**Problem: `op was not bufferized` or `op does not implement BufferizableOpInterface`**
+
+- **Cause:** Missing interface registration
+- **Solution:** Register all required dialect interfaces:
+  ```cpp
+  arith::registerBufferizableOpInterfaceExternalModels(registry);
+  linalg::registerBufferizableOpInterfaceExternalModels(registry);
+  tensor::registerBufferizableOpInterfaceExternalModels(registry);
+  bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(registry);
+  ```
+
+**Problem: `failed to legalize operation 'bufferization.to_memref'`**
+
+- **Cause:** `bufferizeFunctionBoundaries` not enabled, or missing `bufferization-to-memref` pass
+- **Solution:** Set `options.bufferizeFunctionBoundaries = true` and add `createBufferizationToMemRefPass()`
+
+### Runtime Issues
+
+**Problem: Tests produce garbage values or NaN**
+
+Solutions:
+1. **Check function typedef matches lowered signature:**
+   - After `buffer-results-to-out-params`, function returns `void` and takes output as parameter
+   - C++ typedef must be: `void(*)(A[7], B[7], C[7])`
+   - NOT: `MemRefDescriptor(*)(A[7], B[7], C[7])`
+
+2. **Verify memref descriptor expansion:**
+   - Each memref becomes 7 parameters: `(ptr, ptr, offset, size0, size1, stride0, stride1)`
+   - Function with 3 memrefs needs 21 total parameters
+
+3. **Test parameter passing:**
+   - Add debug prints in JIT code to verify pointers and dimensions
+   - Check calling convention (System V AMD64 ABI on Linux)
+
+**Problem: Wrong numerical results (but no NaN)**
+
+Solutions:
+1. Compare against NumPy: `np.allclose(result, expected, rtol=1e-5)`
 2. Check for dimension mismatches (M, N, K)
 3. Verify row-major layout (C-style arrays)
-4. Inspect stride calculation (should be [cols, 1] for row-major)
+4. Inspect stride calculation - should be `[cols, 1]` for row-major
 
----
+**Problem: Segmentation fault during execution**
 
-## References
+Solutions:
+1. Check memory allocation for output buffer in `bindings.cpp`
+2. Verify memref descriptor construction (correct sizes, strides, offset)
+3. Ensure allocated buffer size matches matrix dimensions
+4. Add bounds checking in debug builds
 
-- [MLIR Bufferization Docs](https://mlir.llvm.org/docs/Bufferization/)
-- [One-Shot Bufferize Paper](https://arxiv.org/abs/2202.03293)
-- [BufferizableOpInterface](https://mlir.llvm.org/docs/Dialects/BufferizationOps/)
-- [MLIR Linalg Dialect](https://mlir.llvm.org/docs/Dialects/Linalg/)
-- [MemRef Type](https://mlir.llvm.org/docs/Dialects/MemRef/)
+### IR Inspection
 
----
+To debug bufferization issues, inspect IR at each stage:
 
-*Last updated: November 2025*
-*This guide reflects the successful implementation of tensor-based IR with full bufferization for JIT-compiled matrix multiplication.*
+```cpp
+// In lowering.cpp
+pm.addPass(createCanonicalizerPass());
+module.dump();  // Check tensor IR
+
+pm.addPass(bufferization::createOneShotBufferizePass(options));
+module.dump();  // Should see memref args/results
+
+pm.addPass(bufferization::createBufferResultsToOutParamsPass());
+module.dump();  // Should see out-parameter signature
+
+pm.addPass(createBufferizationToMemRefPass());
+module.dump();  // Should see no bufferization.* ops
+```
+
+Expected progression:
+- **After canonicalization:** `func.func @gemm(%arg0: tensor<?x?xf32>, ...) -> tensor<?x?xf32>`
+- **After one-shot-bufferize:** `func.func @gemm(%arg0: memref<?x?xf32>, ...) -> memref<?x?xf32>`
+- **After buffer-results-to-out-params:** `func.func @gemm(%arg0: memref<?x?xf32>, ..., %arg2: memref<?x?xf32>)`
+- **After bufferization-to-memref:** All `bufferization.*` operations replaced with `memref.*` operations
