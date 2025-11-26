@@ -2,34 +2,6 @@
 
 A hands-on tutorial demonstrating MLIR JIT compilation for matrix multiplication, progressing from simple fixed-size operations to advanced dynamic compilation with caching.
 
-## Project Structure
-
-```
-llvm-example/
-├── CMakeLists.txt           # Unified build configuration
-├── CMakePresets.json        # Build presets (release/debug)
-├── README.md                # This file
-│
-├── ch.1.Fixed-size/         # Chapter 1: Fixed 8×32 × 32×16 GEMM
-│   ├── README.md            # Chapter overview
-│   ├── MLIR_CODING_PATTERN.md
-│   └── src/                 # C++ implementation
-│
-├── ch.2.Dynamic-size/       # Chapter 2: Any matrix dimensions
-│   ├── README.md
-│   ├── IMPROVEMENT_ROADMAP.md
-│   └── src/
-│
-├── ch.3.JIT-caching/        # Chapter 3: Function caching
-│   ├── README.md
-│   └── src/
-│
-└── ch.4.Tensor-bufferization/  # Chapter 4: Advanced bufferization
-    ├── README.md
-    ├── BUFFERIZATION_GUIDE.md
-    └── src/
-```
-
 ## Quick Start
 
 ### Prerequisites
@@ -94,8 +66,6 @@ Using build directory: ../build/x64-release/ch.1.Fixed-size
 - Shape-agnostic IR generation
 - Out-parameter bufferization pattern
 
-**Documentation**: `ch.2.Dynamic-size/README.md`, `IMPROVEMENT_ROADMAP.md`
-
 ### Chapter 3: JIT Caching
 **Goal**: Optimize performance by caching compiled functions
 
@@ -104,8 +74,6 @@ Using build directory: ../build/x64-release/ch.1.Fixed-size
 - Function pointer caching
 - Performance measurement (first call vs cached)
 - Shape flexibility without recompilation
-
-**Documentation**: `ch.3.JIT-caching/README.md`
 
 ### Chapter 4: Tensor Bufferization
 **Goal**: Master advanced MLIR bufferization strategies
@@ -118,41 +86,6 @@ Using build directory: ../build/x64-release/ch.1.Fixed-size
 
 **Documentation**: `ch.4.Tensor-bufferization/README.md`, `BUFFERIZATION_GUIDE.md`
 
-## Build System
-
-### Unified CMake Configuration
-
-The root `CMakeLists.txt` provides:
-- LLVM/MLIR 18 discovery
-- pybind11 integration (auto-fetched)
-- Shared compiler flags and include paths
-- Common MLIR libraries (`MLIR_COMMON_LIBS`)
-
-Each chapter is a minimal subproject (~20 lines):
-```cmake
-project(ch1-fixed-size)
-file(GLOB CPP_SOURCE_FILES "src/*.cpp")
-pybind11_add_module(${PROJECT_NAME} ${CPP_SOURCE_FILES})
-set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME "ch1_fixed_size")
-target_link_libraries(${PROJECT_NAME} PRIVATE ${MLIR_COMMON_LIBS})
-```
-
-### Build Presets
-
-- **x64-release**: Optimized build with Clang 18
-- **x64-debug**: Debug build with symbols
-
-### Selective Building
-
-```bash
-# Build single chapter
-cmake --build --preset x64-release --target ch1-fixed-size
-
-# Clean rebuild
-rm -rf build
-cmake --preset x64-release
-cmake --build --preset x64-release
-```
 
 ## Key Implementation Details
 
