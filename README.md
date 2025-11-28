@@ -86,6 +86,19 @@ Using build directory: ../build/x64-release/ch.1.Fixed-size
 
 **Documentation**: `ch.4.Tensor-bufferization/README.md`, `BUFFERIZATION_GUIDE.md`
 
+### Chapter 5: Vector Operations & SCF Dialect
+**Goal**: Learn structured control flow with explicit loops
+
+**Kernel**: SAXPY (Scalar A times X Plus Y): `C[i] = α·A[i] + B[i]`
+
+**Key Concepts**:
+- SCF (Structured Control Flow) dialect
+- `scf.for` loops with induction variables
+- `memref.dim` for dynamic size queries
+- Comparison: SCF explicit loops vs Linalg high-level ops
+
+**Documentation**: `ch.5.Vector-ops/README.md`
+
 
 ## Key Implementation Details
 
