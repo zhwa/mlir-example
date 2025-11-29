@@ -99,6 +99,20 @@ Using build directory: ../build/x64-release/ch.1.Fixed-size
 
 **Documentation**: `ch.5.Vector-ops/README.md`
 
+### Chapter 6: Softmax with Math Dialect
+**Goal**: Implement softmax using Math dialect for mathematical functions
+
+**Kernel**: Softmax: `output[i] = exp(input[i] - max) / sum(exp(...))`
+
+**Key Concepts**:
+- Math dialect operations (`math.exp`)
+- Multi-pass algorithms (find max, compute exp/sum, normalize)
+- Numerical stability techniques
+- Loop-carried variables in `scf.for`
+- Math-to-LLVM and Math-to-Libm lowering strategies
+
+**Documentation**: `ch.6.Softmax/README.md`
+
 
 ## Key Implementation Details
 
