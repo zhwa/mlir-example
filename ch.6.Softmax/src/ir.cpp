@@ -42,7 +42,7 @@ namespace mlir {
 ///       %new_max = arith.maximumf %current_max, %val
 ///       scf.yield %new_max
 ///     }
-///     
+///
 ///     // Pass 2: Compute exp and sum
 ///     %sum = scf.for %i = ... iter_args(%current_sum) {
 ///       %val = memref.load %input[%i]
@@ -52,7 +52,7 @@ namespace mlir {
 ///       %new_sum = arith.addf %current_sum, %exp_val
 ///       scf.yield %new_sum
 ///     }
-///     
+///
 ///     // Pass 3: Normalize
 ///     scf.for %i = ... {
 ///       %exp_val = memref.load %temp[%i]
@@ -137,22 +137,22 @@ OwningOpRef<ModuleOp> createSoftmaxModule(MLIRContext& context) {
       loc, c0, size, c1, ValueRange{zeroFloat},
       [&](OpBuilder& b, Location loc, Value i, ValueRange iterArgs) {
         Value currentSum = iterArgs[0];
-        
+
         // Load input value
         Value val = b.create<memref::LoadOp>(loc, input, ValueRange{i});
-        
+
         // Subtract max for numerical stability
         Value shifted = b.create<arith::SubFOp>(loc, val, maxVal);
-        
+
         // Compute exp(x - max)
         Value expVal = b.create<math::ExpOp>(loc, shifted);
-        
+
         // Store exp value to temporary buffer
         b.create<memref::StoreOp>(loc, expVal, tempBuffer, ValueRange{i});
-        
+
         // Accumulate sum
         Value newSum = b.create<arith::AddFOp>(loc, currentSum, expVal);
-        
+
         b.create<scf::YieldOp>(loc, ValueRange{newSum});
       }
   );
@@ -167,13 +167,13 @@ OwningOpRef<ModuleOp> createSoftmaxModule(MLIRContext& context) {
       [&](OpBuilder& b, Location loc, Value i, ValueRange iterArgs) {
         // Load exp value from temp buffer
         Value expVal = b.create<memref::LoadOp>(loc, tempBuffer, ValueRange{i});
-        
+
         // Normalize: divide by sum
         Value normalized = b.create<arith::DivFOp>(loc, expVal, sumExp);
-        
+
         // Store to output
         b.create<memref::StoreOp>(loc, normalized, output, ValueRange{i});
-        
+
         b.create<scf::YieldOp>(loc, ValueRange{});
       }
   );

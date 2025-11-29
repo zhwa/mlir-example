@@ -80,6 +80,105 @@ scf.for %i = %c0 to %size step %c1 {
 
 This is how we implement reductions (max, sum) without mutation.
 
+### Two Styles for Building `scf.for` Loops
+
+MLIR provides two ways to construct `scf.for` loops in C++. Chapter 6 uses the **lambda style** because it requires loop-carried variables.
+
+#### Style 1: Multi-Step Construction (Chapter 5 approach)
+
+Good for simple loops without loop-carried variables:
+
+```cpp
+// Step 1: Create the loop
+auto forOp = builder.create<scf::ForOp>(loc, c0, size, c1);
+
+// Step 2: Set insertion point inside loop body
+builder.setInsertionPointToStart(forOp.getBody());
+
+// Step 3: Get induction variable
+Value i = forOp.getInductionVar();
+
+// Step 4: Build loop body operations
+Value a = builder.create<memref::LoadOp>(loc, A, ValueRange{i});
+Value result = builder.create<arith::AddFOp>(loc, a, b);
+builder.create<memref::StoreOp>(loc, result, C, ValueRange{i});
+
+// Step 5: Return to parent level
+builder.setInsertionPointAfter(forOp);
+```
+
+**Pros:** 
+- Clear step-by-step construction
+- Easy to debug
+- Good for learning basics
+
+**Cons:**
+- More verbose
+- Manual insertion point management
+- Cannot easily use loop-carried variables
+
+#### Style 2: Lambda/Callback Construction (Chapter 6 approach)
+
+**Required** for loops with loop-carried variables (reductions):
+
+```cpp
+auto findMaxLoop = builder.create<scf::ForOp>(
+    loc, c0, size, c1, 
+    ValueRange{negInf},  // Initial value for iter_args
+    [&](OpBuilder& b, Location loc, Value i, ValueRange iterArgs) {
+        // Lambda receives: builder, location, induction var, iteration args
+        Value currentMax = iterArgs[0];  // Access loop-carried value
+        Value val = b.create<memref::LoadOp>(loc, input, ValueRange{i});
+        Value newMax = b.create<arith::MaximumFOp>(loc, currentMax, val);
+        b.create<scf::YieldOp>(loc, ValueRange{newMax});  // Must yield!
+    }
+);
+Value maxVal = findMaxLoop.getResult(0);  // Get final result
+```
+
+**Pros:**
+- Concise, functional style
+- Automatic insertion point management
+- **Only way** to handle `iter_args` easily
+- Lambda captures outer scope variables
+
+**Cons:**
+- Less explicit about control flow
+- Callback syntax may be unfamiliar
+
+#### When to Use Each
+
+| Use Case | Style | Example |
+|----------|-------|---------|
+| Simple iteration (no reduction) | Either | Element-wise operations |
+| Reduction (max, sum, product) | Lambda | **Required** for iter_args |
+| Complex body (50+ lines) | Multi-step | Easier to structure |
+| Multiple nested loops | Lambda | Less indentation chaos |
+
+#### Generated MLIR Comparison
+
+Both styles produce valid MLIR, but only the lambda style can produce loops with `iter_args`:
+
+**Without iter_args (Chapter 5):**
+```mlir
+scf.for %i = %c0 to %size step %c1 {
+  %val = memref.load %A[%i]
+  memref.store %val, %C[%i]
+}
+```
+
+**With iter_args (Chapter 6):**
+```mlir
+%result = scf.for %i = %c0 to %size step %c1 
+          iter_args(%acc = %init) -> (f32) {
+  %val = memref.load %input[%i]
+  %new_acc = arith.addf %acc, %val
+  scf.yield %new_acc : f32
+}
+```
+
+The lambda style in Chapter 6 enables functional-style programming where values flow through iterations, essential for implementing reductions like finding maximum or computing sums.
+
 ### Math Dialect Lowering
 
 **math-to-libm pass** converts math operations to C library calls:

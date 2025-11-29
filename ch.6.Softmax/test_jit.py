@@ -9,6 +9,8 @@ import numpy as np
 build_paths = [
     '../build/x64-release/ch.6.Softmax',
     '../build/x64-debug/ch.6.Softmax',
+    'build/x64-release/ch.6.Softmax',
+    'build/x64-debug/ch.6.Softmax'
 ]
 
 build_dir = None

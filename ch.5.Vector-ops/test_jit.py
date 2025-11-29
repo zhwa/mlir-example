@@ -9,6 +9,8 @@ import numpy as np
 build_paths = [
     '../build/x64-release/ch.5.Vector-ops',
     '../build/x64-debug/ch.5.Vector-ops',
+    'build/x64-release/ch.5.Vector-ops',
+    'build/x64-debug/ch.5.Vector-ops'
 ]
 
 build_dir = None
