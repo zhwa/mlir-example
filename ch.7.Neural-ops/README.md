@@ -21,9 +21,9 @@ A computation graph is a directed acyclic graph (DAG) where:
 
 ```python
 g = ch7.Graph()
-x = g.input([4])          # Create input placeholder
-y = g.input([4])          # Create another input
-z = g.add(x, y)          # Add operation (not executed yet!)
+x = g.variable([4])       # Create variable/placeholder
+y = g.variable([4])       # Create another variable
+z = g.add(x, y)           # Add operation (not executed yet!)
 fn = g.compile(z, "add")  # NOW we generate MLIR and compile
 result = ch7.execute_binary_1d(fn, a_data, b_data)
 ```
@@ -56,9 +56,9 @@ This is similar to:
 
 ```python
 g = ch7.Graph()
-x = g.input([4])
-y = g.input([4])
-z = g.mul(g.add(x, y), g.input([4]))  # (x + y) * w
+x = g.variable([4])
+y = g.variable([4])
+z = g.mul(g.add(x, y), g.variable([4]))  # (x + y) * w
 ```
 
 ### Matrix Operations
@@ -67,9 +67,9 @@ z = g.mul(g.add(x, y), g.input([4]))  # (x + y) * w
 
 ```python
 g = ch7.Graph()
-x = g.input([2, 3])   # 2x3 matrix
-W = g.input([3, 4])   # 3x4 weight matrix
-y = g.matmul(x, W)     # 2x4 output
+x = g.variable([2, 3])   # 2x3 matrix
+W = g.variable([3, 4])   # 3x4 weight matrix
+y = g.matmul(x, W)        # 2x4 output
 ```
 
 ### Activation Functions
@@ -103,7 +103,7 @@ JIT Compilation (jit.cpp)
 
 The `ComputationGraph::generateMLIR()` method:
 
-1. **Collect inputs**: Find all `Input` operations
+1. **Collect variables**: Find all `Variable` operations
 2. **Build function signature**: Create func.func with memref arguments
 3. **Recursive generation**: Build operations depth-first, memoizing results
 4. **Copy to output**: Transfer result to output buffer
@@ -163,7 +163,6 @@ PYTHONPATH=../build/x64-release/ch.7.Neural-ops python3 test_jit.py
 - ✅ Matrix multiplication (2D)
 - ✅ ReLU activation
 - ✅ Softmax activation (math.exp lowered to libm)
-- ✅ Composition test (build multi-op graphs)
 - ✅ Multi-layer network (2-layer MLP structure)
 
 **All 6 tests pass!**
@@ -172,9 +171,9 @@ PYTHONPATH=../build/x64-release/ch.7.Neural-ops python3 test_jit.py
 
 ```python
 g = ch7.Graph()
-x = g.input([2, 3])    # Input: batch_size=2, features=3
-W1 = g.input([3, 4])   # Layer 1 weights
-W2 = g.input([4, 2])   # Layer 2 weights
+x = g.variable([2, 3])    # Input: batch_size=2, features=3
+W1 = g.variable([3, 4])   # Layer 1 weights
+W2 = g.variable([4, 2])   # Layer 2 weights
 
 # Layer 1: x @ W1
 h = g.matmul(x, W1)    # → [2, 4]
