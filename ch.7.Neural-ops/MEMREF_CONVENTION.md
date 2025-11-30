@@ -17,7 +17,14 @@ Each memref is a **descriptor** with metadata:
 1. allocated_ptr, 2. aligned_ptr, 3. offset, 4. size, 5. stride
 
 **For 2D memref** `memref<MxNxf32>` (7 parameters):
-1. allocated_ptr, 2. aligned_ptr, 3. offset, 4. size[0], 5. size[1], 6. stride[0], 7. stride[1]
+
+1. allocated_ptr - base pointer to allocated memory
+2. aligned_ptr - aligned pointer for actual data access
+3. offset - offset from base (usually 0)
+4. size[0] - first dimension size (M)
+5. size[1] - second dimension size (N)
+6. stride[0] - row stride (usually N)
+7. stride[1] - column stride (usually 1)
 
 This enables dynamic shapes, strided access, memory alignment, and type safety.
 
@@ -183,7 +190,7 @@ result = ch7.execute_3inputs_2d(fn, x_data, W1_data, W2_data)
 
 **Cons**:
 - Requires C++ compilation
-- Need to write a new helper for each input/output pattern
+- Need to write a new C++ function for every input/output combination (2 inputs, 3 inputs, 4 inputs, mixed 1D/2D, etc.). The ctypes approach is more flexible for prototyping, even if verbose
 - Less flexible than ctypes
 
 ### Comparison Summary
