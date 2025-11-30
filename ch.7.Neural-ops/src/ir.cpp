@@ -23,8 +23,8 @@ ComputationGraph::ComputationGraph(MLIRContext* ctx) : context(ctx), nextId(0) {
     context->getOrLoadDialect<linalg::LinalgDialect>();
 }
 
-// Add an input placeholder
-int ComputationGraph::addInput(const std::vector<int64_t>& shape) {
+// Add a variable/tensor placeholder
+int ComputationGraph::addVariable(const std::vector<int64_t>& shape) {
     int id = nextId++;
     operations.emplace_back(GraphOperation::OpType::Input, std::vector<int>{}, shape, id);
     return id;

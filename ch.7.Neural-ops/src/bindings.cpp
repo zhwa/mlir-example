@@ -11,8 +11,8 @@ public:
     Graph() : ctx(std::make_unique<MLIRContext>()), 
               graph(std::make_unique<ComputationGraph>(ctx.get())) {}
 
-    int input(const std::vector<int64_t>& shape) {
-        return graph->addInput(shape);
+    int variable(const std::vector<int64_t>& shape) {
+        return graph->addVariable(shape);
     }
 
     int add(int lhs, int rhs) {
@@ -191,7 +191,7 @@ PYBIND11_MODULE(ch7_neural_ops, m) {
 
     py::class_<Graph>(m, "Graph")
         .def(py::init<>())
-        .def("input", &Graph::input, "Add an input placeholder")
+        .def("variable", &Graph::variable, "Add a variable/tensor to the graph")
         .def("add", &Graph::add, "Add element-wise addition")
         .def("mul", &Graph::mul, "Add element-wise multiplication")
         .def("matmul", &Graph::matmul, "Add matrix multiplication")

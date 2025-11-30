@@ -31,8 +31,8 @@ class ComputationGraph {
 public:
     explicit ComputationGraph(mlir::MLIRContext* ctx);
 
-    // Add an input placeholder
-    int addInput(const std::vector<int64_t>& shape);
+    // Add a variable/tensor placeholder
+    int addVariable(const std::vector<int64_t>& shape);
 
     // Add element-wise addition
     int add(int lhs, int rhs);
