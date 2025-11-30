@@ -1,6 +1,8 @@
-# MLIR GEMM JIT Tutorial
+# MLIR Learn-by-Doing Tutorial
 
-A hands-on tutorial demonstrating MLIR JIT compilation for matrix multiplication, progressing from simple fixed-size operations to advanced dynamic compilation with caching.
+A hands-on tutorial demonstrating MLIR JIT compilation, progressing from basic matrix operations to neural network operators with computation graphs.
+
+**Progress**: 7 of 9 chapters complete (88%)
 
 ## Quick Start
 
@@ -112,6 +114,21 @@ Using build directory: ../build/x64-release/ch.1.Fixed-size
 - Math-to-LLVM and Math-to-Libm lowering strategies
 
 **Documentation**: `ch.6.Softmax/README.md`
+
+### Chapter 7: Neural Operations (Operator Composition)
+**Goal**: Build computation graphs with deferred execution before introducing custom dialects
+
+**Operations**: Element-wise (add, mul), matrix multiplication, activations (ReLU, softmax)
+
+**Key Concepts**:
+- Computation graph with symbolic operation tracking
+- Deferred execution model (build → compile → execute)
+- Recursive IR generation from graph structure
+- Operation composition for multi-layer networks
+- MLIR calling convention for static memrefs (5 params for 1D, 7 for 2D)
+- Critical lesson: Math dialect lowering pass order (math-to-llvm THEN math-to-libm)
+
+**Documentation**: `ch.7.Neural-ops/README.md`
 
 
 ## Key Implementation Details
