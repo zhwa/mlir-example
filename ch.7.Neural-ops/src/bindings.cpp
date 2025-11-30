@@ -186,6 +186,45 @@ py::array_t<float> execute_matmul(uintptr_t fnPtr, py::array_t<float> lhs, py::a
     return output;
 }
 
+// Helper for 3 2D inputs
+py::array_t<float> execute_3inputs_2d(uintptr_t fnPtr, py::array_t<float> input1, py::array_t<float> input2, py::array_t<float> input3) {
+    auto in1Buf = input1.request();
+    auto in2Buf = input2.request();
+    auto in3Buf = input3.request();
+
+    if (in1Buf.ndim != 2 || in2Buf.ndim != 2 || in3Buf.ndim != 2) {
+        throw std::runtime_error("All inputs must be 2D");
+    }
+
+    // Output shape: (input1.rows, input3.cols)
+    py::array_t<float> output({in1Buf.shape[0], in3Buf.shape[1]});
+    auto outputBuf = output.request();
+
+    // For 3 2D inputs + 1 2D output: each memref = 7 parameters
+    using FnType = void(*)(        
+        float*, float*, int64_t, int64_t, int64_t, int64_t, int64_t,  // input1
+        float*, float*, int64_t, int64_t, int64_t, int64_t, int64_t,  // input2
+        float*, float*, int64_t, int64_t, int64_t, int64_t, int64_t,  // input3
+        float*, float*, int64_t, int64_t, int64_t, int64_t, int64_t   // output
+    );
+    auto fn = reinterpret_cast<FnType>(fnPtr);
+
+    fn(static_cast<float*>(in1Buf.ptr),
+       static_cast<float*>(in1Buf.ptr),
+       0, in1Buf.shape[0], in1Buf.shape[1], in1Buf.shape[1], 1,
+       static_cast<float*>(in2Buf.ptr),
+       static_cast<float*>(in2Buf.ptr),
+       0, in2Buf.shape[0], in2Buf.shape[1], in2Buf.shape[1], 1,
+       static_cast<float*>(in3Buf.ptr),
+       static_cast<float*>(in3Buf.ptr),
+       0, in3Buf.shape[0], in3Buf.shape[1], in3Buf.shape[1], 1,
+       static_cast<float*>(outputBuf.ptr),
+       static_cast<float*>(outputBuf.ptr),
+       0, outputBuf.shape[0], outputBuf.shape[1], outputBuf.shape[1], 1);
+
+    return output;
+}
+
 PYBIND11_MODULE(ch7_neural_ops, m) {
     m.doc() = "MLIR Neural Operations with Computation Graph";
 
@@ -204,4 +243,5 @@ PYBIND11_MODULE(ch7_neural_ops, m) {
     m.def("execute_2d", &execute_2d, "Execute 2D function");
     m.def("execute_binary_1d", &execute_binary_1d, "Execute binary 1D function");
     m.def("execute_matmul", &execute_matmul, "Execute matmul function");
+    m.def("execute_3inputs_2d", &execute_3inputs_2d, "Execute function with 3 2D inputs");
 }

@@ -217,18 +217,23 @@ def test_multi_layer():
                         [0.5, 0.6],
                         [0.7, 0.8]], dtype=np.float32)
 
-    # Manual calculation
+    # Manual calculation for expected result
     h_manual = np.matmul(x_data, W1_data)
     h_relu_manual = np.maximum(h_manual, 0.0)
-    y_manual = np.matmul(h_relu_manual, W2_data)
+    y_expected = np.matmul(h_relu_manual, W2_data)
+
+    # Execute compiled function
+    result = ch7.execute_3inputs_2d(fn, x_data, W1_data, W2_data)
 
     print(f"\nInput shape: {x_data.shape}")
     print(f"W1 shape: {W1_data.shape}")
     print(f"W2 shape: {W2_data.shape}")
-    print(f"Expected output shape: {y_manual.shape}")
-    print(f"Expected output:\n{y_manual}")
-
-    print("✓ Multi-layer network built successfully\n")
+    print(f"Result shape: {result.shape}")
+    print(f"Result:\n{result}")
+    print(f"Expected:\n{y_expected}")
+    
+    assert np.allclose(result, y_expected), f"Multi-layer test failed! Got\n{result}\nExpected\n{y_expected}"
+    print("✓ Multi-layer network test passed\n")
 
 if __name__ == "__main__":
     print("=" * 60)

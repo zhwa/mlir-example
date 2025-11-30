@@ -217,6 +217,14 @@ This two-tier strategy ensures all math operations get properly lowered.
 
 **Likely Cause**: MLIR calling convention mismatch
 
-**Fix**: Verify memref descriptor layout matches MLIR's ABI:
-- Static memrefs pass descriptor fields as individual arguments
-- NOT as a pointer to a struct!
+**Fix**: Each memref expands to multiple parameters (5 for 1D, 7 for 2D), not a simple pointer. See `MEMREF_CONVENTION.md` for detailed explanation and examples of handling this with C++ helpers vs ctypes.
+
+**Quick reference**:
+- Use provided helpers: `execute_binary_1d()`, `execute_matmul()`, `execute_3inputs_2d()`
+- For custom patterns, see `MEMREF_CONVENTION.md` for implementation guide
+
+## See Also
+
+- **`MEMREF_CONVENTION.md`**: Deep dive into MLIR's memref calling convention with concrete ctypes vs C++ examples
+- **`test_jit.py`**: Working examples of all operations and execution patterns
+- **Chapter 6 (`ch.6.Softmax`)**: Reference for softmax implementation details
