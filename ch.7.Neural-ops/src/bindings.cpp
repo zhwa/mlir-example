@@ -1,48 +1,42 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
-#include "api.h"
+#include "graph.h"
 
 namespace py = pybind11;
 using namespace mlir;
 
 class Graph {
 public:
-    Graph() {
-        ctx = std::make_unique<MLIRContext>();
-        graph = createGraph(ctx.get());
-    }
+    Graph() : ctx(std::make_unique<MLIRContext>()), 
+              graph(std::make_unique<ComputationGraph>(ctx.get())) {}
 
-    ~Graph() {
-        deleteGraph(graph);
-    }
-
-    int input(std::vector<int64_t> shape) {
-        return addInput(graph, shape.data(), shape.size());
+    int input(const std::vector<int64_t>& shape) {
+        return graph->addInput(shape);
     }
 
     int add(int lhs, int rhs) {
-        return addAddOp(graph, lhs, rhs);
+        return graph->add(lhs, rhs);
     }
 
     int mul(int lhs, int rhs) {
-        return addMulOp(graph, lhs, rhs);
+        return graph->mul(lhs, rhs);
     }
 
     int matmul(int lhs, int rhs) {
-        return addMatMulOp(graph, lhs, rhs);
+        return graph->matmul(lhs, rhs);
     }
 
     int relu(int input) {
-        return addReLUOp(graph, input);
+        return graph->relu(input);
     }
 
     int softmax(int input) {
-        return addSoftmaxOp(graph, input);
+        return graph->softmax(input);
     }
 
     std::string getMLIR(int outputId, const std::string& funcName = "main") {
-        auto module = generateMLIR(graph, outputId, funcName.c_str());
+        auto module = graph->generateMLIR(outputId, funcName);
         std::string result;
         llvm::raw_string_ostream os(result);
         module.print(os);
@@ -50,13 +44,13 @@ public:
     }
 
     py::object compile(int outputId, const std::string& funcName = "main") {
-        auto module = generateMLIR(graph, outputId, funcName.c_str());
+        auto module = graph->generateMLIR(outputId, funcName);
 
         if (!jit) {
-            jit = createJIT();
+            jit = std::make_unique<JITCompiler>();
         }
 
-        void* fnPtr = compileModule(jit, module, funcName.c_str());
+        void* fnPtr = jit->compile(module, funcName);
         if (!fnPtr) {
             throw std::runtime_error("Failed to compile function");
         }
@@ -66,8 +60,8 @@ public:
 
 private:
     std::unique_ptr<MLIRContext> ctx;
-    ComputationGraph* graph;
-    JITCompiler* jit = nullptr;
+    std::unique_ptr<ComputationGraph> graph;
+    std::unique_ptr<JITCompiler> jit;
 };
 
 // Helper to execute 1D functions

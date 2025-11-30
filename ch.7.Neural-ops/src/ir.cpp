@@ -1,106 +1,80 @@
-#include "mlir/IR/Builders.h"
-#include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/MLIRContext.h"
+#include "graph.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
-#include <string>
-#include <vector>
-#include <memory>
-#include <unordered_map>
+#include <limits>
 
 using namespace mlir;
 
-// Forward declaration
-class ComputationGraph;
+// GraphOperation constructor implementation
+GraphOperation::GraphOperation(OpType t, std::vector<int> ins, std::vector<int64_t> sh, int i)
+    : type(t), inputs(std::move(ins)), shape(std::move(sh)), id(i) {}
 
-// Represents a symbolic operation result in the computation graph
-struct GraphOperation {
-    enum class OpType {
-        Input,      // Input placeholder
-        Add,        // Element-wise addition
-        Mul,        // Element-wise multiplication
-        MatMul,     // Matrix multiplication
-        ReLU,       // Rectified Linear Unit
-        Softmax     // Softmax activation
-    };
+// ComputationGraph constructor implementation
+ComputationGraph::ComputationGraph(MLIRContext* ctx) : context(ctx), nextId(0) {
+    context->getOrLoadDialect<func::FuncDialect>();
+    context->getOrLoadDialect<arith::ArithDialect>();
+    context->getOrLoadDialect<memref::MemRefDialect>();
+    context->getOrLoadDialect<scf::SCFDialect>();
+    context->getOrLoadDialect<math::MathDialect>();
+    context->getOrLoadDialect<linalg::LinalgDialect>();
+}
 
-    OpType type;
-    std::vector<int> inputs;  // Indices of input operations
-    std::vector<int64_t> shape;  // Shape of the result
-    int id;  // Unique identifier
+// Add an input placeholder
+int ComputationGraph::addInput(const std::vector<int64_t>& shape) {
+    int id = nextId++;
+    operations.emplace_back(GraphOperation::OpType::Input, std::vector<int>{}, shape, id);
+    return id;
+}
 
-    GraphOperation(OpType t, std::vector<int> ins, std::vector<int64_t> sh, int i)
-        : type(t), inputs(std::move(ins)), shape(std::move(sh)), id(i) {}
-};
+// Add element-wise addition
+int ComputationGraph::add(int lhs, int rhs) {
+    const auto& lhsShape = operations[lhs].shape;
+    int id = nextId++;
+    operations.emplace_back(GraphOperation::OpType::Add, std::vector<int>{lhs, rhs}, lhsShape, id);
+    return id;
+}
 
-// Computation graph that tracks operations and generates MLIR
-class ComputationGraph {
-public:
-    ComputationGraph(MLIRContext* ctx) : context(ctx), nextId(0) {
-        context->getOrLoadDialect<func::FuncDialect>();
-        context->getOrLoadDialect<arith::ArithDialect>();
-        context->getOrLoadDialect<memref::MemRefDialect>();
-        context->getOrLoadDialect<scf::SCFDialect>();
-        context->getOrLoadDialect<math::MathDialect>();
-        context->getOrLoadDialect<linalg::LinalgDialect>();
-    }
+// Add element-wise multiplication
+int ComputationGraph::mul(int lhs, int rhs) {
+    const auto& lhsShape = operations[lhs].shape;
+    int id = nextId++;
+    operations.emplace_back(GraphOperation::OpType::Mul, std::vector<int>{lhs, rhs}, lhsShape, id);
+    return id;
+}
 
-    // Add an input placeholder
-    int addInput(std::vector<int64_t> shape) {
-        int id = nextId++;
-        operations.emplace_back(GraphOperation::OpType::Input, std::vector<int>{}, std::move(shape), id);
-        return id;
-    }
+// Add matrix multiplication
+int ComputationGraph::matmul(int lhs, int rhs) {
+    const auto& lhsShape = operations[lhs].shape;
+    const auto& rhsShape = operations[rhs].shape;
+    std::vector<int64_t> resultShape = {lhsShape[0], rhsShape[1]};
+    int id = nextId++;
+    operations.emplace_back(GraphOperation::OpType::MatMul, std::vector<int>{lhs, rhs}, resultShape, id);
+    return id;
+}
 
-    // Add element-wise addition
-    int add(int lhs, int rhs) {
-        const auto& lhsShape = operations[lhs].shape;
-        int id = nextId++;
-        operations.emplace_back(GraphOperation::OpType::Add, std::vector<int>{lhs, rhs}, lhsShape, id);
-        return id;
-    }
+// Add ReLU activation
+int ComputationGraph::relu(int input) {
+    const auto& inputShape = operations[input].shape;
+    int id = nextId++;
+    operations.emplace_back(GraphOperation::OpType::ReLU, std::vector<int>{input}, inputShape, id);
+    return id;
+}
 
-    // Add element-wise multiplication
-    int mul(int lhs, int rhs) {
-        const auto& lhsShape = operations[lhs].shape;
-        int id = nextId++;
-        operations.emplace_back(GraphOperation::OpType::Mul, std::vector<int>{lhs, rhs}, lhsShape, id);
-        return id;
-    }
+// Add Softmax activation
+int ComputationGraph::softmax(int input) {
+    const auto& inputShape = operations[input].shape;
+    int id = nextId++;
+    operations.emplace_back(GraphOperation::OpType::Softmax, std::vector<int>{input}, inputShape, id);
+    return id;
+}
 
-    // Add matrix multiplication
-    int matmul(int lhs, int rhs) {
-        const auto& lhsShape = operations[lhs].shape;
-        const auto& rhsShape = operations[rhs].shape;
-        std::vector<int64_t> resultShape = {lhsShape[0], rhsShape[1]};
-        int id = nextId++;
-        operations.emplace_back(GraphOperation::OpType::MatMul, std::vector<int>{lhs, rhs}, resultShape, id);
-        return id;
-    }
-
-    // Add ReLU activation
-    int relu(int input) {
-        const auto& inputShape = operations[input].shape;
-        int id = nextId++;
-        operations.emplace_back(GraphOperation::OpType::ReLU, std::vector<int>{input}, inputShape, id);
-        return id;
-    }
-
-    // Add Softmax activation
-    int softmax(int input) {
-        const auto& inputShape = operations[input].shape;
-        int id = nextId++;
-        operations.emplace_back(GraphOperation::OpType::Softmax, std::vector<int>{input}, inputShape, id);
-        return id;
-    }
-
-    // Generate MLIR module from the computation graph
-    ModuleOp generateMLIR(int outputId, const std::string& funcName) {
-        OpBuilder builder(context);
+// Generate MLIR module from the computation graph
+ModuleOp ComputationGraph::generateMLIR(int outputId, const std::string& funcName) {
+    OpBuilder builder(context);
         auto module = ModuleOp::create(builder.getUnknownLoc());
         builder.setInsertionPointToEnd(module.getBody());
 
@@ -179,34 +153,9 @@ public:
                 });
         }
 
-        builder.create<func::ReturnOp>(builder.getUnknownLoc());
-        return module;
-    }
-
-private:
-    MLIRContext* context;
-    std::vector<GraphOperation> operations;
-    int nextId;
-
-    // Helper to build operations recursively
-    Value buildOperation(OpBuilder& builder, Location loc, int opId,
-                        std::unordered_map<int, Value>& valueMap,
-                        const std::vector<Value>& funcArgs);
-
-    // Helper to build element-wise operations
-    Value buildElementWiseOp(OpBuilder& builder, Location loc,
-                            Value lhs, Value rhs,
-                            GraphOperation::OpType opType);
-
-    // Helper to build matrix multiplication
-    Value buildMatMul(OpBuilder& builder, Location loc, Value lhs, Value rhs);
-
-    // Helper to build ReLU
-    Value buildReLU(OpBuilder& builder, Location loc, Value input);
-
-    // Helper to build Softmax (reusing Chapter 6 implementation)
-    Value buildSoftmax(OpBuilder& builder, Location loc, Value input);
-};
+    builder.create<func::ReturnOp>(builder.getUnknownLoc());
+    return module;
+}
 
 // Recursively build operations
 Value ComputationGraph::buildOperation(OpBuilder& builder, Location loc, int opId,
@@ -470,43 +419,4 @@ Value ComputationGraph::buildSoftmax(OpBuilder& builder, Location loc, Value inp
         });
 
     return result;
-}
-
-// Export the ComputationGraph class
-// Note: We use C++ wrapper functions instead of raw C exports to handle C++ types
-ComputationGraph* createGraph(MLIRContext* ctx) {
-    return new ComputationGraph(ctx);
-}
-
-void deleteGraph(ComputationGraph* graph) {
-    delete graph;
-}
-
-int addInput(ComputationGraph* graph, int64_t* shape, int rank) {
-    std::vector<int64_t> shapeVec(shape, shape + rank);
-    return graph->addInput(shapeVec);
-}
-
-int addAddOp(ComputationGraph* graph, int lhs, int rhs) {
-    return graph->add(lhs, rhs);
-}
-
-int addMulOp(ComputationGraph* graph, int lhs, int rhs) {
-    return graph->mul(lhs, rhs);
-}
-
-int addMatMulOp(ComputationGraph* graph, int lhs, int rhs) {
-    return graph->matmul(lhs, rhs);
-}
-
-int addReLUOp(ComputationGraph* graph, int input) {
-    return graph->relu(input);
-}
-
-int addSoftmaxOp(ComputationGraph* graph, int input) {
-    return graph->softmax(input);
-}
-
-ModuleOp generateMLIR(ComputationGraph* graph, int outputId, const char* funcName) {
-    return graph->generateMLIR(outputId, funcName);
 }

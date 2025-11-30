@@ -1,3 +1,4 @@
+#include "graph.h"
 #include "mlir/ExecutionEngine/ExecutionEngine.h"
 #include "mlir/ExecutionEngine/OptUtils.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -7,19 +8,28 @@
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include <memory>
+#include <vector>
 
 using namespace mlir;
 
 LogicalResult lowerToLLVM(ModuleOp module);
 
-class JITCompiler {
-public:
-    JITCompiler() {
-        llvm::InitializeNativeTarget();
-        llvm::InitializeNativeTargetAsmPrinter();
-    }
+// Implementation details hidden from header
+struct JITCompiler::Impl {
+    std::vector<std::unique_ptr<llvm::orc::LLJIT>> jitInstances;
+};
 
-    void* compile(ModuleOp module, const std::string& funcName) {
+// JITCompiler implementation
+JITCompiler::JITCompiler() : pImpl(new Impl()) {
+    llvm::InitializeNativeTarget();
+    llvm::InitializeNativeTargetAsmPrinter();
+}
+
+JITCompiler::~JITCompiler() {
+    delete pImpl;
+}
+
+void* JITCompiler::compile(ModuleOp module, const std::string& funcName) {
         // Register translations
         registerBuiltinDialectTranslation(*module.getContext());
         registerLLVMDialectTranslation(*module.getContext());
@@ -61,24 +71,8 @@ public:
             return nullptr;
         }
 
-        // Store the JIT instance to keep it alive
-        jitInstances.push_back(std::move(jit));
+    // Store the JIT instance to keep it alive
+    pImpl->jitInstances.push_back(std::move(jit));
 
-        return symOrErr->toPtr<void*>();
-    }
-
-private:
-    std::vector<std::unique_ptr<llvm::orc::LLJIT>> jitInstances;
-};
-
-JITCompiler* createJIT() {
-    return new JITCompiler();
-}
-
-void deleteJIT(JITCompiler* jit) {
-    delete jit;
-}
-
-void* compileModule(JITCompiler* jit, ModuleOp module, const char* funcName) {
-    return jit->compile(module, funcName);
+    return symOrErr->toPtr<void*>();
 }
