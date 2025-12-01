@@ -50,7 +50,7 @@ def test_add():
     print(f"\nInput 1: {a}")
     print(f"Input 2: {b}")
 
-    result = ch7.execute_binary_1d(fn, a, b)
+    result = ch7.execute_generic(fn, [a, b], (4,))
 
     expected = a + b
     print(f"Result:  {result}")
@@ -72,7 +72,7 @@ def test_mul():
 
     a = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
     b = np.array([2.0, 3.0, 4.0, 5.0], dtype=np.float32)
-    result = ch7.execute_binary_1d(fn, a, b)
+    result = ch7.execute_generic(fn, [a, b], (4,))
 
     expected = a * b
     print(f"Input 1: {a}")
@@ -103,7 +103,7 @@ def test_matmul():
     b = np.array([[1.0, 2.0],
                   [3.0, 4.0],
                   [5.0, 6.0]], dtype=np.float32)
-    result = ch7.execute_matmul(fn, a, b)
+    result = ch7.execute_generic(fn, [a, b], (2, 2))
 
     expected = np.matmul(a, b)
     print(f"Input 1:\n{a}")
@@ -125,7 +125,7 @@ def test_relu():
     fn = g.compile(y, "relu_fn")
 
     a = np.array([-2.0, -1.0, 0.0, 1.0, 2.0, 3.0], dtype=np.float32)
-    result = ch7.execute_1d(fn, a)
+    result = ch7.execute_generic(fn, [a], (6,))
 
     expected = np.maximum(a, 0.0)
     print(f"Input:    {a}")
@@ -146,7 +146,7 @@ def test_softmax():
     fn = g.compile(y, "softmax_fn")
 
     a = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
-    result = ch7.execute_1d(fn, a)
+    result = ch7.execute_generic(fn, [a], (4,))
 
     # Expected softmax
     exp_a = np.exp(a - np.max(a))
@@ -223,7 +223,7 @@ def test_multi_layer():
     y_expected = np.matmul(h_relu_manual, W2_data)
 
     # Execute compiled function
-    result = ch7.execute_3inputs_2d(fn, x_data, W1_data, W2_data)
+    result = ch7.execute_generic(fn, [x_data, W1_data, W2_data], (2, 2))
 
     print(f"\nInput shape: {x_data.shape}")
     print(f"W1 shape: {W1_data.shape}")

@@ -30,14 +30,17 @@ This enables dynamic shapes, strided access, memory alignment, and type safety.
 
 ### Handling in Bindings
 
-We provide C++ helpers in `bindings.cpp`:
-- `execute_binary_1d(fn, lhs, rhs)` - 2 1D inputs → 1 1D output
-- `execute_matmul(fn, lhs, rhs)` - 2 2D inputs → 1 2D output  
-- `execute_3inputs_2d(fn, in1, in2, in3)` - 3 2D inputs → 1 2D output
+We provide a **generic C++ helper** in `bindings.cpp`:
+- `execute_generic(fn, inputs, output_shape)` - handles arbitrary number of inputs/outputs with 1D or 2D shapes
 
-For custom patterns, add new helpers or use ctypes.
+This single function replaces all shape-specific helpers through runtime shape introspection.
 
-## Concrete Example: Two Approaches
+For reference, the old approach required separate helpers:
+- ❌ `execute_binary_1d(fn, lhs, rhs)` - 2 1D inputs → 1 1D output
+- ❌ `execute_matmul(fn, lhs, rhs)` - 2 2D inputs → 1 2D output  
+- ❌ `execute_3inputs_2d(fn, in1, in2, in3)` - 3 2D inputs → 1 2D output
+
+## Concrete Example: Three Approaches
 
 Let's execute a compiled multi-layer network function with signature:
 ```mlir
@@ -46,7 +49,34 @@ func.func @mlp(%x: memref<2x3xf32>, %W1: memref<3x4xf32>, %W2: memref<4x2xf32>, 
 
 This expands to **28 parameters** at the LLVM level (7 params × 4 memrefs).
 
-### Approach 1: Python with ctypes (Verbose but Flexible)
+### Approach 1: Generic C++ Helper (Recommended)
+
+```python
+import ch7_neural_ops as ch7
+import numpy as np
+
+# Compile function
+g = ch7.Graph()
+x = g.variable([2, 3])
+W1 = g.variable([3, 4])
+W2 = g.variable([4, 2])
+h = g.matmul(x, W1)
+h_relu = g.relu(h)
+y = g.matmul(h_relu, W2)
+fn = g.compile(y, "mlp")
+
+# Execute with generic API - automatically handles all 28 parameters
+x_data = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float32)
+W1_data = np.array([[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8], [0.9, 1.0, 1.1, 1.2]], dtype=np.float32)
+W2_data = np.array([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]], dtype=np.float32)
+
+result = ch7.execute_generic(fn, [x_data, W1_data, W2_data], (2, 2))
+# Done! Runtime shape introspection handles the complexity.
+```
+
+**Advantages**: Clean API, automatic shape handling, type-safe, extensible.
+
+### Approach 2: Python with ctypes (Educational/Manual)
 
 ```python
 import ctypes
@@ -116,48 +146,19 @@ result = execute_3inputs_2d_ctypes(fn_ptr, x_data, W1_data, W2_data)
 - No type checking at definition time
 - Hard to maintain
 
-### Approach 2: C++ Helper in bindings.cpp (Clean and Reusable)
+### Approach 3: Old C++ Shape-Specific Helper (Obsolete)
 
-**C++ side** (`bindings.cpp`):
+This approach is **no longer used** but shown for historical reference.
+
+**Old Pattern** (`execute_3inputs_2d` - removed):
 ```cpp
+// OLD: Separate function for 3 2D inputs
 py::array_t<float> execute_3inputs_2d(uintptr_t fnPtr, 
                                       py::array_t<float> input1,
                                       py::array_t<float> input2, 
                                       py::array_t<float> input3) {
-    auto in1Buf = input1.request();
-    auto in2Buf = input2.request();
-    auto in3Buf = input3.request();
-
-    if (in1Buf.ndim != 2 || in2Buf.ndim != 2 || in3Buf.ndim != 2) {
-        throw std::runtime_error("All inputs must be 2D");
-    }
-
-    // Allocate output
-    py::array_t<float> output({in1Buf.shape[0], in3Buf.shape[1]});
-    auto outputBuf = output.request();
-
-    // Type-safe function pointer
-    using FnType = void(*)(        
-        float*, float*, int64_t, int64_t, int64_t, int64_t, int64_t,  // input1
-        float*, float*, int64_t, int64_t, int64_t, int64_t, int64_t,  // input2
-        float*, float*, int64_t, int64_t, int64_t, int64_t, int64_t,  // input3
-        float*, float*, int64_t, int64_t, int64_t, int64_t, int64_t   // output
-    );
-    auto fn = reinterpret_cast<FnType>(fnPtr);
-
-    // Call with proper memref descriptors
-    fn(static_cast<float*>(in1Buf.ptr),
-       static_cast<float*>(in1Buf.ptr),
-       0, in1Buf.shape[0], in1Buf.shape[1], in1Buf.shape[1], 1,
-       static_cast<float*>(in2Buf.ptr),
-       static_cast<float*>(in2Buf.ptr),
-       0, in2Buf.shape[0], in2Buf.shape[1], in2Buf.shape[1], 1,
-       static_cast<float*>(in3Buf.ptr),
-       static_cast<float*>(in3Buf.ptr),
-       0, in3Buf.shape[0], in3Buf.shape[1], in3Buf.shape[1], 1,
-       static_cast<float*>(outputBuf.ptr),
-       static_cast<float*>(outputBuf.ptr),
-       0, outputBuf.shape[0], outputBuf.shape[1], outputBuf.shape[1], 1);
+    // ... manually handle 28 parameters ...
+}
 
     return output;
 }
@@ -176,41 +177,41 @@ import ch7_neural_ops as ch7
 
 # Clean, simple call - all complexity hidden!
 result = ch7.execute_3inputs_2d(fn, x_data, W1_data, W2_data)
-```
+**Problem with shape-specific approach**:
+- Need separate C++ function for every pattern:
+  - `execute_binary_1d` - 2 1D inputs
+  - `execute_matmul` - 2 2D inputs
+  - `execute_3inputs_2d` - 3 2D inputs
+  - `execute_4inputs_mixed` - 4 mixed inputs... endless combinations!
 
-**Lines of code**: 1 line in Python, ~30 lines of C++ (reusable)
-
-**Pros**:
-- Clean Python API (1 line!)
-- Type-safe C++ implementation
-- Compile-time error checking
-- Reusable across all tests
-- Proper error messages
-- Self-documenting code
-
-**Cons**:
-- Requires C++ compilation
-- Need to write a new C++ function for every input/output combination (2 inputs, 3 inputs, 4 inputs, mixed 1D/2D, etc.). The ctypes approach is more flexible for prototyping, even if verbose
-- Less flexible than ctypes
+**Solution**: Generic binding with runtime introspection (see Approach 1).
 
 ### Comparison Summary
 
-| Aspect | ctypes Approach | C++ Helper Approach |
-|--------|----------------|---------------------|
-| **Python Code** | 40-50 lines per call site | 1 line per call site |
-| **C++ Code** | 0 lines | ~30 lines (one-time) |
-| **Type Safety** | Runtime only | Compile-time |
-| **Error Messages** | Cryptic segfaults | Clear exceptions |
-| **Maintainability** | Low (repetitive) | High (reusable) |
-| **Flexibility** | High (any signature) | Medium (per-pattern helpers) |
-| **Best For** | Quick experiments | Production code |
+| Aspect | Generic Helper (Now) | ctypes Manual | Shape-Specific (Old) |
+|--------|---------------------|---------------|---------------------|
+| **Python Code** | 1 line per call | 40-50 lines | 1 line per call |
+| **C++ Code** | ~110 lines (handles all) | 0 lines | ~30 lines per pattern |
+| **Type Safety** | Compile-time | Runtime only | Compile-time |
+| **Error Messages** | Clear exceptions | Cryptic segfaults | Clear exceptions |
+| **Maintainability** | High (one function) | Low (repetitive) | Medium (many functions) |
+| **Flexibility** | High (any shape combo) | High (any signature) | Low (one pattern each) |
+| **Best For** | Production & learning | Quick experiments | Obsolete |
 
 ### Recommendation
 
-- **Use ctypes**: For one-off experiments or when testing unusual signatures
-- **Use C++ helpers**: For any operation you'll use more than once
-- **Future direction**: Build a generic executor that handles arbitrary signatures automatically
+✅ **Use `execute_generic()`**: Handles all patterns automatically through runtime introspection.
 
-### Future Work
+🔧 **Use ctypes**: Only for learning or debugging unusual calling conventions.
 
-Production systems need **generic executors** that introspect function signatures and handle arbitrary input/output counts automatically. This represents the direction for future chapters on building production-ready ML systems.
+❌ **Don't write shape-specific helpers**: Generic approach supersedes them.
+
+### Key Achievement
+
+The generic binding layer (Approach 1) combines the best of both worlds:
+- **Clean API** like C++ helpers (1 line of Python)
+- **Flexibility** like ctypes (works with any shape combination)
+- **Maintainability** - single implementation handles everything
+- **Extensibility** - easy to add support for new cases
+
+No more combinatorial explosion of binding functions! 🎉

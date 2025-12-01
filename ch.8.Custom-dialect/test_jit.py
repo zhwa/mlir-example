@@ -54,7 +54,7 @@ def test_add():
     # Execute
     a = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
     b = np.array([5.0, 6.0, 7.0, 8.0], dtype=np.float32)
-    result = ch8.execute_binary_1d(mlir_text, "add", a, b)
+    result = ch8.execute(mlir_text, "add", [a, b], (4,))
 
     expected = a + b
     assert np.allclose(result, expected), f"Expected {expected}, got {result}"
@@ -76,7 +76,7 @@ def test_mul():
 
     a = np.array([2.0, 3.0, 4.0, 5.0], dtype=np.float32)
     b = np.array([10.0, 10.0, 10.0, 10.0], dtype=np.float32)
-    result = ch8.execute_binary_1d(mlir_text, "mul", a, b)
+    result = ch8.execute(mlir_text, "mul", [a, b], (4,))
 
     expected = a * b
     assert np.allclose(result, expected), f"Expected {expected}, got {result}"
@@ -102,7 +102,7 @@ def test_matmul():
                    [0.0, 1.0, 0.0, 1.0],
                    [0.0, 0.0, 1.0, 1.0]], dtype=np.float32)
 
-    result = ch8.execute_matmul(mlir_text, "matmul", a, b)
+    result = ch8.execute(mlir_text, "matmul", [a, b], (2, 4))
 
     expected = a @ b
     assert np.allclose(result, expected), f"Expected {expected}, got {result}"
@@ -125,7 +125,7 @@ def test_relu():
     input_data = np.array([[-1.0, 2.0, -3.0, 4.0],
                             [5.0, -6.0, 7.0, -8.0]], dtype=np.float32)
 
-    result = ch8.execute_unary_2d(mlir_text, "relu", input_data)
+    result = ch8.execute(mlir_text, "relu", [input_data], (2, 4))
 
     expected = np.maximum(0, input_data)
     assert np.allclose(result, expected), f"Expected {expected}, got {result}"
@@ -158,7 +158,7 @@ def test_multi_layer():
                          [1.0, 1.0],
                          [0.5, 0.5]], dtype=np.float32)
 
-    result = ch8.execute_3inputs_2d(mlir_text, "mlp", x_data, W1_data, W2_data)
+    result = ch8.execute(mlir_text, "mlp", [x_data, W1_data, W2_data], (2, 2))
 
     # Compute expected result
     h_expected = x_data @ W1_data
@@ -193,8 +193,9 @@ if __name__ == "__main__":
     print("- Python lowering to standard MLIR works")
     print("- C++ compilation and JIT execution works")
     print("- All operations produce correct results")
+    print("- Generic execute() API handles all shape patterns")
     print()
     print("Key Achievement:")
-    print("Chapter 7 needed 3+ C++ helper functions for different patterns.")
-    print("Chapter 8 uses the same helpers but demonstrates how custom")
-    print("dialects eliminate this need - the lowering pass handles complexity!")
+    print("Generic binding layer eliminates shape-specific helpers.")
+    print("Single execute() function handles arbitrary inputs through")
+    print("runtime shape introspection - true shape-generic execution!")

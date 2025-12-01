@@ -219,8 +219,11 @@ This two-tier strategy ensures all math operations get properly lowered.
 **Fix**: Each memref expands to multiple parameters (5 for 1D, 7 for 2D), not a simple pointer. See `MEMREF_CONVENTION.md` for detailed explanation and examples of handling this with C++ helpers vs ctypes.
 
 **Quick reference**:
-- Use provided helpers: `execute_binary_1d()`, `execute_matmul()`, `execute_3inputs_2d()`
-- For custom patterns, see `MEMREF_CONVENTION.md` for implementation guide
+- **Use**: `execute_generic(fn, [inputs...], output_shape)` - single function handles all patterns
+- Runtime shape introspection automatically marshals memref parameters
+- For deep dive into memref calling convention, see `MEMREF_CONVENTION.md`
+
+**Key improvement**: Generic binding layer eliminates all shape-specific helper functions. One clean API for everything!
 
 ## See Also
 

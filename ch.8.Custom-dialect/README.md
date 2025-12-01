@@ -47,11 +47,26 @@ Standard MLIR pipeline using LLJIT (same as Chapter 7):
 - JIT compile with LLJIT
 
 ### 4. **Python Bindings** (`src/bindings.cpp`)
-Execution helpers handling memref marshaling:
-- `execute_binary_1d()` - 1D element-wise ops (add, mul)
-- `execute_matmul()` - 2D matrix multiplication
-- `execute_unary_2d()` - 2D unary ops (relu)
-- `execute_3inputs_2d()` - Multi-layer networks
+Generic execution handler with automatic memref marshaling:
+
+**API**: `execute(mlir_text, func_name, inputs, output_shape)`
+- Handles arbitrary number of inputs (1D or 2D)
+- Runtime shape introspection
+- Automatic memref descriptor construction
+- Single function replaces all shape-specific helpers
+
+**Usage**:
+```python
+import ch8
+
+# All operations use the same generic API:
+result = ch8.execute(mlir_text, "add", [a, b], (4,))           # 1D binary
+result = ch8.execute(mlir_text, "matmul", [a, b], (2, 4))      # 2D matmul
+result = ch8.execute(mlir_text, "relu", [input], (2, 4))       # 2D unary
+result = ch8.execute(mlir_text, "mlp", [x, W1, W2], (2, 2))    # Multi-input
+```
+
+**Key Design**: Shape-generic binding eliminates the need for operation-specific or shape-specific helper functions.
 
 ## Building
 
@@ -81,9 +96,12 @@ All 5 tests pass:
 |--------|-----------|-----------|
 | **Dialect** | Custom C++ dialect | Text-based "nn" dialect |
 | **Lowering** | C++ passes | Python text generation |
-| **Bindings** | 3+ operation-specific helpers | 4 generic shape-based helpers |
-| **Complexity** | C++ dialect + C++ lowering + C++ bindings | Python graph + Python lowering + generic bindings |
-| **ABI Handling** | Per-operation C++ code | Unified memref parameter passing |
+| **Bindings** | ✅ `execute_generic(fnPtr, inputs, shape)` | ✅ `execute(mlir, func, inputs, shape)` |
+| **Complexity** | C++ dialect + C++ lowering + generic bindings | Python graph + Python lowering + generic bindings |
+| **Shape Handling** | Runtime introspection | Runtime introspection |
+| **Code Lines (bindings)** | ~110 lines (generic only) | ~100 lines (generic only) |
+
+**Key Achievement**: Generic binding layer uses runtime shape introspection to eliminate all shape-specific helper functions. Both chapters benefit from the same clean, maintainable API design.
 
 ## Key Insight
 
@@ -136,6 +154,9 @@ This chapter sets up a direct comparison for the next chapter:
 - ✓ Python-based custom dialect workflow (string generation)
 - ✓ Clean separation: Python (high-level) vs C++ (compilation)
 - ✓ Educational foundation for understanding MLIR concepts
+- ✓ **Generic binding layer** - single `execute()` function for all operations
 - ✓ Ready for Chapter 9's TableGen comparison
+
+**Key Insight**: The generic binding layer (added to both Chapter 7 and 8) solves the shape-specific binding problem through runtime introspection. This is orthogonal to the custom dialect concept - both chapters benefit equally.
 
 **Philosophy**: Start simple (Python strings) to understand concepts, then move to industrial tools (TableGen) for production use.

@@ -64,163 +64,108 @@ private:
     std::unique_ptr<JITCompiler> jit;
 };
 
-// Helper to execute 1D functions
-py::array_t<float> execute_1d(uintptr_t fnPtr, py::array_t<float> input) {
-    auto inputBuf = input.request();
-    if (inputBuf.ndim != 1) {
-        throw std::runtime_error("Input must be 1D");
+// Generic execute helper - handles arbitrary inputs
+py::array_t<float> execute_generic(uintptr_t fnPtr, py::list inputs, py::tuple output_shape) {
+    // Prepare output array
+    std::vector<ssize_t> out_shape;
+    for (auto item : output_shape) {
+        out_shape.push_back(py::cast<ssize_t>(item));
+    }
+    auto output = py::array_t<float>(out_shape);
+
+    // Marshal all arguments
+    std::vector<void*> args;
+    
+    // Helper lambdas for marshaling
+    auto marshal_1d = [&args](py::array_t<float> arr) {
+        auto buf = arr.request();
+        float* data = static_cast<float*>(buf.ptr);
+        args.push_back(data);
+        args.push_back(data);
+        args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(0)));
+        args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[0])));
+        args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(1)));
+    };
+    
+    auto marshal_2d = [&args](py::array_t<float> arr) {
+        auto buf = arr.request();
+        float* data = static_cast<float*>(buf.ptr);
+        args.push_back(data);
+        args.push_back(data);
+        args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(0)));
+        args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[0])));
+        args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[1])));
+        args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[1])));
+        args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(1)));
+    };
+
+    // Marshal inputs
+    for (auto item : inputs) {
+        auto arr = py::cast<py::array_t<float>>(item);
+        auto buf = arr.request();
+        if (buf.ndim == 1) {
+            marshal_1d(arr);
+        } else if (buf.ndim == 2) {
+            marshal_2d(arr);
+        } else {
+            throw std::runtime_error("Only 1D and 2D arrays supported");
+        }
     }
 
-    py::array_t<float> output(inputBuf.shape[0]);
-    auto outputBuf = output.request();
-
-    // For static 1D memrefs like memref<Nxf32>, MLIR uses 5 parameters:
-    // (allocated, aligned, offset, size, stride)
-    using FnType = void(*)(
-        float*, float*, int64_t, int64_t, int64_t,  // input
-        float*, float*, int64_t, int64_t, int64_t   // output
-    );
-    auto fn = reinterpret_cast<FnType>(fnPtr);
-
-    fn(static_cast<float*>(inputBuf.ptr),
-       static_cast<float*>(inputBuf.ptr),
-       0, inputBuf.shape[0], 1,
-       static_cast<float*>(outputBuf.ptr),
-       static_cast<float*>(outputBuf.ptr),
-       0, outputBuf.shape[0], 1);
-
-    return output;
-}
-
-// Helper to execute 2D functions
-py::array_t<float> execute_2d(uintptr_t fnPtr, py::array_t<float> input) {
-    auto inputBuf = input.request();
-    if (inputBuf.ndim != 2) {
-        throw std::runtime_error("Input must be 2D");
+    // Marshal output
+    if (out_shape.size() == 1) {
+        marshal_1d(output);
+    } else if (out_shape.size() == 2) {
+        marshal_2d(output);
+    } else {
+        throw std::runtime_error("Only 1D and 2D outputs supported");
     }
 
-    py::array_t<float> output({inputBuf.shape[0], inputBuf.shape[1]});
-    auto outputBuf = output.request();
-
-    // For static 2D memrefs like memref<MxNxf32>, MLIR uses 7 parameters:
-    // (allocated, aligned, offset, size0, size1, stride1, stride0)
-    using FnType = void(*)(
-        float*, float*, int64_t, int64_t, int64_t, int64_t, int64_t,  // input
-        float*, float*, int64_t, int64_t, int64_t, int64_t, int64_t   // output
-    );
-    auto fn = reinterpret_cast<FnType>(fnPtr);
-
-    fn(static_cast<float*>(inputBuf.ptr),
-       static_cast<float*>(inputBuf.ptr),
-       0, inputBuf.shape[0], inputBuf.shape[1], inputBuf.shape[1], 1,
-       static_cast<float*>(outputBuf.ptr),
-       static_cast<float*>(outputBuf.ptr),
-       0, outputBuf.shape[0], outputBuf.shape[1], outputBuf.shape[1], 1);
-
-    return output;
-}
-
-// Helper for element-wise binary operations
-py::array_t<float> execute_binary_1d(uintptr_t fnPtr, py::array_t<float> lhs, py::array_t<float> rhs) {
-    auto lhsBuf = lhs.request();
-    auto rhsBuf = rhs.request();
-
-    if (lhsBuf.ndim != 1 || rhsBuf.ndim != 1) {
-        throw std::runtime_error("Inputs must be 1D");
+    // Execute with appropriate calling convention based on arg count
+    size_t num_args = args.size();
+    
+    if (num_args == 10) {  // 1 input + 1 output (both 1D): 5+5
+        using FnPtr = void(*)(void*, void*, void*, void*, void*,
+                               void*, void*, void*, void*, void*);
+        auto fn = reinterpret_cast<FnPtr>(fnPtr);
+        fn(args[0], args[1], args[2], args[3], args[4],
+           args[5], args[6], args[7], args[8], args[9]);
+    } else if (num_args == 14) {  // 1 input + 1 output (both 2D): 7+7
+        using FnPtr = void(*)(void*, void*, void*, void*, void*, void*, void*,
+                               void*, void*, void*, void*, void*, void*, void*);
+        auto fn = reinterpret_cast<FnPtr>(fnPtr);
+        fn(args[0], args[1], args[2], args[3], args[4], args[5], args[6],
+           args[7], args[8], args[9], args[10], args[11], args[12], args[13]);
+    } else if (num_args == 15) {  // 2 inputs + 1 output (all 1D): 5+5+5
+        using FnPtr = void(*)(void*, void*, void*, void*, void*,
+                               void*, void*, void*, void*, void*,
+                               void*, void*, void*, void*, void*);
+        auto fn = reinterpret_cast<FnPtr>(fnPtr);
+        fn(args[0], args[1], args[2], args[3], args[4],
+           args[5], args[6], args[7], args[8], args[9],
+           args[10], args[11], args[12], args[13], args[14]);
+    } else if (num_args == 21) {  // 2 inputs + 1 output (all 2D): 7+7+7
+        using FnPtr = void(*)(void*, void*, void*, void*, void*, void*, void*,
+                               void*, void*, void*, void*, void*, void*, void*,
+                               void*, void*, void*, void*, void*, void*, void*);
+        auto fn = reinterpret_cast<FnPtr>(fnPtr);
+        fn(args[0], args[1], args[2], args[3], args[4], args[5], args[6],
+           args[7], args[8], args[9], args[10], args[11], args[12], args[13],
+           args[14], args[15], args[16], args[17], args[18], args[19], args[20]);
+    } else if (num_args == 28) {  // 3 inputs + 1 output (all 2D): 7+7+7+7
+        using FnPtr = void(*)(void*, void*, void*, void*, void*, void*, void*,
+                               void*, void*, void*, void*, void*, void*, void*,
+                               void*, void*, void*, void*, void*, void*, void*,
+                               void*, void*, void*, void*, void*, void*, void*);
+        auto fn = reinterpret_cast<FnPtr>(fnPtr);
+        fn(args[0], args[1], args[2], args[3], args[4], args[5], args[6],
+           args[7], args[8], args[9], args[10], args[11], args[12], args[13],
+           args[14], args[15], args[16], args[17], args[18], args[19], args[20],
+           args[21], args[22], args[23], args[24], args[25], args[26], args[27]);
+    } else {
+        throw std::runtime_error("Unsupported argument count: " + std::to_string(num_args) + 
+                                  ". Extend execute_generic() for this case.");
     }
-
-    py::array_t<float> output(lhsBuf.shape[0]);
-    auto outputBuf = output.request();
-
-    // For binary operations: memref<Nxf32>, memref<Nxf32> -> memref<Nxf32>
-    using FnType = void(*)(
-        float*, float*, int64_t, int64_t, int64_t,  // lhs
-        float*, float*, int64_t, int64_t, int64_t,  // rhs
-        float*, float*, int64_t, int64_t, int64_t   // output
-    );
-    auto fn = reinterpret_cast<FnType>(fnPtr);
-
-    fn(static_cast<float*>(lhsBuf.ptr),
-       static_cast<float*>(lhsBuf.ptr),
-       0, lhsBuf.shape[0], 1,
-       static_cast<float*>(rhsBuf.ptr),
-       static_cast<float*>(rhsBuf.ptr),
-       0, rhsBuf.shape[0], 1,
-       static_cast<float*>(outputBuf.ptr),
-       static_cast<float*>(outputBuf.ptr),
-       0, outputBuf.shape[0], 1);
-
-    return output;
-}
-
-// Helper for matmul
-py::array_t<float> execute_matmul(uintptr_t fnPtr, py::array_t<float> lhs, py::array_t<float> rhs) {
-    auto lhsBuf = lhs.request();
-    auto rhsBuf = rhs.request();
-
-    if (lhsBuf.ndim != 2 || rhsBuf.ndim != 2) {
-        throw std::runtime_error("Inputs must be 2D");
-    }
-
-    py::array_t<float> output({lhsBuf.shape[0], rhsBuf.shape[1]});
-    auto outputBuf = output.request();
-
-    // For matmul: memref<MxKxf32>, memref<KxNxf32> -> memref<MxNxf32>
-    using FnType = void(*)(
-        float*, float*, int64_t, int64_t, int64_t, int64_t, int64_t,  // lhs
-        float*, float*, int64_t, int64_t, int64_t, int64_t, int64_t,  // rhs
-        float*, float*, int64_t, int64_t, int64_t, int64_t, int64_t   // output
-    );
-    auto fn = reinterpret_cast<FnType>(fnPtr);
-
-    fn(static_cast<float*>(lhsBuf.ptr),
-       static_cast<float*>(lhsBuf.ptr),
-       0, lhsBuf.shape[0], lhsBuf.shape[1], lhsBuf.shape[1], 1,
-       static_cast<float*>(rhsBuf.ptr),
-       static_cast<float*>(rhsBuf.ptr),
-       0, rhsBuf.shape[0], rhsBuf.shape[1], rhsBuf.shape[1], 1,
-       static_cast<float*>(outputBuf.ptr),
-       static_cast<float*>(outputBuf.ptr),
-       0, outputBuf.shape[0], outputBuf.shape[1], outputBuf.shape[1], 1);
-
-    return output;
-}
-
-// Helper for 3 2D inputs
-py::array_t<float> execute_3inputs_2d(uintptr_t fnPtr, py::array_t<float> input1, py::array_t<float> input2, py::array_t<float> input3) {
-    auto in1Buf = input1.request();
-    auto in2Buf = input2.request();
-    auto in3Buf = input3.request();
-
-    if (in1Buf.ndim != 2 || in2Buf.ndim != 2 || in3Buf.ndim != 2) {
-        throw std::runtime_error("All inputs must be 2D");
-    }
-
-    // Output shape: (input1.rows, input3.cols)
-    py::array_t<float> output({in1Buf.shape[0], in3Buf.shape[1]});
-    auto outputBuf = output.request();
-
-    // For 3 2D inputs + 1 2D output: each memref = 7 parameters
-    using FnType = void(*)(        
-        float*, float*, int64_t, int64_t, int64_t, int64_t, int64_t,  // input1
-        float*, float*, int64_t, int64_t, int64_t, int64_t, int64_t,  // input2
-        float*, float*, int64_t, int64_t, int64_t, int64_t, int64_t,  // input3
-        float*, float*, int64_t, int64_t, int64_t, int64_t, int64_t   // output
-    );
-    auto fn = reinterpret_cast<FnType>(fnPtr);
-
-    fn(static_cast<float*>(in1Buf.ptr),
-       static_cast<float*>(in1Buf.ptr),
-       0, in1Buf.shape[0], in1Buf.shape[1], in1Buf.shape[1], 1,
-       static_cast<float*>(in2Buf.ptr),
-       static_cast<float*>(in2Buf.ptr),
-       0, in2Buf.shape[0], in2Buf.shape[1], in2Buf.shape[1], 1,
-       static_cast<float*>(in3Buf.ptr),
-       static_cast<float*>(in3Buf.ptr),
-       0, in3Buf.shape[0], in3Buf.shape[1], in3Buf.shape[1], 1,
-       static_cast<float*>(outputBuf.ptr),
-       static_cast<float*>(outputBuf.ptr),
-       0, outputBuf.shape[0], outputBuf.shape[1], outputBuf.shape[1], 1);
 
     return output;
 }
@@ -239,9 +184,9 @@ PYBIND11_MODULE(ch7_neural_ops, m) {
         .def("get_mlir", &Graph::getMLIR, "Get MLIR representation")
         .def("compile", &Graph::compile, "Compile the graph");
 
-    m.def("execute_1d", &execute_1d, "Execute 1D function");
-    m.def("execute_2d", &execute_2d, "Execute 2D function");
-    m.def("execute_binary_1d", &execute_binary_1d, "Execute binary 1D function");
-    m.def("execute_matmul", &execute_matmul, "Execute matmul function");
-    m.def("execute_3inputs_2d", &execute_3inputs_2d, "Execute function with 3 2D inputs");
+    m.def("execute_generic", &execute_generic,
+          "Generic execute function - handles arbitrary inputs",
+          py::arg("fnPtr"),
+          py::arg("inputs"),
+          py::arg("output_shape"));
 }
