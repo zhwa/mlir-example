@@ -25,6 +25,10 @@ add_definitions(${LLVM_DEFINITIONS})
 # pybind11
 add_subdirectory(${CMAKE_SOURCE_DIR}/build/deps/pybind11 pybind11_build EXCLUDE_FROM_ALL)
 
+# Find libffi for variadic function calls
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(FFI REQUIRED libffi)
+
 # Get MLIR libraries
 get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
 get_property(conversion_libs GLOBAL PROPERTY MLIR_CONVERSION_LIBS)
@@ -51,10 +55,15 @@ pybind11_add_module(ch8
 
 target_link_libraries(ch8 PRIVATE
     ${MLIR_LIBS}
+    ${FFI_LIBRARIES}
     LLVMX86Info
     LLVMX86AsmParser
     LLVMX86CodeGen
     LLVMX86Desc
+)
+
+target_include_directories(ch8 PRIVATE
+    ${FFI_INCLUDE_DIRS}
 )
 
 # Install the Python module to the build directory

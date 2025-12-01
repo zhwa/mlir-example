@@ -2,6 +2,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
+#include <ffi.h>
 
 namespace py = pybind11;
 
@@ -38,7 +39,7 @@ void marshal_memref_2d(std::vector<void*>& args, py::array_t<float> arr) {
     args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(1)));  // stride1
 }
 
-// Generic execute function - handles arbitrary inputs
+// libffi-based execute - handles ANY signature universally
 py::array_t<float> execute(const std::string& mlir_text,
                             const std::string& func_name,
                             py::list inputs,
@@ -62,12 +63,12 @@ py::array_t<float> execute(const std::string& mlir_text,
     }
     auto output = py::array_t<float>(out_shape);
 
-    // Marshal all input arguments + output
+    // Marshal all arguments (inputs + output) into a flat vector
     std::vector<void*> args;
     for (auto item : inputs) {
         auto arr = py::cast<py::array_t<float>>(item);
         auto buf = arr.request();
-        
+
         if (buf.ndim == 1) {
             marshal_memref_1d(args, arr);
         } else if (buf.ndim == 2) {
@@ -86,54 +87,29 @@ py::array_t<float> execute(const std::string& mlir_text,
         throw std::runtime_error("Only 1D and 2D outputs supported");
     }
 
-    // Call the function with variable number of arguments
-    // This is the tricky part - we need to match MLIR's calling convention
+    // Use libffi for truly variadic calling (handles ANY parameter count)
     size_t num_args = args.size();
-    
-    // Use libffi-style invocation for arbitrary arg counts
-    // For simplicity, handle common cases explicitly
-    if (num_args == 10) {  // 2 inputs (1D) + 1 output (1D): 5+5 params
-        using FnPtr = void(*)(void*, void*, void*, void*, void*,
-                               void*, void*, void*, void*, void*);
-        auto fn = reinterpret_cast<FnPtr>(fnPtr);
-        fn(args[0], args[1], args[2], args[3], args[4],
-           args[5], args[6], args[7], args[8], args[9]);
-    } else if (num_args == 14) {  // 1 input (2D) + 1 output (2D): 7+7 params
-        using FnPtr = void(*)(void*, void*, void*, void*, void*, void*, void*,
-                               void*, void*, void*, void*, void*, void*, void*);
-        auto fn = reinterpret_cast<FnPtr>(fnPtr);
-        fn(args[0], args[1], args[2], args[3], args[4], args[5], args[6],
-           args[7], args[8], args[9], args[10], args[11], args[12], args[13]);
-    } else if (num_args == 15) {  // 2 inputs (1D) + 1 output (1D): 5+5+5 params
-        using FnPtr = void(*)(void*, void*, void*, void*, void*,
-                               void*, void*, void*, void*, void*,
-                               void*, void*, void*, void*, void*);
-        auto fn = reinterpret_cast<FnPtr>(fnPtr);
-        fn(args[0], args[1], args[2], args[3], args[4],
-           args[5], args[6], args[7], args[8], args[9],
-           args[10], args[11], args[12], args[13], args[14]);
-    } else if (num_args == 21) {  // 2 inputs (2D) + 1 output (2D): 7+7+7 params
-        using FnPtr = void(*)(void*, void*, void*, void*, void*, void*, void*,
-                               void*, void*, void*, void*, void*, void*, void*,
-                               void*, void*, void*, void*, void*, void*, void*);
-        auto fn = reinterpret_cast<FnPtr>(fnPtr);
-        fn(args[0], args[1], args[2], args[3], args[4], args[5], args[6],
-           args[7], args[8], args[9], args[10], args[11], args[12], args[13],
-           args[14], args[15], args[16], args[17], args[18], args[19], args[20]);
-    } else if (num_args == 28) {  // 3 inputs (2D) + 1 output (2D): 7+7+7+7 params
-        using FnPtr = void(*)(void*, void*, void*, void*, void*, void*, void*,
-                               void*, void*, void*, void*, void*, void*, void*,
-                               void*, void*, void*, void*, void*, void*, void*,
-                               void*, void*, void*, void*, void*, void*, void*);
-        auto fn = reinterpret_cast<FnPtr>(fnPtr);
-        fn(args[0], args[1], args[2], args[3], args[4], args[5], args[6],
-           args[7], args[8], args[9], args[10], args[11], args[12], args[13],
-           args[14], args[15], args[16], args[17], args[18], args[19], args[20],
-           args[21], args[22], args[23], args[24], args[25], args[26], args[27]);
-    } else {
-        throw std::runtime_error("Unsupported argument count: " + std::to_string(num_args) + 
-                                  ". Extend execute() for this case.");
+
+    // Setup FFI types (all arguments are pointers or intptr_t cast to pointers)
+    std::vector<ffi_type*> arg_types(num_args, &ffi_type_pointer);
+
+    // Prepare argument values
+    std::vector<void*> arg_values(num_args);
+    for (size_t i = 0; i < num_args; ++i) {
+        arg_values[i] = &args[i];  // pointer to the void* value
     }
+
+    // Setup FFI CIF (Call Interface)
+    ffi_cif cif;
+    ffi_status status = ffi_prep_cif(&cif, FFI_DEFAULT_ABI, num_args, 
+                                      &ffi_type_void, arg_types.data());
+
+    if (status != FFI_OK) {
+        throw std::runtime_error("libffi ffi_prep_cif failed");
+    }
+
+    // Execute the function
+    ffi_call(&cif, FFI_FN(fnPtr), nullptr, arg_values.data());
 
     return output;
 }
@@ -141,10 +117,10 @@ py::array_t<float> execute(const std::string& mlir_text,
 } // namespace ch8
 
 PYBIND11_MODULE(ch8, m) {
-    m.doc() = "Chapter 8: Custom Dialect with Python Lowering";
+    m.doc() = "Chapter 8: Custom Dialect with Python Lowering (libffi-based)";
 
     m.def("execute", &ch8::execute,
-          "Generic execute function - handles arbitrary inputs",
+          "Universal execute using libffi - handles ANY signature",
           py::arg("mlir_text"),
           py::arg("func_name"),
           py::arg("inputs"),
