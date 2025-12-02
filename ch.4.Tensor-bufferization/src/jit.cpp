@@ -67,8 +67,15 @@ using GemmFnPtr = void(*)(
 /// Since we use dynamic shapes (memref<?x?xf32>), the compiled code is
 /// shape-agnostic and works for ANY matrix dimensions. We only need to
 /// compile ONCE and reuse for all shapes!
+/// Global cache for the JIT-compiled GEMM function.
+/// Since we use dynamic shapes (memref<?x?xf32>), the compiled code is
+/// shape-agnostic and works for ANY matrix dimensions. We only need to
+/// compile ONCE and reuse for all shapes!
+///
+/// Note: We use raw pointer to avoid destructor ordering issues during
+/// static destruction. The memory leak on exit is intentional and harmless.
 struct GlobalJITCache {
-  std::unique_ptr<mlir::ExecutionEngine> engine;
+  mlir::ExecutionEngine* engine = nullptr;
   GemmFnPtr funcPtr = nullptr;
   bool isCompiled = false;
 } gGemmJIT;
@@ -81,8 +88,8 @@ struct GlobalJITCache {
 /// This function performs the expensive JIT compilation.
 /// Since we use dynamic shapes, this only needs to be called ONCE!
 ///
-/// Returns: pair<LLJIT instance, function pointer> or {nullptr, nullptr} on error.
-std::pair<std::unique_ptr<mlir::ExecutionEngine>, GemmFnPtr> 
+/// Returns: pair<ExecutionEngine instance, function pointer> or {nullptr, nullptr} on error.
+std::pair<mlir::ExecutionEngine*, GemmFnPtr> 
 compileGemmFunction() {
   llvm::errs() << "[JIT] Compiling shape-agnostic GEMM function...\n";
 
@@ -157,7 +164,8 @@ compileGemmFunction() {
 
   // Extract function pointer and return along with ExecutionEngine instance
   auto* gemm_func = reinterpret_cast<GemmFnPtr>(*expectedFPtr);
-  return {std::move(engine), gemm_func};
+  // Transfer ownership - caller manages the ExecutionEngine lifetime
+  return {engine.release(), gemm_func};
 }
 
 //===----------------------------------------------------------------------===//
@@ -198,8 +206,8 @@ void executeGemm(float* A, float* B, float* C, int64_t M, int64_t N, int64_t K) 
       return;
     }
     
-    // Store in global cache
-    gGemmJIT.engine = std::move(engine);
+    // Store in global cache (raw pointer, no ownership management)
+    gGemmJIT.engine = engine;
     gGemmJIT.funcPtr = func;
     gGemmJIT.isCompiled = true;
     
