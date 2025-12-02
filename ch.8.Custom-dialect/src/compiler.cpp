@@ -129,7 +129,8 @@ public:
         }
 
         // Store ExecutionEngine instance to keep it alive
-        engines_.push_back(std::move(engine));
+        // Use raw pointer to avoid destruction order issues (see EXECUTION_ENGINE.md)
+        engines_.push_back(engine.release());
 
         return reinterpret_cast<void*>(*expectedFPtr);
     }
@@ -138,7 +139,9 @@ public:
 
 private:
     MLIRContext context_;
-    std::vector<std::unique_ptr<mlir::ExecutionEngine>> engines_;
+    // Raw pointers to avoid static destruction order issues with LLVM globals
+    // Memory intentionally leaked on program exit (OS reclaims all memory anyway)
+    std::vector<mlir::ExecutionEngine*> engines_;
 };
 
 } // namespace ch8
