@@ -77,7 +77,7 @@ py::array_t<float> gemm(py::array_t<float> A, py::array_t<float> B) {
   auto C = py::array_t<float>({8, 16});
   auto C_buf = C.request();
 
-  // Execute GEMM (currently uses placeholder CPU implementation)
+  // Execute GEMM using ExecutionEngine
   mlir::executeGemm(
     static_cast<float*>(A_buf.ptr),
     static_cast<float*>(B_buf.ptr),
@@ -142,7 +142,7 @@ std::string test_optimized_ir() {
 }
 
 PYBIND11_MODULE(ch1_fixed_size, m) {
-  m.doc() = "MLIR-powered matrix multiplication accelerator (Chapter 1: Fixed-size)";
+  m.doc() = "MLIR-powered matrix multiplication (Chapter 1: ExecutionEngine)";
 
   m.def("gemm", &gemm, 
         "Compute C = A @ B where A is 8x32 and B is 32x16",

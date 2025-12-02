@@ -1,13 +1,15 @@
-//===- jit.cpp - JIT Execution using LLJIT -------------------------------===//
+//===- jit.cpp - JIT Execution using ExecutionEngine ---------------------===//
 //
-// This file demonstrates Just-In-Time (JIT) compilation:
+// This file demonstrates Just-In-Time (JIT) compilation using MLIR's official
+// ExecutionEngine wrapper:
 //   1. Generate MLIR IR (high-level)
-//   2. Lower to LLVM IR (low-level)
+//   2. Lower to LLVM IR (automatic via ExecutionEngine)
 //   3. Compile to native machine code (x86_64 instructions)
 //   4. Execute directly in memory (no files written to disk!)
 //
-// LLJIT is LLVM's modern JIT API (ORC v2). It's more powerful than the
-// older MCJIT API and is the recommended approach for new projects.
+// ExecutionEngine is MLIR's official wrapper around LLVM's LLJIT (ORC v2).
+// It simplifies the JIT workflow by handling LLVM IR translation and 
+// optimization internally.
 //
 // The trickiest part: memref descriptors expand to 7 arguments each!
 //   memref<8x32xf32> → (ptr, ptr, offset, size0, size1, stride0, stride1)
@@ -16,19 +18,14 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/ExecutionEngine/ExecutionEngine.h"
 #include "mlir/ExecutionEngine/OptUtils.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
-#include "mlir/Target/LLVMIR/Export.h"
-#include "llvm/ExecutionEngine/Orc/LLJIT.h"
-#include "llvm/ExecutionEngine/Orc/Mangling.h"
-#include "llvm/ExecutionEngine/Orc/ExecutorProcessControl.h"
-#include "llvm/IR/Module.h"
 #include "llvm/Support/TargetSelect.h"
 #include <cstdint>
-#include <cstdlib>
 
 namespace mlir {
 
@@ -36,23 +33,22 @@ namespace mlir {
 OwningOpRef<ModuleOp> createGemmModule(MLIRContext& context);
 LogicalResult applyOptimizationPasses(ModuleOp module);
 
-/// JIT-compiles and executes the GEMM function.
+/// JIT-compiles and executes the GEMM function using ExecutionEngine.
 ///
-/// This function does something remarkable: it generates machine code at runtime
-/// and executes it immediately. The workflow is:
+/// This function generates machine code at runtime using MLIR's official
+/// ExecutionEngine API. The workflow is:
 ///   1. Generate MLIR (high-level matrix multiply)
 ///   2. Apply optimization passes (linalg → loops → LLVM)
-///   3. Translate to LLVM IR
-///   4. JIT compile to native x86_64 code
-///   5. Look up the function pointer
-///   6. Call it directly!
+///   3. ExecutionEngine handles LLVM IR translation + optimization internally
+///   4. Look up the function pointer
+///   5. Call it directly!
 ///
 /// Args:
 ///   A: Float array for 8×32 matrix A (row-major layout)
 ///   B: Float array for 32×16 matrix B (row-major layout)
 ///   C: Float array for 8×16 matrix C (output, will be overwritten)
 void executeGemm(float* A, float* B, float* C) {
-  llvm::errs() << "[JIT] Starting executeGemm with LLJIT\n";
+  llvm::errs() << "[JIT] Starting executeGemm with ExecutionEngine\n";
 
   // Step 1: Initialize LLVM's code generation for our CPU
   // This tells LLVM what instruction set we support (x86_64, ARM, etc.)
@@ -61,7 +57,6 @@ void executeGemm(float* A, float* B, float* C) {
   if (!initialized) {
     llvm::InitializeNativeTarget();           // Enable codegen for our CPU
     llvm::InitializeNativeTargetAsmPrinter(); // Enable assembly output
-    llvm::InitializeNativeTargetAsmParser();  // Enable assembly input
     initialized = true;
   }
 
@@ -75,61 +70,40 @@ void executeGemm(float* A, float* B, float* C) {
     return;
   }
 
-  // Apply optimization passes
+  // Apply optimization passes (lowers to LLVM dialect)
   if (failed(applyOptimizationPasses(*mlirModule))) {
     llvm::errs() << "[JIT] Failed to apply optimization passes\n";
     return;
   }
 
-  // Register dialect translations
+  // Register LLVM dialect translations (required for ExecutionEngine)
   registerBuiltinDialectTranslation(*mlirModule->getContext());
   registerLLVMDialectTranslation(*mlirModule->getContext());
 
-  // Translate MLIR to LLVM IR
-  llvm::errs() << "[JIT] Translating MLIR to LLVM IR...\n";
-  auto llvmContext = std::make_unique<llvm::LLVMContext>();
-  auto llvmModule = translateModuleToLLVMIR(*mlirModule, *llvmContext);
-  if (!llvmModule) {
-    llvm::errs() << "[JIT] Failed to translate MLIR to LLVM IR\n";
+  llvm::errs() << "[JIT] Creating ExecutionEngine...\n";
+
+  // Create ExecutionEngine with optimization pipeline
+  // ExecutionEngine handles LLVM IR translation internally
+  mlir::ExecutionEngineOptions options;
+  options.transformer = mlir::makeOptimizingTransformer(
+      /*optLevel=*/3, /*sizeLevel=*/0, /*targetMachine=*/nullptr);
+
+  auto maybeEngine = mlir::ExecutionEngine::create(*mlirModule, options);
+  if (!maybeEngine) {
+    llvm::errs() << "[JIT] Failed to create ExecutionEngine: " 
+                 << maybeEngine.takeError() << "\n";
     return;
   }
 
-  // Apply LLVM optimizations
-  auto optPipeline = makeOptimizingTransformer(
-      /*optLevel=*/3,
-      /*sizeLevel=*/0,
-      /*targetMachine=*/nullptr
-  );
-  if (auto Err = optPipeline(llvmModule.get())) {
-    llvm::errs() << "[JIT] Failed to apply LLVM optimization: " << Err << "\n";
-    return;
-  }
-
-  llvm::errs() << "[JIT] Creating LLJIT instance...\n";
-
-  // Create LLJIT
-  auto JIT = llvm::orc::LLJITBuilder().create();
-  if (!JIT) {
-    llvm::errs() << "[JIT] Failed to create LLJIT: " << JIT.takeError() << "\n";
-    return;
-  }
-
-  // Add the LLVM IR module to LLJIT (use same context)
-  auto TSM = llvm::orc::ThreadSafeModule(
-      std::move(llvmModule), 
-      std::move(llvmContext)
-  );
-  if (auto Err = (*JIT)->addIRModule(std::move(TSM))) {
-    llvm::errs() << "[JIT] Failed to add IR module: " << Err << "\n";
-    return;
-  }
+  auto engine = std::move(*maybeEngine);
 
   llvm::errs() << "[JIT] Looking up function 'gemm_8x16x32'...\n";
 
   // Lookup the function
-  auto Sym = (*JIT)->lookup("gemm_8x16x32");
-  if (!Sym) {
-    llvm::errs() << "[JIT] Failed to lookup function: " << Sym.takeError() << "\n";
+  auto expectedFPtr = engine->lookup("gemm_8x16x32");
+  if (!expectedFPtr) {
+    llvm::errs() << "[JIT] Failed to lookup function: " 
+                 << expectedFPtr.takeError() << "\n";
     return;
   }
 
@@ -142,7 +116,7 @@ void executeGemm(float* A, float* B, float* C) {
       float*, float*, int64_t, int64_t, int64_t, int64_t, int64_t   // C
   );
 
-  auto* gemm_func = Sym->toPtr<FnPtr>();
+  auto* gemm_func = reinterpret_cast<FnPtr>(*expectedFPtr);
 
   llvm::errs() << "[JIT] Calling JIT-compiled function...\n";
   gemm_func(

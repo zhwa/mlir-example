@@ -7,7 +7,6 @@
 #include <mlir/Transforms/Passes.h>
 #include <mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h>
 #include <mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h>
-#include <mlir/Target/LLVMIR/Export.h>
 
 // Dialect headers
 #include <mlir/Dialect/Arith/IR/Arith.h>
@@ -32,7 +31,6 @@
 #include <mlir/Dialect/Linalg/Passes.h>
 
 #include <llvm/Support/TargetSelect.h>
-#include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/Support/CommandLine.h>
 #include <string>
 #include <memory>
@@ -96,9 +94,10 @@ public:
 
         return succeeded(pm.run(module));
     }
-    // JIT compile module using LLJIT (same pattern as Chapter 7)
+
+    // JIT compile module using mlir::ExecutionEngine (official MLIR API)
     void* compileAndGetFunctionPtr(ModuleOp module, const std::string& funcName) {
-        // Register translations
+        // Register translations (required for ExecutionEngine)
         registerBuiltinDialectTranslation(*module.getContext());
         registerLLVMDialectTranslation(*module.getContext());
 
@@ -108,48 +107,38 @@ public:
             return nullptr;
         }
 
-        // Translate to LLVM IR
-        llvm::LLVMContext llvmContext;
-        auto llvmModule = translateModuleToLLVMIR(module, llvmContext);
-        if (!llvmModule) {
-            llvm::errs() << "Failed to translate to LLVM IR\n";
+        // Create ExecutionEngine with optimization pipeline
+        mlir::ExecutionEngineOptions options;
+        options.transformer = mlir::makeOptimizingTransformer(
+            /*optLevel=*/3, /*sizeLevel=*/0, /*targetMachine=*/nullptr);
+
+        auto maybeEngine = mlir::ExecutionEngine::create(module, options);
+        if (!maybeEngine) {
+            llvm::errs() << "Failed to create ExecutionEngine: " 
+                         << maybeEngine.takeError() << "\n";
             return nullptr;
         }
 
-        // Create LLJIT
-        auto jitOrErr = llvm::orc::LLJITBuilder().create();
-        if (!jitOrErr) {
-            llvm::errs() << "Failed to create LLJIT: " << jitOrErr.takeError() << "\n";
-            return nullptr;
-        }
-        auto jit = std::move(*jitOrErr);
+        auto engine = std::move(*maybeEngine);
 
-        // Add the module
-        auto tsm = llvm::orc::ThreadSafeModule(std::move(llvmModule), 
-                                               std::make_unique<llvm::LLVMContext>());
-        if (auto err = jit->addIRModule(std::move(tsm))) {
-            llvm::errs() << "Failed to add IR module: " << err << "\n";
+        // Lookup function
+        auto expectedFPtr = engine->lookup(funcName);
+        if (!expectedFPtr) {
+            llvm::errs() << "Failed to lookup function: " << funcName << "\n";
             return nullptr;
         }
 
-        // Lookup the function
-        auto symOrErr = jit->lookup(funcName);
-        if (!symOrErr) {
-            llvm::errs() << "Failed to lookup function: " << symOrErr.takeError() << "\n";
-            return nullptr;
-        }
+        // Store ExecutionEngine instance to keep it alive
+        engines_.push_back(std::move(engine));
 
-        // Store JIT instance to keep it alive
-        jitInstances_.push_back(std::move(jit));
-
-        return symOrErr->toPtr<void*>();
+        return reinterpret_cast<void*>(*expectedFPtr);
     }
 
     MLIRContext& getContext() { return context_; }
 
 private:
     MLIRContext context_;
-    std::vector<std::unique_ptr<llvm::orc::LLJIT>> jitInstances_;
+    std::vector<std::unique_ptr<mlir::ExecutionEngine>> engines_;
 };
 
 } // namespace ch8

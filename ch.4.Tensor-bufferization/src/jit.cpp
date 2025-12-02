@@ -1,4 +1,4 @@
-//===- jit.cpp - JIT Execution using LLJIT -------------------------------===//
+//===- jit.cpp - JIT Execution with Tensor Bufferization ----------------===//
 //
 // This file demonstrates Just-In-Time (JIT) compilation:
 //   1. Generate MLIR IR with dynamic shapes (high-level)
@@ -6,8 +6,8 @@
 //   3. Compile to native machine code (x86_64 instructions)
 //   4. Execute directly in memory (no files written to disk!)
 //
-// LLJIT is LLVM's modern JIT API (ORC v2). It's more powerful than the
-// older MCJIT API and is the recommended approach for new projects.
+// ExecutionEngine is MLIR's official JIT wrapper around LLVM's LLJIT.
+// It simplifies JIT compilation by handling translation and optimization.
 //
 // The trickiest part: memref descriptors expand to 7 arguments each!
 //   memref<?x?xf32> → (ptr, ptr, offset, size0, size1, stride0, stride1)
@@ -24,20 +24,15 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/ExecutionEngine/ExecutionEngine.h"
 #include "mlir/ExecutionEngine/OptUtils.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
-#include "mlir/Target/LLVMIR/Export.h"
-#include "llvm/ExecutionEngine/Orc/LLJIT.h"
-#include "llvm/ExecutionEngine/Orc/Mangling.h"
-#include "llvm/ExecutionEngine/Orc/ExecutorProcessControl.h"
-#include "llvm/IR/Module.h"
 #include "llvm/Support/TargetSelect.h"
 #include <cstdint>
 #include <cstdlib>
-#include <unordered_map>
 #include <memory>
 
 namespace mlir {
@@ -73,7 +68,7 @@ using GemmFnPtr = void(*)(
 /// shape-agnostic and works for ANY matrix dimensions. We only need to
 /// compile ONCE and reuse for all shapes!
 struct GlobalJITCache {
-  std::unique_ptr<llvm::orc::LLJIT> jit;
+  std::unique_ptr<mlir::ExecutionEngine> engine;
   GemmFnPtr funcPtr = nullptr;
   bool isCompiled = false;
 } gGemmJIT;
@@ -87,11 +82,11 @@ struct GlobalJITCache {
 /// Since we use dynamic shapes, this only needs to be called ONCE!
 ///
 /// Returns: pair<LLJIT instance, function pointer> or {nullptr, nullptr} on error.
-std::pair<std::unique_ptr<llvm::orc::LLJIT>, GemmFnPtr> 
+std::pair<std::unique_ptr<mlir::ExecutionEngine>, GemmFnPtr> 
 compileGemmFunction() {
   llvm::errs() << "[JIT] Compiling shape-agnostic GEMM function...\n";
 
-  // Initialize LLVM (same as static version)
+  // Initialize LLVM
   static bool initialized = false;
   if (!initialized) {
     llvm::InitializeNativeTarget();
@@ -125,63 +120,44 @@ compileGemmFunction() {
     return {nullptr, nullptr};
   }
 
-  // Register dialect translations
+  // Register dialect translations (required before ExecutionEngine::create)
   registerBuiltinDialectTranslation(*mlirModule->getContext());
   registerLLVMDialectTranslation(*mlirModule->getContext());
 
-  // Translate MLIR to LLVM IR
-  llvm::errs() << "[JIT] Translating MLIR to LLVM IR...\n";
-  auto llvmContext = std::make_unique<llvm::LLVMContext>();
-  auto llvmModule = translateModuleToLLVMIR(*mlirModule, *llvmContext);
-  if (!llvmModule) {
-    llvm::errs() << "[JIT] Failed to translate MLIR to LLVM IR\n";
-    return {nullptr, nullptr};
-  }
+  llvm::errs() << "[JIT] Creating ExecutionEngine...\n";
 
-  // Apply LLVM optimizations
-  auto optPipeline = makeOptimizingTransformer(
+  // Create ExecutionEngine with optimization
+  mlir::ExecutionEngineOptions options;
+  options.transformer = mlir::makeOptimizingTransformer(
       /*optLevel=*/3,
       /*sizeLevel=*/0,
       /*targetMachine=*/nullptr
   );
-  if (auto Err = optPipeline(llvmModule.get())) {
-    llvm::errs() << "[JIT] Failed to apply LLVM optimization: " << Err << "\n";
+  
+  auto maybeEngine = mlir::ExecutionEngine::create(*mlirModule, options);
+  if (!maybeEngine) {
+    llvm::errs() << "[JIT] Failed to create ExecutionEngine: " 
+                 << maybeEngine.takeError() << "\n";
     return {nullptr, nullptr};
   }
-
-  llvm::errs() << "[JIT] Creating LLJIT instance...\n";
-
-  // Create LLJIT
-  auto JIT = llvm::orc::LLJITBuilder().create();
-  if (!JIT) {
-    llvm::errs() << "[JIT] Failed to create LLJIT: " << JIT.takeError() << "\n";
-    return {nullptr, nullptr};
-  }
-
-  // Add the LLVM IR module to LLJIT
-  auto TSM = llvm::orc::ThreadSafeModule(
-      std::move(llvmModule), 
-      std::move(llvmContext)
-  );
-  if (auto Err = (*JIT)->addIRModule(std::move(TSM))) {
-    llvm::errs() << "[JIT] Failed to add IR module: " << Err << "\n";
-    return {nullptr, nullptr};
-  }
+  
+  auto engine = std::move(*maybeEngine);
 
   llvm::errs() << "[JIT] Looking up function 'gemm'...\n";
 
   // Lookup the function
-  auto Sym = (*JIT)->lookup("gemm");
-  if (!Sym) {
-    llvm::errs() << "[JIT] Failed to lookup function: " << Sym.takeError() << "\n";
+  auto expectedFPtr = engine->lookup("gemm");
+  if (!expectedFPtr) {
+    llvm::errs() << "[JIT] Failed to lookup function: " 
+                 << expectedFPtr.takeError() << "\n";
     return {nullptr, nullptr};
   }
 
   llvm::errs() << "[JIT] Function found! Compilation successful.\n";
 
-  // Extract function pointer and return along with JIT instance
-  auto* gemm_func = Sym->toPtr<GemmFnPtr>();
-  return {std::move(*JIT), gemm_func};
+  // Extract function pointer and return along with ExecutionEngine instance
+  auto* gemm_func = reinterpret_cast<GemmFnPtr>(*expectedFPtr);
+  return {std::move(engine), gemm_func};
 }
 
 //===----------------------------------------------------------------------===//
@@ -215,7 +191,7 @@ void executeGemm(float* A, float* B, float* C, int64_t M, int64_t N, int64_t K) 
   if (!gGemmJIT.isCompiled) {
     llvm::errs() << "[JIT] ✗ First call - compiling function...\n";
     
-    auto [jit, func] = compileGemmFunction();
+    auto [engine, func] = compileGemmFunction();
     
     if (!func) {
       llvm::errs() << "[JIT] Compilation failed!\n";
@@ -223,7 +199,7 @@ void executeGemm(float* A, float* B, float* C, int64_t M, int64_t N, int64_t K) 
     }
     
     // Store in global cache
-    gGemmJIT.jit = std::move(jit);
+    gGemmJIT.engine = std::move(engine);
     gGemmJIT.funcPtr = func;
     gGemmJIT.isCompiled = true;
     

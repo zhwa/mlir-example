@@ -1,6 +1,7 @@
 //===- jit.cpp - JIT Compilation for Softmax ----------------------------===//
 //
-// This file demonstrates JIT compilation and execution of softmax using LLJIT.
+// This file demonstrates JIT compilation and execution of softmax using
+// MLIR's ExecutionEngine.
 //
 //===----------------------------------------------------------------------===//
 
@@ -10,14 +11,12 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/ExecutionEngine/ExecutionEngine.h"
 #include "mlir/ExecutionEngine/OptUtils.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
-#include "mlir/Target/LLVMIR/Export.h"
 
-#include "llvm/ExecutionEngine/Orc/LLJIT.h"
-#include "llvm/IR/Module.h"
 #include "llvm/Support/TargetSelect.h"
 
 #include <memory>
@@ -37,9 +36,8 @@ LogicalResult applyLoweringPasses(ModuleOp module);
 /// This function:
 ///   1. Creates high-level MLIR IR (scf.for, math.exp)
 ///   2. Applies lowering passes (math→libm, scf→cf, *→llvm)
-///   3. Translates to LLVM IR
-///   4. JIT compiles using LLJIT
-///   5. Executes the compiled function
+///   3. JIT compiles using ExecutionEngine
+///   4. Executes the compiled function
 ///
 /// Args:
 ///   input: Input array
@@ -76,41 +74,32 @@ void executeSoftmax(float* input, float* output, int64_t size) {
     return;
   }
 
-  // Register dialect translations
+  // Register dialect translations (required before ExecutionEngine::create)
   registerBuiltinDialectTranslation(*mlirModule->getContext());
   registerLLVMDialectTranslation(*mlirModule->getContext());
 
-  // Translate MLIR to LLVM IR
-  llvm::LLVMContext llvmContext;
-  auto llvmModule = translateModuleToLLVMIR(*mlirModule, llvmContext);
-  if (!llvmModule) {
-    llvm::errs() << "[JIT] Failed to translate to LLVM IR\n";
+  // Create ExecutionEngine with optimization
+  mlir::ExecutionEngineOptions options;
+  options.transformer = mlir::makeOptimizingTransformer(
+      /*optLevel=*/3,
+      /*sizeLevel=*/0,
+      /*targetMachine=*/nullptr
+  );
+  
+  auto maybeEngine = mlir::ExecutionEngine::create(*mlirModule, options);
+  if (!maybeEngine) {
+    llvm::errs() << "[JIT] Failed to create ExecutionEngine: "
+                 << maybeEngine.takeError() << "\n";
     return;
   }
-
-  // Create LLJIT instance
-  auto jitOrErr = llvm::orc::LLJITBuilder().create();
-  if (!jitOrErr) {
-    llvm::errs() << "[JIT] Failed to create LLJIT: "
-                 << llvm::toString(jitOrErr.takeError()) << "\n";
-    return;
-  }
-  auto jit = std::move(*jitOrErr);
-
-  // Add LLVM module to JIT
-  auto tsm = llvm::orc::ThreadSafeModule(std::move(llvmModule),
-                                         std::make_unique<llvm::LLVMContext>());
-  if (auto err = jit->addIRModule(std::move(tsm))) {
-    llvm::errs() << "[JIT] Failed to add module: "
-                 << llvm::toString(std::move(err)) << "\n";
-    return;
-  }
+  
+  auto engine = std::move(*maybeEngine);
 
   // Look up the function
-  auto symOrErr = jit->lookup("softmax");
-  if (!symOrErr) {
+  auto expectedFPtr = engine->lookup("softmax");
+  if (!expectedFPtr) {
     llvm::errs() << "[JIT] Failed to look up function: "
-                 << llvm::toString(symOrErr.takeError()) << "\n";
+                 << expectedFPtr.takeError() << "\n";
     return;
   }
 
@@ -121,7 +110,7 @@ void executeSoftmax(float* input, float* output, int64_t size) {
     float*, float*, int64_t, int64_t, int64_t,   // input descriptor
     float*, float*, int64_t, int64_t, int64_t    // output descriptor
   );
-  auto softmaxFn = symOrErr->toPtr<SoftmaxFnPtr>();
+  auto softmaxFn = reinterpret_cast<SoftmaxFnPtr>(*expectedFPtr);
 
   // Prepare memref descriptors
   // For contiguous 1D arrays: allocated = aligned, offset = 0, stride = 1

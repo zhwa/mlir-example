@@ -16,5 +16,14 @@ target_include_directories(${PROJECT_NAME} SYSTEM PRIVATE
     ${MLIR_INCLUDE_DIRS}
 )
 
-# Link against common MLIR libraries
-target_link_libraries(${PROJECT_NAME} PRIVATE ${MLIR_COMMON_LIBS})
+# Find libffi
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBFFI REQUIRED libffi)
+
+# Link against common MLIR libraries and libffi
+target_link_libraries(${PROJECT_NAME} PRIVATE 
+    ${MLIR_COMMON_LIBS}
+    ${LIBFFI_LIBRARIES}
+)
+
+target_include_directories(${PROJECT_NAME} PRIVATE ${LIBFFI_INCLUDE_DIRS})

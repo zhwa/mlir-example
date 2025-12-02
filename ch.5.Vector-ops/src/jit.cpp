@@ -3,7 +3,7 @@
 // JIT compilation workflow:
 //   1. Generate MLIR IR with SCF
 //   2. Lower to LLVM IR
-//   3. JIT compile to native code
+//   3. JIT compile to native code using ExecutionEngine
 //   4. Execute with dynamic sizes
 //
 // Key difference from Chapter 1: Dynamic memrefs (memref<?xf32>)
@@ -12,14 +12,12 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/ExecutionEngine/ExecutionEngine.h"
 #include "mlir/ExecutionEngine/OptUtils.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
-#include "mlir/Target/LLVMIR/Export.h"
-#include "llvm/ExecutionEngine/Orc/LLJIT.h"
-#include "llvm/IR/Module.h"
 #include "llvm/Support/TargetSelect.h"
 #include <cstdint>
 
@@ -66,41 +64,32 @@ void executeSaxpy(float alpha, float* A, float* B, float* C, int64_t size) {
     return;
   }
 
-  // Register LLVM dialect translation
+  // Register LLVM dialect translation (required before ExecutionEngine::create)
   registerBuiltinDialectTranslation(context);
   registerLLVMDialectTranslation(context);
 
-  // Translate MLIR → LLVM IR
-  llvm::LLVMContext llvmContext;
-  auto llvmModule = translateModuleToLLVMIR(*mlirModule, llvmContext);
-  if (!llvmModule) {
-    llvm::errs() << "[JIT] Failed to translate to LLVM IR\n";
+  // Create ExecutionEngine with optimization
+  mlir::ExecutionEngineOptions options;
+  options.transformer = mlir::makeOptimizingTransformer(
+      /*optLevel=*/3,
+      /*sizeLevel=*/0,
+      /*targetMachine=*/nullptr
+  );
+  
+  auto maybeEngine = mlir::ExecutionEngine::create(*mlirModule, options);
+  if (!maybeEngine) {
+    llvm::errs() << "[JIT] Failed to create ExecutionEngine: "
+                 << maybeEngine.takeError() << "\n";
     return;
   }
-
-  // Create LLJIT instance
-  auto jitOrErr = llvm::orc::LLJITBuilder().create();
-  if (!jitOrErr) {
-    llvm::errs() << "[JIT] Failed to create LLJIT: "
-                 << llvm::toString(jitOrErr.takeError()) << "\n";
-    return;
-  }
-  auto jit = std::move(*jitOrErr);
-
-  // Add LLVM module to JIT
-  auto tsm = llvm::orc::ThreadSafeModule(std::move(llvmModule),
-                                         std::make_unique<llvm::LLVMContext>());
-  if (auto err = jit->addIRModule(std::move(tsm))) {
-    llvm::errs() << "[JIT] Failed to add module: "
-                 << llvm::toString(std::move(err)) << "\n";
-    return;
-  }
+  
+  auto engine = std::move(*maybeEngine);
 
   // Look up the function
-  auto symOrErr = jit->lookup("saxpy");
-  if (!symOrErr) {
+  auto expectedFPtr = engine->lookup("saxpy");
+  if (!expectedFPtr) {
     llvm::errs() << "[JIT] Failed to look up function: "
-                 << llvm::toString(symOrErr.takeError()) << "\n";
+                 << expectedFPtr.takeError() << "\n";
     return;
   }
 
@@ -112,7 +101,7 @@ void executeSaxpy(float alpha, float* A, float* B, float* C, int64_t size) {
     float*, float*, int64_t, int64_t, int64_t,   // B descriptor
     float*, float*, int64_t, int64_t, int64_t    // C descriptor
   );
-  auto saxpyFn = symOrErr->toPtr<SaxpyFnPtr>();
+  auto saxpyFn = reinterpret_cast<SaxpyFnPtr>(*expectedFPtr);
 
   // Prepare memref descriptors
   // For contiguous arrays: allocated = aligned, offset = 0, stride = 1

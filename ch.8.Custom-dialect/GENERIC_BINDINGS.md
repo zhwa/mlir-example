@@ -6,6 +6,8 @@
 
 **Chapter 7** uses explicit cases for educational transparency (see `ch.7.Neural-ops/` for comparison).
 
+**Note**: Both chapters now use `mlir::ExecutionEngine` instead of LLJIT (as of the latest migration). This simplifies JIT compilation by ~60% while maintaining identical functionality.
+
 ## API
 
 **Chapter 8** (Python Dialect with libffi):
@@ -51,7 +53,10 @@ result = ch8.execute(mlir, "custom", [many, inputs, of, any, shape], output_shap
 
 ```cpp
 py::array_t<float> execute(mlir_text, func_name, inputs, output_shape) {
-    // Marshal all inputs dynamically
+    // 1. Compile MLIR using ExecutionEngine
+    void* fnPtr = compiler.compileAndGetFunctionPtr(mlir_text, func_name);
+
+    // 2. Marshal all inputs dynamically
     std::vector<void*> args;
     for (auto item : inputs) {
         auto arr = py::cast<py::array_t<float>>(item);
@@ -62,7 +67,7 @@ py::array_t<float> execute(mlir_text, func_name, inputs, output_shape) {
     // Marshal output
     marshal_output(args, output_shape);
 
-    // Use libffi for truly variadic calling
+    // 3. Use libffi for truly variadic calling
     size_t num_args = args.size();
 
     // Setup FFI types (all arguments are pointers)
@@ -88,7 +93,7 @@ py::array_t<float> execute(mlir_text, func_name, inputs, output_shape) {
 
 ### Explicit Cases Approach (Chapter 7 - for comparison)
 
-Chapter 7 uses explicit parameter count enumeration for educational clarity:
+Chapter 7 uses explicit parameter count enumeration for educational clarity with ExecutionEngine:
 
 ```cpp
 py::array_t<float> execute_generic(fnPtr, inputs, output_shape) {
@@ -105,7 +110,7 @@ py::array_t<float> execute_generic(fnPtr, inputs, output_shape) {
 }
 ```
 
-**Trade-off**: Zero overhead but requires manual case enumeration.
+**Trade-off**: Zero overhead but requires manual case enumeration. Both chapters use ExecutionEngine for simplified JIT compilation.
 
 ## Code Reduction
 
@@ -113,11 +118,12 @@ py::array_t<float> execute_generic(fnPtr, inputs, output_shape) {
 - Chapter 7: ~250 lines (5 functions)
 - Chapter 8: ~220 lines (4 functions)
 
-**After** (generic binding):
-- Chapter 7: ~110 lines (explicit cases)
-- Chapter 8: ~80 lines (libffi universal)
+**After** (generic binding + ExecutionEngine):
+- Chapter 7: ~110 lines (explicit cases with ExecutionEngine)
+- Chapter 8: ~80 lines (libffi universal with ExecutionEngine)
 
-**Chapter 8: ~65% reduction** compared to shape-specific helpers!
+**Chapter 8: ~65% reduction** compared to shape-specific helpers!  
+**ExecutionEngine migration: ~60% reduction** in JIT compilation code (all chapters).
 
 ## Performance
 
@@ -148,10 +154,10 @@ sudo apt-get install libffi-dev pkg-config
 **The binding complexity is orthogonal to custom dialects**. Whether you use C++ (Chapter 7) or Python (Chapter 8) to define your dialect, the memref ABI challenge exists at the **FFI boundary**, not the IR level.
 
 **Chapter Comparison**:
-- **Chapter 7**: Explicit cases (educational, zero overhead)
-- **Chapter 8**: libffi universal (production-ready, minimal overhead)
+- **Chapter 7**: Explicit cases (educational, zero overhead) + ExecutionEngine
+- **Chapter 8**: libffi universal (production-ready, minimal overhead) + ExecutionEngine
 
-Both solve the same problem with different trade-offs.
+Both solve the same problem with different trade-offs. The recent ExecutionEngine migration (replacing LLJIT) reduces JIT compilation complexity by ~60% in both chapters while maintaining identical functionality.
 
 ### Implementation Strategy - libffi Universal
 
@@ -164,7 +170,7 @@ Both solve the same problem with different trade-offs.
 
 ```cpp
 py::array_t<float> execute(mlir_text, func_name, inputs, output_shape) {
-    // 1. Parse and compile MLIR
+    // 1. Parse and compile MLIR using ExecutionEngine
     void* fnPtr = compiler.compileAndGetFunctionPtr(...);
 
     // 2. Marshal all arguments
@@ -187,7 +193,7 @@ py::array_t<float> execute(mlir_text, func_name, inputs, output_shape) {
 }
 ```
 
-Total: ~80 lines including error handling.
+Total: ~80 lines including error handling. ExecutionEngine handles MLIR→LLVM translation and optimization automatically.
 
 ## Benefits
 
@@ -296,7 +302,7 @@ You might wonder: "Industrial compilers like IREE have clean Python APIs - do th
 
 ### IREE's Approach
 
-IREE (Intermediate Representation Execution Environment) uses a multi-layer strategy:
+IREE (Intermediate Representation Execution Environment) uses a multi-layer strategy similar to our ExecutionEngine approach, but with additional runtime abstractions:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -327,9 +333,10 @@ IREE (Intermediate Representation Execution Environment) uses a multi-layer stra
 
 | Aspect | Our Approach | IREE Approach |
 |--------|--------------|---------------|
+| **JIT Engine** | mlir::ExecutionEngine | Custom VM + JIT |
 | **Abstraction** | Minimal (direct FFI) | Heavy (BufferView, VM, Runtime) |
 | **Buffer Representation** | NumPy array → raw params | NumPy → BufferView → Runtime dispatch |
-| **Variadic Calling** | Explicit cases (10, 14, 21...) | **libffi** (true variadic) |
+| **Variadic Calling** | Explicit cases (10, 14, 21...) or libffi | **libffi** (true variadic) |
 | **Complexity Location** | Visible in bindings.cpp | Hidden in runtime layers |
 | **Runtime Overhead** | Minimal (direct call) | VM dispatch + buffer abstraction |
 | **Flexibility** | Switch cases (extensible) | Full generality (any signature) |
@@ -423,7 +430,8 @@ ffi_call(&cif, FFI_FN(fn), NULL, arg_values);  // Works for ANY arg count!
 - ✅ Educational transparency (see the problem directly)
 - ✅ Zero runtime overhead (direct function calls)
 - ✅ Simple debugging (just bindings.cpp and MLIR)
-- ✅ Minimal dependencies (just MLIR + pybind11)
+- ✅ Minimal dependencies (MLIR ExecutionEngine + pybind11)
+- ✅ Official MLIR JIT API (ExecutionEngine is the recommended approach)
 
 **Our Costs:**
 - ❌ Manual case enumeration (not fully general)
@@ -443,17 +451,21 @@ ffi_call(&cif, FFI_FN(fn), NULL, arg_values);  // Works for ANY arg count!
 - Makes memref ABI conventions explicit
 - Demonstrates the trade-off between abstraction and transparency
 - Lower barrier to entry (less infrastructure)
+- Uses official MLIR ExecutionEngine API (modern, recommended)
 
 **For Advanced Learning (Chapter 8 + libffi):**
 - Best of both worlds: educational transparency + production technique
 - Shows explicit cases first, then libffi as optimization
 - Demonstrates when abstraction is worth the complexity
+- ExecutionEngine simplifies JIT setup while libffi handles variadic calling
 
 ### The Key Insight
 
 > **Custom dialects don't eliminate binding complexity** - whether you use C++ (Chapter 7) or Python (Chapter 8) to define your dialect, the memref ABI problem exists at the **FFI boundary**, not the IR level.
 
 > **IREE doesn't magically avoid this** - they use BufferView abstractions + VM dispatch + libffi to hide the complexity, but the 1D→5 params, 2D→7 params expansion still happens under the hood.
+
+> **ExecutionEngine simplifies JIT, not FFI** - migrating from LLJIT to ExecutionEngine reduces JIT compilation code by ~60%, but the memref ABI challenge at the Python/C++ boundary remains unchanged. That's why we still need either explicit cases (Chapter 7) or libffi (Chapter 8).
 
 The difference is **where you pay the cost**:
 - **Our approach**: Pay at compile time (write switch cases)
@@ -481,6 +493,9 @@ The generic binding layer demonstrates that **thoughtful API design can hide com
 1. Shows how to build ergonomic APIs on top of low-level FFI
 2. Reveals the true cost of abstractions (IREE's approach)
 3. Demonstrates when to use explicit cases vs. libffi
-4. Crucial skill for compiler engineering and runtime design
+4. Illustrates the separation of concerns: ExecutionEngine for JIT compilation, libffi for variadic calling
+5. Crucial skill for compiler engineering and runtime design
 
 **Production Value**: Industrial compilers like IREE prove that these patterns scale - they just move complexity into infrastructure rather than eliminating it.
+
+**Recent Migration**: All chapters (1-8) now use `mlir::ExecutionEngine` instead of LLJIT, reducing JIT compilation code by ~60% while maintaining identical functionality. This modernization uses MLIR's official, recommended JIT API.
