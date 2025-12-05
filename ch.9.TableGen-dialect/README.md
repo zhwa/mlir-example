@@ -70,59 +70,89 @@ CMake automatically:
 import ch9
 import numpy as np
 
-# Write MLIR using NN dialect
-mlir_code = """
-module {
-  func.func @add(%arg0: memref<4xf32>, %arg1: memref<4xf32>, %arg2: memref<4xf32>) {
-    nn.add %arg0, %arg1, %arg2 : memref<4xf32>, memref<4xf32>, memref<4xf32>
-    return
-  }
-}
-"""
+# Create tensors from numpy arrays
+a = ch9.Tensor(np.array([1., 2., 3., 4.], dtype=np.float32))
+b = ch9.Tensor(np.array([5., 6., 7., 8.], dtype=np.float32))
 
-# Execute (automatic lowering and compilation)
-a = np.array([1, 2, 3, 4], dtype=np.float32)
-b = np.array([5, 6, 7, 8], dtype=np.float32)
-result = ch9.execute(mlir_code, "add", [a, b], (4,))
+# Use operator overloading - builds computation graph
+c = a + b
+
+# Compile and execute - OpBuilder creates IR directly
+result = ch9.compile(c)
 print(result)  # [6. 8. 10. 12.]
+
+# Chain operations
+d = (a + b) * a
+result = ch9.compile(d)
+
+# Matrix operations
+A = ch9.Tensor(np.array([[1., 2.], [3., 4.]], dtype=np.float32))
+B = ch9.Tensor(np.array([[5., 6.], [7., 8.]], dtype=np.float32))
+C = ch9.matmul(A, B)
+result = ch9.compile(C)
 ```
 
 ## Compilation Pipeline
 
-1. **Parse**: MLIR text with NN dialect → IR
-2. **Lower NN → Standard**: `nn.add` → `linalg.generic` + `arith.addf`
-3. **Lower to Loops**: `linalg` → `scf`
-4. **Lower to LLVM**: Standard dialects → LLVM dialect
-5. **JIT**: LLVM IR → native code → execute
+The Pythonic API uses **industrial-grade IR construction**:
+
+1. **Graph Building**: Python operations (`a + b`) build computation graph
+2. **IR Construction**: OpBuilder creates MLIR IR directly (no string generation!)
+3. **Lowering**: NN dialect → Linalg → Loops → LLVM
+4. **JIT Compilation**: LLVM IR → native machine code
+5. **Execution**: Call generated function with libffi
+
+**Key Difference from Tutorials**: We use `OpBuilder` to construct IR objects directly, just like Torch-MLIR, JAX, and IREE. No MLIR text parsing overhead!
 
 ## Testing
 
 ```bash
 cd ch.9.TableGen-dialect
-python3 test_jit.py
+python3 test.py
 ```
 
 Expected output:
 ```
+======================================================================
 Chapter 9: Custom Dialect with TableGen
-========================================
+======================================================================
 
-### Test 1: NN Add ###
+### Test 1: Tensor Addition (a + b) ###
 ✓ [1. 2. 3. 4.] + [5. 6. 7. 8.] = [ 6.  8. 10. 12.]
 
-### Test 2: NN Mul ###
+### Test 2: Tensor Multiplication (a * b) ###
 ✓ [2. 3. 4. 5.] * [10. 10. 10. 10.] = [20. 30. 40. 50.]
 
-### Test 3: NN MatMul ###
-✓ MatMul: (2, 3) @ (3, 4) = (2, 4)
-  Result: [1. 2. 3. 6.]
-
-### Test 4: NN ReLU ###
-✓ Input:  [-1.  2. -3.  4.]
-  Output: [0. 2. 0. 4.]
+... (more tests)
 
 All tests passed! ✓
 ```
+
+## Summary
+
+This chapter demonstrates industrial-strength MLIR dialect development with **two Python APIs**:
+
+### Pythonic Tensor API (New!)
+- ✅ **Operator overloading**: `a + b`, `a * b` work naturally
+- ✅ **Graph building**: Operations build computation graph lazily
+- ✅ **Clean syntax**: No MLIR text needed from users
+- ✅ **PyTorch-like**: Familiar API for ML practitioners
+
+### Low-level MLIR API (Educational)
+- ✅ **Direct MLIR control**: Write MLIR text explicitly
+- ✅ **Learning tool**: Understand MLIR syntax and semantics
+- ✅ **Debugging**: See exact MLIR being compiled
+
+### Underlying Technology
+- ✅ **TableGen/ODS**: Declarative operation definitions (~50 lines → ~1000 lines generated C++)
+- ✅ **Type Safety**: Compile-time verification and error checking
+- ✅ **Pattern Rewriting**: Transform IR programmatically (vs string manipulation)
+- ✅ **Production Patterns**: How real MLIR projects (Torch-MLIR, IREE) are built
+- ✅ **Full Verification**: MLIR verifier catches errors at every transformation step
+
+**Key Achievement**: Production-grade custom dialect with elegant Python interface!
+
+---
 
 ## Next Steps
 

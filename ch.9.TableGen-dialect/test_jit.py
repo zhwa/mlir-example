@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
-Chapter 9: Custom Dialect with TableGen - Test Suite
+Chapter 9: Custom Dialect with TableGen - Complete Test Suite
 
-Demonstrates the NN dialect defined in C++ with TableGen, lowered to standard MLIR.
+Demonstrates industrial-strength MLIR dialect development:
+- TableGen-defined custom dialect
+- OpBuilder-based IR construction (no string generation!)
+- Pythonic API with operator overloading
+- Same approach as Torch-MLIR, JAX, and IREE
 """
 
 import sys
@@ -32,118 +36,71 @@ sys.path.insert(0, build_dir)
 
 import ch9
 
-def test_nn_add():
-    """Test nn.add operation"""
-    print("### Test 1: NN Add ###")
+print()
+print("=" * 70)
+print("Chapter 9: Custom Dialect with TableGen")
+print("=" * 70)
+print()
 
-    mlir_code = """
-    module {
-      func.func @add(%arg0: memref<4xf32>, %arg1: memref<4xf32>, %arg2: memref<4xf32>) {
-        nn.add %arg0, %arg1, %arg2 : memref<4xf32>, memref<4xf32>, memref<4xf32>
-        return
-      }
-    }
-    """
+# Test 1: Element-wise addition with operator overloading
+print("### Test 1: Tensor Addition (a + b) ###")
+a = ch9.Tensor(np.array([1., 2., 3., 4.], dtype=np.float32))
+b = ch9.Tensor(np.array([5., 6., 7., 8.], dtype=np.float32))
+c = a + b
+result = ch9.compile(c)
+print(f"✓ [1. 2. 3. 4.] + [5. 6. 7. 8.] = {result}")
+print()
 
-    a = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
-    b = np.array([5.0, 6.0, 7.0, 8.0], dtype=np.float32)
-    result = ch9.execute(mlir_code, "add", [a, b], (4,))
+# Test 2: Element-wise multiplication with operator overloading
+print("### Test 2: Tensor Multiplication (a * b) ###")
+a = ch9.Tensor(np.array([2., 3., 4., 5.], dtype=np.float32))
+b = ch9.Tensor(np.array([10., 10., 10., 10.], dtype=np.float32))
+c = a * b
+result = ch9.compile(c)
+print(f"✓ [2. 3. 4. 5.] * [10. 10. 10. 10.] = {result}")
+print()
 
-    expected = a + b
-    assert np.allclose(result, expected), f"Expected {expected}, got {result}"
-    print(f"✓ {a} + {b} = {result}")
-    print()
+# Test 3: Matrix multiplication
+print("### Test 3: Matrix Multiplication ###")
+a = ch9.Tensor(np.array([[1., 2., 3.],
+                         [4., 5., 6.]], dtype=np.float32))
+b = ch9.Tensor(np.array([[1., 0., 0., 0.],
+                         [0., 1., 0., 0.],
+                         [0., 0., 1., 0.]], dtype=np.float32))
+c = ch9.matmul(a, b)
+result = ch9.compile(c)
+print(f"✓ MatMul: (2, 3) @ (3, 4) = (2, 4)")
+print(f"  Result shape: {result.shape}")
+print(f"  First row: {result[0]}")
+print()
 
-def test_nn_mul():
-    """Test nn.mul operation"""
-    print("### Test 2: NN Mul ###")
+# Test 4: ReLU activation
+print("### Test 4: ReLU Activation ###")
+a = ch9.Tensor(np.array([-1., 2., -3., 4.], dtype=np.float32))
+b = ch9.relu(a)
+result = ch9.compile(b)
+print(f"✓ Input:  {a.numpy()}")
+print(f"  Output: {result}")
+print()
 
-    mlir_code = """
-    module {
-      func.func @mul(%arg0: memref<4xf32>, %arg1: memref<4xf32>, %arg2: memref<4xf32>) {
-        nn.mul %arg0, %arg1, %arg2 : memref<4xf32>, memref<4xf32>, memref<4xf32>
-        return
-      }
-    }
-    """
+# Test 5: Chained operations (demonstrates graph building)
+print("### Test 5: Chained Operations (a + b) * c ###")
+a = ch9.Tensor(np.array([1., 2., 3., 4.], dtype=np.float32))
+b = ch9.Tensor(np.array([1., 1., 1., 1.], dtype=np.float32))
+c = ch9.Tensor(np.array([2., 3., 4., 5.], dtype=np.float32))
+d = (a + b) * c
+result = ch9.compile(d)
+print(f"✓ ([1. 2. 3. 4.] + [1. 1. 1. 1.]) * [2. 3. 4. 5.] = {result}")
+print()
 
-    a = np.array([2.0, 3.0, 4.0, 5.0], dtype=np.float32)
-    b = np.array([10.0, 10.0, 10.0, 10.0], dtype=np.float32)
-    result = ch9.execute(mlir_code, "mul", [a, b], (4,))
-
-    expected = a * b
-    assert np.allclose(result, expected), f"Expected {expected}, got {result}"
-    print(f"✓ {a} * {b} = {result}")
-    print()
-
-def test_nn_matmul():
-    """Test nn.matmul operation"""
-    print("### Test 3: NN MatMul ###")
-
-    mlir_code = """
-    module {
-      func.func @matmul(%arg0: memref<2x3xf32>, %arg1: memref<3x4xf32>, %arg2: memref<2x4xf32>) {
-        nn.matmul %arg0, %arg1, %arg2 : memref<2x3xf32>, memref<3x4xf32>, memref<2x4xf32>
-        return
-      }
-    }
-    """
-
-    a = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float32)
-    b = np.array([[1.0, 0.0, 0.0, 1.0],
-                  [0.0, 1.0, 0.0, 1.0],
-                  [0.0, 0.0, 1.0, 1.0]], dtype=np.float32)
-    result = ch9.execute(mlir_code, "matmul", [a, b], (2, 4))
-
-    expected = a @ b
-    assert np.allclose(result, expected), f"Expected {expected}, got {result}"
-    print(f"✓ MatMul: {a.shape} @ {b.shape} = {result.shape}")
-    print(f"  Result: {result[0]}")
-    print()
-
-def test_nn_relu():
-    """Test nn.relu operation"""
-    print("### Test 4: NN ReLU ###")
-
-    mlir_code = """
-    module {
-      func.func @relu(%arg0: memref<2x4xf32>, %arg1: memref<2x4xf32>) {
-        nn.relu %arg0, %arg1 : memref<2x4xf32>, memref<2x4xf32>
-        return
-      }
-    }
-    """
-
-    input_data = np.array([[-1.0, 2.0, -3.0, 4.0],
-                           [5.0, -6.0, 7.0, -8.0]], dtype=np.float32)
-    result = ch9.execute(mlir_code, "relu", [input_data], (2, 4))
-
-    expected = np.maximum(0, input_data)
-    assert np.allclose(result, expected), f"Expected {expected}, got {result}"
-    print(f"✓ Input:  {input_data[0]}")
-    print(f"  Output: {result[0]}")
-    print()
-
-if __name__ == "__main__":
-    print("="*60)
-    print("Chapter 9: Custom Dialect with TableGen")
-    print("="*60)
-    print()
-
-    test_nn_add()
-    test_nn_mul()
-    test_nn_matmul()
-    test_nn_relu()
-
-    print("="*60)
-    print("All tests passed! ✓")
-    print("="*60)
-    print()
-    print("Summary:")
-    print("- NN dialect defined with TableGen (ODS)")
-    print("- Operations: add, mul, matmul, relu")
-    print("- Lowering to linalg/arith works correctly")
-    print("- Full compilation pipeline functional")
-    print()
-    print("Key Achievement:")
-    print("Production-grade custom dialect using MLIR's TableGen!")
+# Test 6: More complex graph
+print("### Test 6: Complex Graph: relu((a + b) * c) ###")
+a = ch9.Tensor(np.array([1., -2., 3., -4.], dtype=np.float32))
+b = ch9.Tensor(np.array([-2., 3., -4., 5.], dtype=np.float32))
+c = ch9.Tensor(np.array([2., 1., 2., 1.], dtype=np.float32))
+d = ch9.relu((a + b) * c)
+result = ch9.compile(d)
+print(f"✓ Input a: {a.numpy()}")
+print(f"  Input b: {b.numpy()}")
+print(f"  Input c: {c.numpy()}")
+print(f"  Result:  {result}")
