@@ -3,9 +3,9 @@
 // Chapter 9: Custom Dialect with TableGen - Python Interface
 //
 //===----------------------------------------------------------------------===//
-#include "NN/NNDialect.h"
-#include "NN/NNOps.h"
-#include "NN/NNToStandard.h"
+#include "NNDialect.h"
+#include "NNOps.h"
+#include "NNToStandard.h"
 
 #include <mlir/ExecutionEngine/ExecutionEngine.h>
 #include <mlir/ExecutionEngine/OptUtils.h>

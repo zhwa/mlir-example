@@ -19,8 +19,8 @@ include(HandleLLVMOptions)
 
 include_directories(${LLVM_INCLUDE_DIRS})
 include_directories(${MLIR_INCLUDE_DIRS})
-include_directories(${PROJECT_SOURCE_DIR}/include)
-include_directories(${PROJECT_BINARY_DIR}/include)  # For generated files
+include_directories(${PROJECT_SOURCE_DIR}/inc)
+include_directories(${PROJECT_BINARY_DIR}/inc)  # For generated files
 link_directories(${LLVM_BUILD_LIBRARY_DIR})
 add_definitions(${LLVM_DEFINITIONS})
 
@@ -35,11 +35,11 @@ pkg_check_modules(FFI REQUIRED libffi)
 # TableGen for dialect code generation
 #===------------------------------------------------------------------------===#
 
-set(LLVM_TARGET_DEFINITIONS include/NN/NNOps.td)
-mlir_tablegen(include/NN/NNOps.h.inc -gen-op-decls)
-mlir_tablegen(include/NN/NNOps.cpp.inc -gen-op-defs)
-mlir_tablegen(include/NN/NNOpsDialect.h.inc -gen-dialect-decls -dialect=nn)
-mlir_tablegen(include/NN/NNOpsDialect.cpp.inc -gen-dialect-defs -dialect=nn)
+set(LLVM_TARGET_DEFINITIONS inc/NNOps.td)
+mlir_tablegen(inc/NNOps.h.inc -gen-op-decls)
+mlir_tablegen(inc/NNOps.cpp.inc -gen-op-defs)
+mlir_tablegen(inc/NNOpsDialect.h.inc -gen-dialect-decls -dialect=nn)
+mlir_tablegen(inc/NNOpsDialect.cpp.inc -gen-dialect-defs -dialect=nn)
 add_public_tablegen_target(NNOpsIncGen)
 
 # Make sure TableGen runs before compiling
@@ -50,14 +50,14 @@ add_dependencies(NNOpsIncGen MLIRTableGen)
 #===------------------------------------------------------------------------===#
 
 add_library(NNDialect STATIC
-    lib/NN/NNDialect.cpp
-    lib/NN/NNOps.cpp
-    lib/Conversion/NNToStandard.cpp
+    src/NNDialect.cpp
+    src/NNOps.cpp
+    src/NNToStandard.cpp
 )
 
 target_include_directories(NNDialect PUBLIC
-    ${PROJECT_SOURCE_DIR}/include
-    ${PROJECT_BINARY_DIR}/include
+    ${PROJECT_SOURCE_DIR}/inc
+    ${PROJECT_BINARY_DIR}/inc
 )
 
 # Get MLIR libraries
@@ -81,7 +81,7 @@ add_dependencies(NNDialect NNOpsIncGen)
 #===------------------------------------------------------------------------===#
 
 pybind11_add_module(ch9
-    python/bindings.cpp
+    src/bindings.cpp
 )
 
 target_link_libraries(ch9 PRIVATE
@@ -104,8 +104,8 @@ target_link_libraries(ch9 PRIVATE
 )
 
 target_include_directories(ch9 PRIVATE
-    ${PROJECT_SOURCE_DIR}/include
-    ${PROJECT_BINARY_DIR}/include
+    ${PROJECT_SOURCE_DIR}/inc
+    ${PROJECT_BINARY_DIR}/inc
     ${FFI_INCLUDE_DIRS}
 )
 
