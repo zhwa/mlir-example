@@ -2,8 +2,6 @@
 
 A hands-on tutorial demonstrating MLIR JIT compilation, progressing from basic matrix operations to neural network operators with computation graphs.
 
-**Progress**: 7 of 9 chapters complete (88%)
-
 ## Quick Start
 
 ### Prerequisites
@@ -54,7 +52,7 @@ Using build directory: ../build/x64-release/ch.1.Fixed-size
 **Key Concepts**:
 - MLIR IR generation (`linalg.matmul`)
 - Optimization pipeline (affine, linalg, SCF)
-- JIT execution with LLJIT
+- JIT execution with mlir::ExecutionEngine
 - Python binding basics
 
 **Documentation**: `ch.1.Fixed-size/README.md`, `MLIR_CODING_PATTERN.md`
@@ -129,6 +127,31 @@ Using build directory: ../build/x64-release/ch.1.Fixed-size
 - Critical lesson: Math dialect lowering pass order (math-to-llvm THEN math-to-libm)
 
 **Documentation**: `ch.7.Neural-ops/README.md`
+
+### Chapter 8: Universal Bindings with libffi
+**Goal**: Implement production-grade universal Python bindings
+
+**Key Concepts**:
+- libffi-based marshalling (eliminates per-kernel wrappers)
+- Dynamic FFI dispatch for ANY function signature
+- ~60% code reduction vs explicit parameter cases
+- Python string-based custom dialect workflow
+- Comparison with industrial compilers (IREE)
+
+**Documentation**: `ch.8.Custom-dialect/README.md`
+
+### Chapter 9: TableGen Custom Dialect
+**Goal**: Build production-grade custom dialect using TableGen/ODS
+
+**Key Concepts**:
+- TableGen dialect definition (NNDialect.td, NNOps.td)
+- Operation Definition Specification (ODS)
+- OpBuilder for programmatic IR construction
+- Memref-based operations (nn.add, nn.mul, nn.matmul, nn.relu)
+- Flat directory structure (inc/, src/)
+- PyTorch-like API (`ch9.forward()`)
+
+**Documentation**: `ch.9.TableGen-dialect/README.md`, `TUTORIAL.md`
 
 
 ## Key Implementation Details

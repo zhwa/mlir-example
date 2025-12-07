@@ -96,7 +96,7 @@ Lowering (lowering.cpp)
         ↓
 JIT Compilation (jit.cpp)
     ├─ MLIR → LLVM IR
-    └─ LLJIT → Machine Code
+    └─ mlir::ExecutionEngine → Machine Code
 ```
 
 ### IR Generation Strategy

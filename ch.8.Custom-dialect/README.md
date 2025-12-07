@@ -17,7 +17,7 @@ Python Lowering → MLIR text strings
            ↓
 C++ MLIR Parser & Compiler
            ↓
-     LLJIT Execution
+  mlir::ExecutionEngine Execution
 ```
 
 **Philosophy**: Use Python's simplicity for graph building and MLIR text generation. Let C++ handle parsing, optimization, and JIT compilation.
@@ -41,10 +41,10 @@ Converts high-level `nn` operations to standard MLIR dialects:
 - `nn.relu` → `linalg.generic` + `arith.maximumf`
 
 ### 3. **C++ Compiler** (`src/compiler.cpp`)
-Standard MLIR pipeline using LLJIT (same as Chapter 7):
+Standard MLIR pipeline using mlir::ExecutionEngine (same as Chapter 7):
 - Parse MLIR text
 - Apply lowering passes: linalg → loops → SCF → CF → LLVM
-- JIT compile with LLJIT
+- JIT compile with mlir::ExecutionEngine
 
 ### 4. **Python Bindings** (`src/bindings.cpp`)
 Universal execution using libffi for production-grade flexibility:
@@ -133,7 +133,7 @@ Standard MLIR (linalg, arith, memref)
          ↓
 C++ Compiler (linalg → loops → LLVM)
          ↓
-  LLJIT Execution
+  mlir::ExecutionEngine Execution
          ↓
      NumPy Arrays
 ```

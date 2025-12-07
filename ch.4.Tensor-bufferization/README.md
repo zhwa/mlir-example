@@ -9,7 +9,7 @@ This chapter shows the MLIR compilation stack with **tensor-based IR and bufferi
 1. **Tensor-Based IR** (`src/ir.cpp`) - Creates MLIR with `linalg.matmul` on tensors (`tensor<?x?xf32>`)
 2. **Bufferization** (`src/lowering.cpp`) - Converts tensors to memrefs using One-Shot Bufferize
 3. **Optimization Pipeline** - Multi-pass lowering: Tensor → MemRef → Loops → LLVM dialect
-4. **JIT Execution** (`src/jit.cpp`) - LLJIT-based compilation with runtime dimensions
+4. **JIT Execution** (`src/jit.cpp`) - mlir::ExecutionEngine-based compilation with runtime dimensions
 5. **Python Bindings** (`src/bindings.cpp`) - NumPy-compatible interface
 
 **Key Learning:** Tensor-based approach with bufferization enables better optimization opportunities compared to direct memref-based IR (Chapter 1-3).
@@ -67,7 +67,7 @@ print(gemm.test_optimized_ir())
    - MemRef/Arith/Func/CF → LLVM: Complete lowering
 
 4. **JIT Execution** (`src/jit.cpp`):
-   - LLJIT compiles LLVM dialect to native code
+   - mlir::ExecutionEngine compiles LLVM dialect to native code
    - Runtime dimensions passed through memref descriptors
    - Direct function pointer invocation
 

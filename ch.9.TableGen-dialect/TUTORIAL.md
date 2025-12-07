@@ -4,6 +4,8 @@
 
 This tutorial provides a deep, operation-by-operation comparison between Chapter 8's Python approach and Chapter 9's TableGen/C++ approach for creating custom MLIR dialects.
 
+> **Note**: This tutorial references the original nested directory structure (`include/NN/`, `lib/NN/`, `lib/Conversion/`, `python/`) for pedagogical comparison with Chapter 8. The current Chapter 9 has been simplified to use flat directories (`inc/`, `src/`) and a PyTorch-like `forward()` API. The concepts remain identical - only the file organization changed.
+
 ---
 
 ## Table of Contents

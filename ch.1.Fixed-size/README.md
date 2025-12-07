@@ -26,7 +26,7 @@ print(ch1_fixed_size.test_optimized_ir())
    - Arith/Func/CF → LLVM → Complete lowering
 
 3. **JIT Execution** (`src/jit.cpp`):
-   - LLJIT compiles LLVM dialect to native code
+   - mlir::ExecutionEngine compiles LLVM dialect to native code
    - Explicit symbol resolution for `malloc`/`free`
    - Direct function pointer invocation
 
