@@ -1,4 +1,4 @@
-// Chapter 10: Optimized Lowering for NN Dialect
+// Chapter 10: Optimized Compilation (Fusion + Vectorization)
 #include "NNDialect.h"
 #include "NNOps.h"
 #include "NNToStandard.h"
@@ -22,6 +22,7 @@
 #include <mlir/Dialect/SCF/IR/SCF.h>
 #include <mlir/Dialect/Math/IR/Math.h>
 #include <mlir/Dialect/Tensor/IR/Tensor.h>
+#include <mlir/Dialect/Vector/IR/VectorOps.h>
 
 #include <mlir/Conversion/ArithToLLVM/ArithToLLVM.h>
 #include <mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h>
@@ -32,8 +33,13 @@
 #include <mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h>
 #include <mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h>
 #include <mlir/Conversion/TensorToLinalg/TensorToLinalgPass.h>
+#include <mlir/Conversion/VectorToLLVM/ConvertVectorToLLVMPass.h>
+#include <mlir/Conversion/VectorToSCF/VectorToSCF.h>
 #include <mlir/Dialect/Linalg/Passes.h>
+#include <mlir/Dialect/Linalg/Transforms/Transforms.h>
 #include <mlir/Dialect/Bufferization/Transforms/Passes.h>
+#include <mlir/Dialect/Vector/Transforms/Passes.h>
+#include <mlir/Dialect/Vector/Transforms/VectorRewritePatterns.h>
 
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/CommandLine.h>
@@ -80,56 +86,39 @@ public:
         context_.getOrLoadDialect<scf::SCFDialect>();
         context_.getOrLoadDialect<math::MathDialect>();
         context_.getOrLoadDialect<tensor::TensorDialect>();
+        context_.getOrLoadDialect<vector::VectorDialect>();
         context_.getOrLoadDialect<LLVM::LLVMDialect>();
     }
 
     MLIRContext& getContext() { return context_; }
 
-    // Baseline lowering (Chapter 9 behavior)
-    bool lowerToLLVMBaseline(ModuleOp module) {
-        PassManager pm(&context_);
-
-        // 1. Lower NN dialect to standard dialects (memref-based)
-        pm.addPass(createConvertNNToStandardPass());
-        pm.addPass(mlir::createCanonicalizerPass());
-
-        // 2. Lower linalg to loops
-        pm.addPass(mlir::createConvertLinalgToLoopsPass());
-
-        // 3. Lower to LLVM
-        pm.addPass(createConvertMathToLLVMPass());
-        pm.addPass(createConvertMathToLibmPass());
-        pm.addPass(createConvertSCFToCFPass());
-        pm.addPass(createArithToLLVMConversionPass());
-        pm.addPass(createConvertControlFlowToLLVMPass());
-        pm.addPass(createFinalizeMemRefToLLVMConversionPass());
-        pm.addPass(createConvertFuncToLLVMPass());
-        pm.addPass(createReconcileUnrealizedCastsPass());
-
-        return succeeded(pm.run(module));
-    }
-    // Optimized lowering (Chapter 10 - fusion + loop opts)
-    bool lowerToLLVMOptimized(ModuleOp module) {
+    bool lowerToLLVM(ModuleOp module) {
         PassManager pm(&context_);
 
         // 1. Lower NN dialect to standard dialects
         pm.addPass(createConvertNNToStandardPass());
         pm.addPass(mlir::createCanonicalizerPass());
 
-        // 2. Linalg optimizations (NEW!)
+        // 2. Linalg optimizations
         pm.addPass(mlir::createLinalgGeneralizationPass());
         pm.addPass(mlir::createCanonicalizerPass());
         pm.addPass(mlir::createLinalgElementwiseOpFusionPass());
         pm.addPass(mlir::createCanonicalizerPass());
 
-        // 3. Lower linalg to loops (now optimized)
+        // 3. Lower linalg to loops
         pm.addPass(mlir::createConvertLinalgToLoopsPass());
 
         // 4. SCF optimizations
         pm.addPass(mlir::createLoopInvariantCodeMotionPass());
         pm.addPass(mlir::createCanonicalizerPass());
 
-        // 5. Lower to LLVM
+        // 5. Vectorization (NEW! Explicit SIMD)
+        // Convert affine/scf loops to vector operations
+        pm.addPass(mlir::createConvertVectorToSCFPass());
+        pm.addPass(mlir::createCanonicalizerPass());
+
+        // 6. Lower to LLVM
+        pm.addPass(createConvertVectorToLLVMPass());  // Vector → LLVM first
         pm.addPass(createConvertMathToLLVMPass());
         pm.addPass(createConvertMathToLibmPass());
         pm.addPass(createConvertSCFToCFPass());
@@ -142,18 +131,14 @@ public:
         return succeeded(pm.run(module));
     }
 
-    void* compileAndGetFunctionPtr(ModuleOp module, const std::string& funcName, bool optimized = false) {
+    void* compileAndGetFunctionPtr(ModuleOp module, const std::string& funcName) {
         registerBuiltinDialectTranslation(*module.getContext());
         registerLLVMDialectTranslation(*module.getContext());
 
-        // Choose lowering pipeline
-        bool success = optimized ? lowerToLLVMOptimized(module) : lowerToLLVMBaseline(module);
-        if (!success) {
+        if (!lowerToLLVM(module)) {
             llvm::errs() << "Failed to lower to LLVM dialect\n";
             return nullptr;
-        }
-
-        mlir::ExecutionEngineOptions options;
+        }        mlir::ExecutionEngineOptions options;
         options.transformer = mlir::makeOptimizingTransformer(3, 0, nullptr);
 
         auto maybeEngine = mlir::ExecutionEngine::create(module, options);
@@ -263,7 +248,7 @@ private:
 // Graph compiler - Industrial approach with OpBuilder
 class GraphCompiler {
 public:
-    static py::array_t<float> forward(std::shared_ptr<Tensor> output, bool optimized = false) {
+    static py::array_t<float> forward(std::shared_ptr<Tensor> output) {
         NNCompiler& compiler = getCompiler();
 
         // Topological sort to get computation order
@@ -294,7 +279,7 @@ public:
         }
 
         // Compile and execute
-        void* fnPtr = compiler.compileAndGetFunctionPtr(module.get(), "compute", optimized);
+        void* fnPtr = compiler.compileAndGetFunctionPtr(module.get(), "compute");
         if (!fnPtr) {
             throw std::runtime_error("Failed to compile function");
         }
@@ -495,9 +480,9 @@ std::shared_ptr<Tensor> relu(std::shared_ptr<Tensor> a) {
 //===----------------------------------------------------------------------===//
 
 PYBIND11_MODULE(ch10, m) {
-    m.doc() = "Chapter 10: Optimized Compilation for NN Dialect\n\n"
-              "Same NN dialect as Chapter 9, with optimized lowering pipeline.\n"
-              "Demonstrates 3-5x speedup through linalg fusion and loop opts.";
+    m.doc() = "Chapter 10: Optimized Compilation\n\n"
+              "Same NN dialect as Chapter 9, with fusion + vectorization.\n"
+              "Demonstrates explicit SIMD via vector dialect.";
 
     // Pythonic Tensor API (same as Chapter 9)
     py::class_<Tensor, std::shared_ptr<Tensor>>(m, "Tensor")
@@ -516,15 +501,8 @@ PYBIND11_MODULE(ch10, m) {
             return ss.str();
         });
 
-    // Dual API: baseline vs optimized
-    m.def("forward", 
-          [](std::shared_ptr<Tensor> output) { return GraphCompiler::forward(output, false); },
-          "Baseline compilation (Chapter 9 behavior)");
-
-    m.def("forward_optimized", 
-          [](std::shared_ptr<Tensor> output) { return GraphCompiler::forward(output, true); },
-          "Optimized compilation with fusion + loop opts (3-5x faster)");
-
+    // Single API with optimizations always enabled
+    m.def("forward", &GraphCompiler::forward, "Compile and execute with fusion + vectorization");
     m.def("matmul", &matmul, "Matrix multiplication");
     m.def("relu", &relu, "ReLU activation");
 }
