@@ -15,7 +15,6 @@ This tutorial provides a deep, operation-by-operation comparison between Chapter
 3. [Complete Walkthrough: The `matmul` Operation](#complete-walkthrough-the-matmul-operation)
 4. [Step-by-Step: Creating a Dialect](#step-by-step-creating-a-dialect)
 5. [Common Patterns & Cheat Sheet](#common-patterns--cheat-sheet)
-6. [When to Use Which Approach](#when-to-use-which-approach)
 
 ---
 
@@ -819,55 +818,6 @@ result = ch9.execute(mlir_code, "test", [a, b], (4,))
 | `type of operand #0 is not buildable` | Assembly format missing type | Add `type($operand)` to format string |
 | `op was not bufferized` | Using tensor types with memref pipeline | Change to memref in TableGen definition |
 | `pass failed to preserve dominance` | Invalid IR after rewrite | Use `rewriter` methods, not direct `op->erase()` |
-
----
-
-## When to Use Which Approach
-
-### Use Chapter 8 (Python String-Based) When:
-
-✅ **Prototyping new ideas**
-- Quick iteration needed
-- Exploring MLIR concepts
-- Learning the framework
-
-✅ **Simple transformations**
-- 1:1 operation mapping
-- Minimal IR analysis
-- Educational purposes
-
-✅ **Python-heavy workflows**
-- Already have Python infrastructure
-- DSL embedded in Python
-- Runtime code generation
-
-**Example Use Case**: Research project exploring novel operation fusion strategies
-
----
-
-### Use Chapter 9 (TableGen/C++) When:
-
-✅ **Production compilers**
-- Type safety critical
-- Long-term maintainability
-- Team collaboration
-
-✅ **Complex transformations**
-- Multi-pass lowering
-- IR analysis/optimization
-- Pattern matching on IR structure
-
-✅ **Performance-critical**
-- No parsing overhead
-- Compiler optimizations
-- Large-scale code generation
-
-✅ **Framework integration**
-- PyTorch, TensorFlow, JAX frontends
-- Industrial-strength requirements
-- Need MLIR verification infrastructure
-
-**Example Use Case**: Building a production ML framework compiler (like Torch-MLIR, IREE)
 
 ---
 

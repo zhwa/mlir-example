@@ -34,9 +34,7 @@ struct NNAddOpLowering : public OpRewritePattern<AddOp> {
     auto loc = op.getLoc();
     auto outputType = cast<MemRefType>(op.getOutput().getType());
 
-    SmallVector<utils::IteratorType> iteratorTypes(
-        outputType.getRank(),
-        utils::IteratorType::parallel);
+    SmallVector<utils::IteratorType> iteratorTypes(outputType.getRank(), utils::IteratorType::parallel);
 
     rewriter.create<linalg::GenericOp>(
         loc, 
@@ -70,9 +68,7 @@ struct NNMulOpLowering : public OpRewritePattern<MulOp> {
     auto loc = op.getLoc();
     auto outputType = cast<MemRefType>(op.getOutput().getType());
 
-    SmallVector<utils::IteratorType> iteratorTypes(
-        outputType.getRank(),
-        utils::IteratorType::parallel);
+    SmallVector<utils::IteratorType> iteratorTypes(outputType.getRank(), utils::IteratorType::parallel);
 
     rewriter.create<linalg::GenericOp>(
         loc,
@@ -111,8 +107,7 @@ struct NNMatMulOpLowering : public OpRewritePattern<MatMulOp> {
     auto zero = rewriter.create<arith::ConstantOp>(loc, zeroAttr);
 
     // Fill output with zeros
-    rewriter.create<linalg::FillOp>(
-        loc, ValueRange{zero}, ValueRange{op.getOutput()});
+    rewriter.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{op.getOutput()});
 
     // Create linalg.matmul
     rewriter.create<linalg::MatmulOp>(

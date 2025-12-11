@@ -138,7 +138,8 @@ public:
         if (!lowerToLLVM(module)) {
             llvm::errs() << "Failed to lower to LLVM dialect\n";
             return nullptr;
-        }        mlir::ExecutionEngineOptions options;
+        }
+        mlir::ExecutionEngineOptions options;
         options.transformer = mlir::makeOptimizingTransformer(3, 0, nullptr);
 
         auto maybeEngine = mlir::ExecutionEngine::create(module, options);
@@ -156,7 +157,7 @@ public:
         }
 
         // Use raw pointer to avoid destruction order issues
-        engines_.push_back(engine.release());
+        engines_.emplace_back(engine.release());
         return reinterpret_cast<void*>(*expectedFPtr);
     }
 
@@ -177,23 +178,23 @@ static NNCompiler& getCompiler() {
 void marshal_memref_1d(std::vector<void*>& args, py::array_t<float> arr) {
     auto buf = arr.request();
     float* data = static_cast<float*>(buf.ptr);
-    args.push_back(data);
-    args.push_back(data);
-    args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(0)));
-    args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[0])));
-    args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(1)));
+    args.emplace_back(data);
+    args.emplace_back(data);
+    args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(0)));
+    args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[0])));
+    args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(1)));
 }
 
 void marshal_memref_2d(std::vector<void*>& args, py::array_t<float> arr) {
     auto buf = arr.request();
     float* data = static_cast<float*>(buf.ptr);
-    args.push_back(data);
-    args.push_back(data);
-    args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(0)));
-    args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[0])));
-    args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[1])));
-    args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[1])));
-    args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(1)));
+    args.emplace_back(data);
+    args.emplace_back(data);
+    args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(0)));
+    args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[0])));
+    args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[1])));
+    args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[1])));
+    args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(1)));
 }
 
 //===----------------------------------------------------------------------===//
@@ -208,7 +209,7 @@ public:
         : data_(data), op_type_("input"), is_computed_(true) {
         auto buf = data.request();
         for (ssize_t i = 0; i < buf.ndim; ++i) {
-            shape_.push_back(buf.shape[i]);
+            shape_.emplace_back(buf.shape[i]);
         }
     }
 
@@ -262,12 +263,12 @@ public:
 
             if (t->is_input()) {
                 tensor_ids[t.get()] = inputs.size();
-                inputs.push_back(t);
+                inputs.emplace_back(t);
             } else {
                 if (t->input1()) collect(t->input1());
                 if (t->input2()) collect(t->input2());
                 tensor_ids[t.get()] = inputs.size() + ops.size();
-                ops.push_back(t);
+                ops.emplace_back(t);
             }
         };
         collect(output);
@@ -322,10 +323,10 @@ private:
         // Build function signature types
         SmallVector<Type> inputTypes;
         for (auto& inp : inputs) {
-            inputTypes.push_back(getMemRefType(builder, inp->shape()));
+            inputTypes.emplace_back(getMemRefType(builder, inp->shape()));
         }
         // Add output parameter
-        inputTypes.push_back(getMemRefType(builder, output->shape()));
+        inputTypes.emplace_back(getMemRefType(builder, output->shape()));
 
         auto funcType = builder.getFunctionType(inputTypes, {});
 
@@ -392,14 +393,11 @@ private:
     }
 
     // Execute without parsing MLIR text
-    static py::array_t<float> execute_direct(
-        void* fnPtr,
-        py::list inputs,
-        py::tuple output_shape) {
+    static py::array_t<float> execute_direct(void* fnPtr, py::list inputs, py::tuple output_shape) {
 
         std::vector<ssize_t> out_shape;
         for (auto item : output_shape) {
-            out_shape.push_back(py::cast<ssize_t>(item));
+            out_shape.emplace_back(py::cast<ssize_t>(item));
         }
         auto output = py::array_t<float>(out_shape);
 
@@ -435,8 +433,7 @@ private:
         }
 
         ffi_cif cif;
-        if (ffi_prep_cif(&cif, FFI_DEFAULT_ABI, num_args, 
-                         &ffi_type_void, arg_types.data()) != FFI_OK) {
+        if (ffi_prep_cif(&cif, FFI_DEFAULT_ABI, num_args, &ffi_type_void, arg_types.data()) != FFI_OK) {
             throw std::runtime_error("libffi ffi_prep_cif failed");
         }
 
