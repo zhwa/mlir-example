@@ -100,7 +100,7 @@ public:
         pm.addPass(mlir::createCanonicalizerPass());
 
         // 2. Linalg optimizations
-        pm.addPass(mlir::createLinalgGeneralizationPass());
+        pm.addPass(mlir::createLinalgGeneralizeNamedOpsPass());
         pm.addPass(mlir::createCanonicalizerPass());
         pm.addPass(mlir::createLinalgElementwiseOpFusionPass());
         pm.addPass(mlir::createCanonicalizerPass());
@@ -353,7 +353,7 @@ private:
             } else {
                 auto allocOp = builder.create<memref::AllocOp>(
                     loc, 
-                    getMemRefType(builder, op->shape()).cast<MemRefType>()
+                    mlir::cast<MemRefType>(getMemRefType(builder, op->shape()))
                 );
                 result = allocOp.getResult();
             }

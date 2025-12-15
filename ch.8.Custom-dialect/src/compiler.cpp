@@ -74,7 +74,7 @@ public:
         PassManager pm(&context_);
 
         // Linalg optimizations
-        pm.addNestedPass<mlir::func::FuncOp>(mlir::createLinalgGeneralizationPass());
+        pm.addNestedPass<mlir::func::FuncOp>(mlir::createLinalgGeneralizeNamedOpsPass());
 
         // Lower Linalg to loops
         pm.addNestedPass<mlir::func::FuncOp>(mlir::createConvertLinalgToLoopsPass());

@@ -37,11 +37,11 @@ jobs:
 
     - name: Install dependencies
       run: |
-          sudo apt install -y libmlir-18-dev libmlir-18 mlir-18-tools
+          sudo apt install -y libmlir-19-dev libmlir-19 mlir-19-tools
           sudo apt install -y python3-dev python3-numpy ninja-build libzstd-dev
-          sudo apt install -y clang-18
+          sudo apt install -y clang-19
           # Enable this on WSL2 Ubuntu: Fix LLVM header conflict (required for pybind11)
-          # sudo mv /usr/lib/llvm-18/include/cxxabi.h /usr/lib/llvm-18/include/cxxabi.h.backup
+          # sudo mv /usr/lib/llvm-19/include/cxxabi.h /usr/lib/llvm-19/include/cxxabi.h.backup
 
     - name: Configure CMake
       run: cmake --preset x64-release
