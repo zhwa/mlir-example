@@ -335,7 +335,7 @@ private:
             } else {
                 auto allocOp = builder.create<memref::AllocOp>(
                     loc, 
-                    getMemRefType(builder, op->shape()).cast<MemRefType>()
+                    mlir::cast<MemRefType>(getMemRefType(builder, op->shape()))
                 );
                 result = allocOp.getResult();
             }

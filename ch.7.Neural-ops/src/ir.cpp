@@ -210,7 +210,7 @@ Value ComputationGraph::buildOperation(OpBuilder& builder, Location loc, int opI
 Value ComputationGraph::buildElementWiseOp(OpBuilder& builder, Location loc,
                                           Value lhs, Value rhs,
                                           GraphOperation::OpType opType) {
-    auto lhsType = lhs.getType().cast<MemRefType>();
+    auto lhsType = mlir::cast<MemRefType>(lhs.getType());
     auto resultType = lhsType;
 
     // Allocate result buffer
@@ -271,8 +271,8 @@ Value ComputationGraph::buildElementWiseOp(OpBuilder& builder, Location loc,
 
 // Build matrix multiplication
 Value ComputationGraph::buildMatMul(OpBuilder& builder, Location loc, Value lhs, Value rhs) {
-    auto lhsType = lhs.getType().cast<MemRefType>();
-    auto rhsType = rhs.getType().cast<MemRefType>();
+    auto lhsType = mlir::cast<MemRefType>(lhs.getType());
+    auto rhsType = mlir::cast<MemRefType>(rhs.getType());
 
     auto m = builder.create<memref::DimOp>(loc, lhs, 0);
     auto n = builder.create<memref::DimOp>(loc, rhs, 1);
@@ -329,7 +329,7 @@ Value ComputationGraph::buildMatMul(OpBuilder& builder, Location loc, Value lhs,
 
 // Build ReLU activation
 Value ComputationGraph::buildReLU(OpBuilder& builder, Location loc, Value input) {
-    auto inputType = input.getType().cast<MemRefType>();
+    auto inputType = mlir::cast<MemRefType>(input.getType());
 
     SmallVector<Value> dynSizes;
     for (int i = 0; i < inputType.getRank(); ++i) {
@@ -374,7 +374,7 @@ Value ComputationGraph::buildReLU(OpBuilder& builder, Location loc, Value input)
 
 // Build Softmax (from Chapter 6)
 Value ComputationGraph::buildSoftmax(OpBuilder& builder, Location loc, Value input) {
-    auto inputType = input.getType().cast<MemRefType>();
+    auto inputType = mlir::cast<MemRefType>(input.getType());
     auto dim0 = builder.create<memref::DimOp>(loc, input, 0);
 
     SmallVector<Value> dynSizes;
