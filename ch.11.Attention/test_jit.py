@@ -49,47 +49,46 @@ def reference_attention_with_proj(x, w_q, w_k, w_v, w_o, num_heads):
     """
     B, T, C = x.shape
     head_dim = C // num_heads
-    
+
     # Linear projections: Q = x @ w_q^T, etc.
     q = np.matmul(x, w_q.T)  # (B, T, C)
     k = np.matmul(x, w_k.T)
     v = np.matmul(x, w_v.T)
-    
+
     # Reshape and transpose for multi-head: (B, T, C) -> (B, num_heads, T, head_dim)
     q = q.reshape(B, T, num_heads, head_dim).transpose(0, 2, 1, 3)
     k = k.reshape(B, T, num_heads, head_dim).transpose(0, 2, 1, 3)
     v = v.reshape(B, T, num_heads, head_dim).transpose(0, 2, 1, 3)
-    
+
     # Compute attention for each head
     outputs = []
     for h in range(num_heads):
         q_h = q[:, h, :, :]  # (B, T, head_dim)
         k_h = k[:, h, :, :]
         v_h = v[:, h, :, :]
-        
+
         # Attention scores
         scores = np.matmul(q_h, k_h.transpose(0, 2, 1))  # (B, T, T)
         scores = scores / np.sqrt(head_dim)
-        
+
         # Softmax
         scores_max = np.max(scores, axis=-1, keepdims=True)
         scores_exp = np.exp(scores - scores_max)
         attn = scores_exp / np.sum(scores_exp, axis=-1, keepdims=True)
-        
+
         # Output
         out = np.matmul(attn, v_h)  # (B, T, head_dim)
         outputs.append(out)
-    
+
     # Stack and concatenate heads
     stacked = np.stack(outputs, axis=1)  # (B, num_heads, T, head_dim)
     transposed = stacked.transpose(0, 2, 1, 3)  # (B, T, num_heads, head_dim)
     concat = transposed.reshape(B, T, C)  # (B, T, C)
-    
+
     # Output projection
     final = np.matmul(concat, w_o.T)  # (B, T, C)
-    
-    return final
 
+    return final
 
 # Test 1: Single-Head Attention
 print("### Test 1: Single-Head Self-Attention ###")
@@ -116,8 +115,7 @@ expected_batched = reference_attention_with_proj(x_batched, w_q, w_k, w_v, w_o, 
 expected = expected_batched[0]  # Remove batch dimension
 
 # Compute with ch11
-output = np.zeros_like(x)
-ch11.attention(x, output, w_q, w_k, w_v, w_o, num_heads, head_dim)
+output = ch11.attention(x, w_q, w_k, w_v, w_o, num_heads, head_dim)
 
 print(f"\nExpected output (first 2 tokens, 4 dims):\n{expected[:2, :4]}")
 print(f"Actual output (first 2 tokens, 4 dims):\n{output[:2, :4]}")
@@ -129,7 +127,6 @@ except AssertionError as e:
     print(f"\n✗ Test 1 FAILED: {e}")
 
 print()
-
 
 # Test 2: Multi-Head Attention
 print("### Test 2: Multi-Head Attention (2 heads) ###")
@@ -148,8 +145,7 @@ expected_multi_batched = reference_attention_with_proj(x_multi_batched, w_q, w_k
 expected_multi = expected_multi_batched[0]  # Remove batch dimension
 
 # Compute with ch11
-output_multi = np.zeros_like(x_multi)
-ch11.attention(x_multi, output_multi, w_q, w_k, w_v, w_o, num_heads, head_dim)
+output_multi = ch11.attention(x_multi, w_q, w_k, w_v, w_o, num_heads, head_dim)
 
 print(f"\nExpected output (first 2 tokens, 4 dims):\n{expected_multi[:2, :4]}")
 print(f"Actual output (first 2 tokens, 4 dims):\n{output_multi[:2, :4]}")
@@ -161,7 +157,6 @@ except AssertionError as e:
     print(f"\n✗ Test 2 FAILED: {e}")
 
 print()
-
 
 # Test 3: Attention with Random Projections
 print("### Test 3: Attention with Q/K/V/O Projections ###")
@@ -187,8 +182,7 @@ expected_proj_batched = reference_attention_with_proj(x_proj_batched, w_q_rand, 
 expected_proj = expected_proj_batched[0]  # Remove batch dimension
 
 # Compute with ch11 (transpose weights to match C++ expectation: input @ W instead of input @ W.T)
-output_proj = np.zeros_like(x_proj)
-ch11.attention(x_proj, output_proj, w_q_rand.T, w_k_rand.T, w_v_rand.T, w_o_rand.T, num_heads, head_dim)
+output_proj = ch11.attention(x_proj, w_q_rand.T, w_k_rand.T, w_v_rand.T, w_o_rand.T, num_heads, head_dim)
 
 print(f"\nExpected output (first 2 tokens, 4 dims):\n{expected_proj[:2, :4]}")
 print(f"Actual output (first 2 tokens, 4 dims):\n{output_proj[:2, :4]}")

@@ -96,7 +96,6 @@ import ch11
 
 # Input: [seq_len, d_model]
 input = np.random.randn(4, 8).astype(np.float32)
-output = np.zeros_like(input)
 
 # Projection weights: [d_model, d_model]
 w_q = np.random.randn(8, 8).astype(np.float32) * 0.1
@@ -104,10 +103,10 @@ w_k = np.random.randn(8, 8).astype(np.float32) * 0.1
 w_v = np.random.randn(8, 8).astype(np.float32) * 0.1
 w_o = np.random.randn(8, 8).astype(np.float32) * 0.1
 
-# Multi-head attention
+# Multi-head attention (Pythonic API - returns output)
 num_heads = 2
 head_dim = 4
-ch11.attention(input, output, w_q.T, w_k.T, w_v.T, w_o.T, num_heads, head_dim)
+output = ch11.attention(input, w_q.T, w_k.T, w_v.T, w_o.T, num_heads, head_dim)
 ```
 
 **Note**: Weights must be transposed (`.T`) because C++ implementation does `input @ W` while convention is `input @ W^T`.

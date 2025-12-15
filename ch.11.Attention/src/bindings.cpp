@@ -126,9 +126,8 @@ private:
 // C++ Attention Implementation (fallback)
 //===----------------------------------------------------------------------===//
 
-void compute_attention_cpp(
+py::array_t<float> compute_attention_cpp(
     py::array_t<float> input_arr,
-    py::array_t<float> output_arr,
     py::array_t<float> wq_arr,
     py::array_t<float> wk_arr,
     py::array_t<float> wv_arr,
@@ -137,10 +136,13 @@ void compute_attention_cpp(
     int head_dim
 ) {
     auto input = input_arr.unchecked<2>();
-    auto output = output_arr.mutable_unchecked<2>();
 
     int seq_len = input.shape(0);
     int d_model = input.shape(1);
+
+    // Allocate output array
+    py::array_t<float> output_arr({seq_len, d_model});
+    auto output = output_arr.mutable_unchecked<2>();
 
     // Get weight matrices
     auto wq = wq_arr.unchecked<2>();
@@ -251,6 +253,8 @@ void compute_attention_cpp(
             output(i, j) = sum;
         }
     }
+
+    return output_arr;
 }
 
 //===----------------------------------------------------------------------===//
@@ -267,7 +271,6 @@ PYBIND11_MODULE(ch11, m) {
 
     m.def("attention", &compute_attention_cpp,
           py::arg("input"),
-          py::arg("output"),
           py::arg("wq"),
           py::arg("wk"),
           py::arg("wv"),
