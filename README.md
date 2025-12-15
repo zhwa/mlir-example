@@ -7,13 +7,14 @@ A hands-on tutorial demonstrating MLIR JIT compilation, progressing from basic m
 ### Prerequisites
 
 ```bash
-# Ubuntu/WSL2
-sudo apt install -y libmlir-18-dev libmlir-18 mlir-18-tools
+# Ubuntu/WSL2 - LLVM 19 Required
+sudo apt install -y llvm-19 llvm-19-dev llvm-19-runtime
+sudo apt install -y mlir-19-tools libmlir-19-dev
+sudo apt install -y clang-19
 sudo apt install -y python3-dev python3-numpy ninja-build libzstd-dev
-sudo apt install -y clang-18  # or g++
 
 # Fix LLVM header conflict (required for pybind11)
-sudo mv /usr/lib/llvm-18/include/cxxabi.h /usr/lib/llvm-18/include/cxxabi.h.backup
+sudo mv /usr/lib/llvm-19/include/cxxabi.h /usr/lib/llvm-19/include/cxxabi.h.backup
 ```
 
 ### Build All Chapters
@@ -153,6 +154,30 @@ Using build directory: ../build/x64-release/ch.1.Fixed-size
 
 **Documentation**: `ch.9.TableGen-dialect/README.md`, `TUTORIAL.md`
 
+### Chapter 10: Optimization Passes
+**Goal**: Compare baseline vs optimized lowering pipelines
+
+**Key Concepts**:
+- Linalg generalization and fusion
+- Performance measurement and comparison
+- Reusing Chapter 9's NN dialect
+- LLVM 19 API updates
+
+### Chapter 11: Multi-Head Attention with Transformer Dialect
+**Goal**: Implement multi-head scaled dot-product attention with custom dialect
+
+**Operations**: matmul, add, mul, softmax, transpose, attention
+
+**Key Concepts**:
+- TableGen without attributes (LLVM 19 BytecodeOpInterface issue)
+- Minimal includes pattern (only mlir/IR/OpBase.td)
+- Multi-pass softmax with numerical stability
+- C++ reference implementation for validation
+- LLVM 19 compatibility (API changes in ExecutionEngine, cast methods)
+- Lowering transformer ops to standard MLIR (scf.for loops, memref operations)
+
+**Documentation**: `ch.11.Attention/README.md`
+
 
 ## Key Implementation Details
 
@@ -270,13 +295,25 @@ The user sees a clean functional API, but internally it uses efficient imperativ
 
 ### "Could not find LLVM/MLIR"
 ```bash
-sudo apt install libmlir-18-dev mlir-18-tools
+sudo apt install llvm-19-dev mlir-19-tools libmlir-19-dev
 ```
 
 ### "cxxabi.h duplicate declarations"
 ```bash
-sudo mv /usr/lib/llvm-18/include/cxxabi.h /usr/lib/llvm-18/include/cxxabi.h.backup
+sudo mv /usr/lib/llvm-19/include/cxxabi.h /usr/lib/llvm-19/include/cxxabi.h.backup
 ```
+
+### Chapter 11 Build Errors
+
+**BytecodeOpInterface not found**
+- Fixed: Operations with attributes trigger BytecodeOpInterface in LLVM 19
+- Solution: Remove attributes from operation definitions, infer from shapes instead
+
+**createLinalgGeneralizationPass not found**
+- LLVM 19 renamed it to `createLinalgGeneralizeNamedOpsPass()`
+
+**.cast<T>() errors**
+- LLVM 19 changed to `mlir::cast<T>()`
 
 ### "Module not found" when running tests
 Ensure you're in the chapter directory:
