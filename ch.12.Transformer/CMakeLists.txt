@@ -54,6 +54,27 @@ pybind11_add_module(ch12 src/bindings.cpp)
 
 target_link_libraries(ch12 PRIVATE
   MLIRCh12TransformerDialect
+  MLIRIR
+  MLIRParser
+  MLIRPass
+  MLIRExecutionEngine
+  MLIRArithDialect
+  MLIRFuncDialect
+  MLIRMathDialect
+  MLIRMemRefDialect
+  MLIRSCFDialect
+  MLIRTransforms
+  MLIRTargetLLVMIRExport
+  MLIRLLVMCommonConversion
+  MLIRLLVMDialect
+  MLIRArithToLLVM
+  MLIRControlFlowToLLVM
+  MLIRFuncToLLVM
+  MLIRMathToLLVM
+  MLIRMathToLibm
+  MLIRMemRefToLLVM
+  MLIRReconcileUnrealizedCasts
+  MLIRSCFToControlFlow
 )
 
 target_include_directories(ch12 PRIVATE

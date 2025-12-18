@@ -47,21 +47,22 @@ result = ch12.forward(attn_out)  # Execute via graph interpreter
 - ✅ No manual output allocation
 - ✅ Deferred execution with computation graph
 - ✅ Pythonic API following PyTorch conventions
-- ✅ Pure graph interpreter (no MLIR codegen in bindings)
-- ✅ Minimal implementation (~920 lines vs 1100+ with JIT code)
+- ✅ **Hybrid execution**: JIT compilation + C++ fallback
+- ✅ Full MLIR ExecutionEngine integration
 - ✅ All 15 tests passing across 5 phases
 
 **Execution Model:**
-Chapter 12 uses a **pure graph interpreter** for maximum simplicity. The `forward()` function traverses the computation graph and executes each node using C++ reference implementations. No MLIR IR is generated at runtime - MLIR is only used in the dialect's lowering passes (for testing and validation).
+Chapter 12 demonstrates **hybrid execution**:
+1. **JIT Path (`jit_add`)**: Builds MLIR IR → Applies lowering passes → JIT compiles with ExecutionEngine → Executes native code
+2. **Interpreter Path (`forward`)**: Graph interpreter using C++ reference implementations for complex graphs
 
-**Why Pure Interpreter:**
-- ✅ Minimal code - no MLIR IR generation in bindings
-- ✅ No runtime dependencies on MLIR libraries
-- ✅ Zero complexity - just Python/C++ with pybind11
-- ✅ Fast iteration during development
-- ✅ Easy to understand and maintain
+**Why Hybrid Approach:**
+- ✅ **JIT for simple ops** - Demonstrates proper MLIR compilation pipeline
+- ✅ **Interpreter for complex graphs** - Handles operations with weights/parameters cleanly
+- ✅ **Best of both worlds** - Shows MLIR's power while staying practical
+- ✅ **Educational value** - Learn both JIT and interpreter patterns
 
-The MLIR dialect with full lowering passes exists in `src/` for validation and future JIT work, but the Python bindings are kept deliberately simple.
+The `jit_add` function shows how to properly use MLIR's ExecutionEngine with memref descriptors, following the pattern from earlier chapters but with the transformer dialect.
 
 ## Implementation Phases (All Complete ✅)
 
