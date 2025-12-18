@@ -1,35 +1,13 @@
 //===- bindings.cpp - Python bindings for Transformer dialect -----*- C++ -*-===//
-#include "TransformerDialect.h"
-#include "TransformerOps.h"
-#include "TransformerPasses.h"
-
-#include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
-#include "mlir/Dialect/Math/IR/Math.h"
-#include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/ExecutionEngine/ExecutionEngine.h"
-#include "mlir/ExecutionEngine/OptUtils.h"
-#include "mlir/IR/Builders.h"
-#include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/MLIRContext.h"
-#include "mlir/Parser/Parser.h"
-#include "mlir/Pass/PassManager.h"
-#include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
-#include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
-#include "mlir/Target/LLVMIR/Export.h"
-#include "mlir/Transforms/Passes.h"
-
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
 #include <memory>
 #include <vector>
+#include <cmath>
 
 namespace py = pybind11;
-using namespace mlir;
 
 //===----------------------------------------------------------------------===//
 // Computation Graph
@@ -269,194 +247,129 @@ Tensor multi_layer_transformer(const Tensor& input,
 }
 
 //===----------------------------------------------------------------------===//
-// MLIR IR Generation
+// Forward declarations for C++ reference implementations
 //===----------------------------------------------------------------------===//
 
-class GraphCompiler {
-private:
-  MLIRContext context;
-  OpBuilder builder;
-  ModuleOp module;
-  func::FuncOp func;
+py::array_t<float> add_ref(py::array_t<float> lhs, py::array_t<float> rhs);
+py::array_t<float> layer_norm_ref(py::array_t<float> input, py::array_t<float> gamma, py::array_t<float> beta, float epsilon);
+py::array_t<float> linear_ref(py::array_t<float> input, py::array_t<float> weight, py::array_t<float> bias);
+py::array_t<float> gelu_ref(py::array_t<float> input);
+py::array_t<float> matmul_ref(py::array_t<float> lhs, py::array_t<float> rhs);
+py::array_t<float> transpose_ref(py::array_t<float> input);
+py::array_t<float> softmax_ref(py::array_t<float> input);
+py::array_t<float> scale_ref(py::array_t<float> input, float scale_factor);
 
-  std::map<GraphNode*, Value> valueMap;
+//===----------------------------------------------------------------------===//
+// Graph Interpreter
+//===----------------------------------------------------------------------===//
 
-public:
-  GraphCompiler() : builder(&context) {
-    context.loadDialect<transformer::TransformerDialect, 
-                        func::FuncDialect,
-                        arith::ArithDialect,
-                        memref::MemRefDialect,
-                        scf::SCFDialect,
-                        math::MathDialect>();
+py::array_t<float> forward(const Tensor& output) {
+  // Execute computation graph using C++ reference implementations
 
-    module = ModuleOp::create(builder.getUnknownLoc());
-    builder.setInsertionPointToEnd(module.getBody());
-  }
+  std::map<GraphNode*, py::array_t<float>> resultMap;
 
-  Value createMemRef(const std::vector<int64_t>& shape) {
-    auto memrefType = MemRefType::get(shape, builder.getF32Type());
-    return builder.create<memref::AllocOp>(builder.getUnknownLoc(), memrefType);
-  }
-
-  Value compileNode(std::shared_ptr<GraphNode> node) {
-    // Check cache
-    if (valueMap.count(node.get())) {
-      return valueMap[node.get()];
+  std::function<py::array_t<float>(std::shared_ptr<GraphNode>)> execute;
+  execute = [&](std::shared_ptr<GraphNode> node) -> py::array_t<float> {
+    if (resultMap.count(node.get())) {
+      return resultMap[node.get()];
     }
 
-    Value result;
-    Location loc = builder.getUnknownLoc();
+    py::array_t<float> result;
 
     switch (node->type) {
-      case OpType::Input: {
-        // Input is a function argument
-        result = createMemRef(node->shape);
+      case OpType::Input:
+        result = node->data;
+        break;
+
+      case OpType::Add: {
+        auto lhs = execute(node->inputs[0]);
+        auto rhs = execute(node->inputs[1]);
+        result = add_ref(lhs, rhs);
         break;
       }
 
       case OpType::LayerNorm: {
-        Value input = compileNode(node->inputs[0]);
-        Value output = createMemRef(node->shape);
-
-        // Create gamma and beta memrefs
-        int64_t dModel = node->shape[1];
-        Value gamma = createMemRef({dModel});
-        Value beta = createMemRef({dModel});
-
-        // Note: epsilon hardcoded in lowering pass (1e-5) to avoid BytecodeOpInterface issues
-        builder.create<transformer::LayerNormOp>(loc, input, gamma, beta, output);
-
-        // Store gamma/beta for runtime
-        valueMap[reinterpret_cast<GraphNode*>(node->gamma.request().ptr)] = gamma;
-        valueMap[reinterpret_cast<GraphNode*>(node->beta.request().ptr)] = beta;
-
-        result = output;
+        auto input = execute(node->inputs[0]);
+        result = layer_norm_ref(input, node->gamma, node->beta, node->epsilon);
         break;
       }
 
       case OpType::Linear: {
-        Value input = compileNode(node->inputs[0]);
-        Value output = createMemRef(node->shape);
-
-        // Create weight and bias memrefs
-        auto weight_info = node->weight.request();
-        auto bias_info = node->bias.request();
-        Value weight = createMemRef({weight_info.shape[0], weight_info.shape[1]});
-        Value bias = createMemRef({bias_info.shape[0]});
-
-        builder.create<transformer::LinearOp>(loc, input, weight, bias, output);
-
-        valueMap[reinterpret_cast<GraphNode*>(node->weight.request().ptr)] = weight;
-        valueMap[reinterpret_cast<GraphNode*>(node->bias.request().ptr)] = bias;
-
-        result = output;
+        auto input = execute(node->inputs[0]);
+        result = linear_ref(input, node->weight, node->bias);
         break;
       }
 
       case OpType::Gelu: {
-        Value input = compileNode(node->inputs[0]);
-        Value output = createMemRef(node->shape);
-        builder.create<transformer::GeluOp>(loc, input, output);
-        result = output;
-        break;
-      }
-
-      case OpType::Add: {
-        Value lhs = compileNode(node->inputs[0]);
-        Value rhs = compileNode(node->inputs[1]);
-        Value output = createMemRef(node->shape);
-        builder.create<transformer::AddOp>(loc, lhs, rhs, output);
-        result = output;
+        auto input = execute(node->inputs[0]);
+        result = gelu_ref(input);
         break;
       }
 
       case OpType::Matmul: {
-        Value lhs = compileNode(node->inputs[0]);
-        Value rhs = compileNode(node->inputs[1]);
-        Value output = createMemRef(node->shape);
-        builder.create<transformer::MatmulOp>(loc, lhs, rhs, output);
-        result = output;
+        auto lhs = execute(node->inputs[0]);
+        auto rhs = execute(node->inputs[1]);
+        result = matmul_ref(lhs, rhs);
         break;
       }
 
       case OpType::Transpose: {
-        Value input = compileNode(node->inputs[0]);
-        Value output = createMemRef(node->shape);
-        builder.create<transformer::TransposeOp>(loc, input, output);
-        result = output;
+        auto input = execute(node->inputs[0]);
+        result = transpose_ref(input);
         break;
       }
 
       case OpType::Softmax: {
-        Value input = compileNode(node->inputs[0]);
-        Value output = createMemRef(node->shape);
-        builder.create<transformer::SoftmaxOp>(loc, input, output);
-        result = output;
+        auto input = execute(node->inputs[0]);
+        result = softmax_ref(input);
         break;
       }
 
       case OpType::Scale: {
-        Value input = compileNode(node->inputs[0]);
-        Value output = createMemRef(node->shape);
-
-        // Create scalar memref for scale factor
-        Value scale = createMemRef({1});
-        // TODO: Store scale_factor value at runtime
-
-        builder.create<transformer::ScaleOp>(loc, input, scale, output);
-        result = output;
+        auto input = execute(node->inputs[0]);
+        result = scale_ref(input, node->scale_factor);
         break;
       }
     }
 
-    valueMap[node.get()] = result;
+    resultMap[node.get()] = result;
     return result;
-  }
+  };
 
-  ModuleOp build(std::shared_ptr<GraphNode> output) {
-    // Simply compile the graph - operations are created at module level
-    // TODO: Wrap in a function for proper execution
-    compileNode(output);
-    return module;
-  }
-};
-
-//===----------------------------------------------------------------------===//
-// Execution Engine
-//===----------------------------------------------------------------------===//
-
-py::array_t<float> forward(const Tensor& output) {
-  GraphCompiler compiler;
-  ModuleOp module = compiler.build(output.node);
-
-  // Print IR for debugging
-  module.print(llvm::outs());
-
-  // Apply lowering pass
-  PassManager pm(module.getContext());
-  pm.addPass(createLowerTransformerToStandardPass());
-  pm.addPass(createCanonicalizerPass());
-  pm.addPass(createCSEPass());
-
-  if (failed(pm.run(module))) {
-    throw std::runtime_error("Failed to lower Transformer dialect");
-  }
-
-  // Print lowered IR
-  llvm::outs() << "\n=== After Lowering ===\n";
-  module.print(llvm::outs());
-
-  // For now, return a placeholder
-  // TODO: Create ExecutionEngine and run
-  auto shape = output.node->shape;
-  py::array_t<float> result(shape);
-  return result;
+  return execute(output.node);
 }
 
 //===----------------------------------------------------------------------===//
-// C++ Reference Implementation (for testing)
+// C++ Reference Implementation (for interpreter)
 //===----------------------------------------------------------------------===//
+
+py::array_t<float> add_ref(py::array_t<float> lhs, py::array_t<float> rhs) {
+  auto lhs_buf = lhs.request();
+  auto rhs_buf = rhs.request();
+
+  if (lhs_buf.ndim != rhs_buf.ndim) {
+    throw std::runtime_error("Dimension mismatch in add");
+  }
+
+  // Allocate output
+  py::array_t<float> result(lhs_buf.shape);
+  auto result_buf = result.request();
+
+  float* lhs_ptr = static_cast<float*>(lhs_buf.ptr);
+  float* rhs_ptr = static_cast<float*>(rhs_buf.ptr);
+  float* result_ptr = static_cast<float*>(result_buf.ptr);
+
+  size_t size = 1;
+  for (ssize_t i = 0; i < lhs_buf.ndim; i++) {
+    size *= lhs_buf.shape[i];
+  }
+
+  for (size_t i = 0; i < size; i++) {
+    result_ptr[i] = lhs_ptr[i] + rhs_ptr[i];
+  }
+
+  return result;
+}
 
 py::array_t<float> layer_norm_ref(py::array_t<float> input, 
                                    py::array_t<float> gamma,
@@ -920,7 +833,7 @@ PYBIND11_MODULE(ch12, m) {
 
   m.def("forward", &forward,
         py::arg("output"),
-        "Compile and execute computation graph");
+        "Execute computation graph using interpreter");
 
   // C++ reference implementations
   m.def("layer_norm_ref", &layer_norm_ref,
