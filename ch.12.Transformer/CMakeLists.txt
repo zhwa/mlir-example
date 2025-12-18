@@ -48,6 +48,10 @@ add_llvm_library(MLIRCh12TransformerDialect
   MLIRTransforms
 )
 
+# Find libffi
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(FFI REQUIRED libffi)
+
 # Python bindings (pybind11 is already fetched at root level)
 
 pybind11_add_module(ch12 src/bindings.cpp)
@@ -75,9 +79,11 @@ target_link_libraries(ch12 PRIVATE
   MLIRMemRefToLLVM
   MLIRReconcileUnrealizedCasts
   MLIRSCFToControlFlow
+  ${FFI_LIBRARIES}
 )
 
 target_include_directories(ch12 PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_BINARY_DIR}/inc
+  ${FFI_INCLUDE_DIRS}
 )

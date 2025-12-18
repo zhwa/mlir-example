@@ -34,9 +34,12 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <ffi.h>
+
 #include <memory>
 #include <vector>
-#include <cmath>
+#include <unordered_map>
+#include <functional>
 
 namespace py = pybind11;
 using namespace mlir;
@@ -51,6 +54,109 @@ static struct LLVMInit {
     llvm::InitializeNativeTargetAsmPrinter();
   }
 } llvmInit;
+
+//===----------------------------------------------------------------------===//
+// Compiler Infrastructure
+//===----------------------------------------------------------------------===//
+
+class TransformerCompiler {
+public:
+  TransformerCompiler() {
+    context_.loadDialect<transformer::TransformerDialect,
+                         func::FuncDialect, arith::ArithDialect,
+                         memref::MemRefDialect, scf::SCFDialect, math::MathDialect,
+                         LLVM::LLVMDialect>();
+  }
+
+  MLIRContext& getContext() { return context_; }
+
+  bool lowerToLLVM(ModuleOp module) {
+    PassManager pm(&context_);
+
+    // Lower transformer dialect to standard dialects
+    pm.addNestedPass<func::FuncOp>(createLowerTransformerToStandardPass());
+    pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
+    pm.addNestedPass<func::FuncOp>(createCSEPass());
+
+    // Lower to LLVM
+    pm.addPass(createConvertMathToLLVMPass());
+    pm.addPass(createConvertMathToLibmPass());
+    pm.addPass(createConvertSCFToCFPass());
+    pm.addPass(createArithToLLVMConversionPass());
+    pm.addPass(createConvertControlFlowToLLVMPass());
+    pm.addPass(createFinalizeMemRefToLLVMConversionPass());
+    pm.addPass(createConvertFuncToLLVMPass());
+    pm.addPass(createReconcileUnrealizedCastsPass());
+
+    return succeeded(pm.run(module));
+  }
+
+  void* compileAndGetFunctionPtr(ModuleOp module, const std::string& funcName) {
+    registerBuiltinDialectTranslation(*module.getContext());
+    registerLLVMDialectTranslation(*module.getContext());
+
+    if (!lowerToLLVM(module)) {
+      llvm::errs() << "Failed to lower to LLVM dialect\n";
+      return nullptr;
+    }
+
+    ExecutionEngineOptions options;
+    options.transformer = makeOptimizingTransformer(3, 0, nullptr);
+
+    auto maybeEngine = ExecutionEngine::create(module, options);
+    if (!maybeEngine) {
+      llvm::errs() << "Failed to create ExecutionEngine: " 
+                   << maybeEngine.takeError() << "\n";
+      return nullptr;
+    }
+
+    auto engine = std::move(*maybeEngine);
+    auto expectedFPtr = engine->lookup(funcName);
+    if (!expectedFPtr) {
+      llvm::errs() << "Failed to lookup function: " << funcName << "\n";
+      return nullptr;
+    }
+
+    // Keep engine alive
+    engines_.emplace_back(engine.release());
+    return reinterpret_cast<void*>(*expectedFPtr);
+  }
+
+private:
+  MLIRContext context_;
+  std::vector<ExecutionEngine*> engines_;  // Keep engines alive
+};
+
+static TransformerCompiler& getCompiler() {
+  static TransformerCompiler compiler;
+  return compiler;
+}
+
+//===----------------------------------------------------------------------===//
+// Memref Marshalling
+//===----------------------------------------------------------------------===//
+
+void marshal_memref_2d(std::vector<void*>& args, py::array_t<float> arr) {
+  auto buf = arr.request();
+  float* data = static_cast<float*>(buf.ptr);
+  args.emplace_back(data);
+  args.emplace_back(data);
+  args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(0)));
+  args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[0])));
+  args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[1])));
+  args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[1])));
+  args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(1)));
+}
+
+void marshal_memref_1d(std::vector<void*>& args, py::array_t<float> arr) {
+  auto buf = arr.request();
+  float* data = static_cast<float*>(buf.ptr);
+  args.emplace_back(data);
+  args.emplace_back(data);
+  args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(0)));
+  args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[0])));
+  args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(1)));
+}
 
 //===----------------------------------------------------------------------===//
 // Computation Graph
@@ -74,14 +180,10 @@ struct GraphNode {
   py::array_t<float> data; // For Input nodes
 
   // Operation parameters
-  py::array_t<float> gamma; // LayerNorm scale
-  py::array_t<float> beta;  // LayerNorm bias
-  float epsilon = 1e-5f;     // LayerNorm epsilon
-
-  py::array_t<float> weight; // Linear weight
-  py::array_t<float> bias;   // Linear bias
-
-  float scale_factor = 1.0f;  // Scale operation factor
+  py::array_t<float> gamma, beta;  // LayerNorm
+  float epsilon = 1e-5f;
+  py::array_t<float> weight, bias; // Linear
+  float scale_factor = 1.0f;        // Scale
 
   std::vector<int64_t> shape;
 
@@ -109,11 +211,10 @@ public:
 
   const std::vector<int64_t>& shape() const { return node->shape; }
 
-  // Operator overloading for clean composition
   Tensor operator+(const Tensor& other) const {
     auto add_node = std::make_shared<GraphNode>(OpType::Add);
-    add_node->inputs.push_back(node);
-    add_node->inputs.push_back(other.node);
+    add_node->inputs.emplace_back(node);
+    add_node->inputs.emplace_back(other.node);
     add_node->shape = node->shape;
     return Tensor(add_node);
   }
@@ -126,21 +227,19 @@ public:
 Tensor layer_norm(const Tensor& input, py::array_t<float> gamma, 
                   py::array_t<float> beta, float epsilon = 1e-5f) {
   auto node = std::make_shared<GraphNode>(OpType::LayerNorm);
-  node->inputs.push_back(input.node);
+  node->inputs.emplace_back(input.node);
   node->gamma = gamma;
   node->beta = beta;
   node->epsilon = epsilon;
-  node->shape = input.node->shape; // Output shape same as input
+  node->shape = input.node->shape;
   return Tensor(node);
 }
 
 Tensor linear(const Tensor& input, py::array_t<float> weight, py::array_t<float> bias) {
   auto node = std::make_shared<GraphNode>(OpType::Linear);
-  node->inputs.push_back(input.node);
+  node->inputs.emplace_back(input.node);
   node->weight = weight;
   node->bias = bias;
-
-  // Output shape: [seq_len, out_features]
   auto weight_info = weight.request();
   node->shape = {input.node->shape[0], weight_info.shape[0]};
   return Tensor(node);
@@ -148,48 +247,44 @@ Tensor linear(const Tensor& input, py::array_t<float> weight, py::array_t<float>
 
 Tensor gelu(const Tensor& input) {
   auto node = std::make_shared<GraphNode>(OpType::Gelu);
-  node->inputs.push_back(input.node);
+  node->inputs.emplace_back(input.node);
   node->shape = input.node->shape;
   return Tensor(node);
 }
 
 Tensor add(const Tensor& lhs, const Tensor& rhs) {
   auto node = std::make_shared<GraphNode>(OpType::Add);
-  node->inputs.push_back(lhs.node);
-  node->inputs.push_back(rhs.node);
+  node->inputs.emplace_back(lhs.node);
+  node->inputs.emplace_back(rhs.node);
   node->shape = lhs.node->shape;
   return Tensor(node);
 }
 
 Tensor matmul(const Tensor& lhs, const Tensor& rhs) {
   auto node = std::make_shared<GraphNode>(OpType::Matmul);
-  node->inputs.push_back(lhs.node);
-  node->inputs.push_back(rhs.node);
-
-  // Output shape: [M, N] where lhs is [M, K] and rhs is [K, N]
+  node->inputs.emplace_back(lhs.node);
+  node->inputs.emplace_back(rhs.node);
   node->shape = {lhs.node->shape[0], rhs.node->shape[1]};
   return Tensor(node);
 }
 
 Tensor transpose(const Tensor& input) {
   auto node = std::make_shared<GraphNode>(OpType::Transpose);
-  node->inputs.push_back(input.node);
-
-  // Swap last two dimensions
+  node->inputs.emplace_back(input.node);
   node->shape = {input.node->shape[1], input.node->shape[0]};
   return Tensor(node);
 }
 
 Tensor softmax(const Tensor& input) {
   auto node = std::make_shared<GraphNode>(OpType::Softmax);
-  node->inputs.push_back(input.node);
+  node->inputs.emplace_back(input.node);
   node->shape = input.node->shape;
   return Tensor(node);
 }
 
 Tensor scale(const Tensor& input, float scale_factor) {
   auto node = std::make_shared<GraphNode>(OpType::Scale);
-  node->inputs.push_back(input.node);
+  node->inputs.emplace_back(input.node);
   node->scale_factor = scale_factor;
   node->shape = input.node->shape;
   return Tensor(node);
@@ -201,22 +296,20 @@ Tensor scale(const Tensor& input, float scale_factor) {
 
 Tensor ffn(const Tensor& input, py::array_t<float> w1, py::array_t<float> b1,
            py::array_t<float> w2, py::array_t<float> b2) {
-  // FFN: Linear → GELU → Linear
   Tensor hidden = linear(input, w1, b1);
   Tensor activated = gelu(hidden);
   return linear(activated, w2, b2);
 }
 
 Tensor scaled_dot_product_attention(const Tensor& Q, const Tensor& K, const Tensor& V) {
-  // Attention(Q, K, V) = softmax(Q @ K^T / sqrt(d_k)) @ V
   int64_t d_k = K.node->shape[1];
   float scale_factor = 1.0f / std::sqrt(static_cast<float>(d_k));
 
   Tensor K_T = transpose(K);
-  Tensor scores = matmul(Q, K_T);  // [seq_len, seq_len]
+  Tensor scores = matmul(Q, K_T);
   Tensor scaled_scores = scale(scores, scale_factor);
   Tensor attn_weights = softmax(scaled_scores);
-  return matmul(attn_weights, V);  // [seq_len, d_model]
+  return matmul(attn_weights, V);
 }
 
 Tensor multi_head_attention(const Tensor& input,
@@ -224,46 +317,33 @@ Tensor multi_head_attention(const Tensor& input,
                              py::array_t<float> w_k, py::array_t<float> b_k,
                              py::array_t<float> w_v, py::array_t<float> b_v,
                              py::array_t<float> w_o, py::array_t<float> b_o) {
-  // Project to Q, K, V
   Tensor Q = linear(input, w_q, b_q);
   Tensor K = linear(input, w_k, b_k);
   Tensor V = linear(input, w_v, b_v);
-
-  // Apply scaled dot-product attention
   Tensor attn_output = scaled_dot_product_attention(Q, K, V);
-
-  // Output projection
   return linear(attn_output, w_o, b_o);
 }
 
 Tensor transformer_block(const Tensor& input,
-                         // Attention weights
                          py::array_t<float> w_q, py::array_t<float> b_q,
                          py::array_t<float> w_k, py::array_t<float> b_k,
                          py::array_t<float> w_v, py::array_t<float> b_v,
                          py::array_t<float> w_o, py::array_t<float> b_o,
-                         // LayerNorm 1 params
                          py::array_t<float> gamma1, py::array_t<float> beta1,
-                         // FFN weights
                          py::array_t<float> w1, py::array_t<float> b1,
                          py::array_t<float> w2, py::array_t<float> b2,
-                         // LayerNorm 2 params
                          py::array_t<float> gamma2, py::array_t<float> beta2) {
-  // Pre-norm architecture (like GPT-2)
-  // x = x + attention(layer_norm(x))
   Tensor normed1 = layer_norm(input, gamma1, beta1);
   Tensor attn_out = multi_head_attention(normed1, w_q, b_q, w_k, b_k, w_v, b_v, w_o, b_o);
-  Tensor residual1 = input + attn_out;  // Using operator overloading!
+  Tensor residual1 = input + attn_out;
 
-  // x = x + ffn(layer_norm(x))
   Tensor normed2 = layer_norm(residual1, gamma2, beta2);
   Tensor ffn_out = ffn(normed2, w1, b1, w2, b2);
-  return residual1 + ffn_out;  // Using operator overloading!
+  return residual1 + ffn_out;
 }
 
 Tensor multi_layer_transformer(const Tensor& input,
                                 const std::vector<py::array_t<float>>& all_weights) {
-  // Expect 16 weights per layer (8 attention + 2 LN1 + 4 FFN + 2 LN2)
   if (all_weights.size() % 16 != 0) {
     throw std::runtime_error("Expected 16 weights per layer");
   }
@@ -275,14 +355,14 @@ Tensor multi_layer_transformer(const Tensor& input,
     int base = layer * 16;
     output = transformer_block(
         output,
-        all_weights[base + 0],  all_weights[base + 1],   // w_q, b_q
-        all_weights[base + 2],  all_weights[base + 3],   // w_k, b_k
-        all_weights[base + 4],  all_weights[base + 5],   // w_v, b_v
-        all_weights[base + 6],  all_weights[base + 7],   // w_o, b_o
-        all_weights[base + 8],  all_weights[base + 9],   // gamma1, beta1
-        all_weights[base + 10], all_weights[base + 11],  // w1, b1
-        all_weights[base + 12], all_weights[base + 13],  // w2, b2
-        all_weights[base + 14], all_weights[base + 15]   // gamma2, beta2
+        all_weights[base + 0],  all_weights[base + 1],
+        all_weights[base + 2],  all_weights[base + 3],
+        all_weights[base + 4],  all_weights[base + 5],
+        all_weights[base + 6],  all_weights[base + 7],
+        all_weights[base + 8],  all_weights[base + 9],
+        all_weights[base + 10], all_weights[base + 11],
+        all_weights[base + 12], all_weights[base + 13],
+        all_weights[base + 14], all_weights[base + 15]
     );
   }
 
@@ -290,25 +370,34 @@ Tensor multi_layer_transformer(const Tensor& input,
 }
 
 //===----------------------------------------------------------------------===//
-// MLIR IR Generation and JIT Compilation
+// MLIR IR Generation
 //===----------------------------------------------------------------------===//
 
-class GraphCompiler {
-private:
-  MLIRContext& context;
-  OpBuilder builder;
-  std::map<GraphNode*, Value> valueMap;
+class IRBuilder {
+public:
+  OpBuilder& builder;
+  std::unordered_map<GraphNode*, Value> valueMap;
+  std::unordered_map<void*, int>* paramIndex; // Map param pointer → arg index
+  int parameterArgOffset; // Offset of first parameter argument
 
 public:
-  GraphCompiler(MLIRContext& ctx) : context(ctx), builder(&ctx) {}
+  IRBuilder(OpBuilder& b) : builder(b), paramIndex(nullptr), parameterArgOffset(0) {}
 
-  Value createMemRefAlloc(const std::vector<int64_t>& shape) {
+  Value createAlloc(const std::vector<int64_t>& shape) {
     auto memrefType = MemRefType::get(shape, builder.getF32Type());
     return builder.create<memref::AllocOp>(builder.getUnknownLoc(), memrefType);
   }
 
+  Value getParameter(void* ptr) {
+    if (!paramIndex || paramIndex->count(ptr) == 0) {
+      throw std::runtime_error("Parameter not found in function arguments");
+    }
+    int idx = (*paramIndex)[ptr];
+    auto func = builder.getBlock()->getParentOp();
+    return cast<func::FuncOp>(func).getArgument(parameterArgOffset + idx);
+  }
+
   Value compileNode(std::shared_ptr<GraphNode> node) {
-    // Check cache
     if (valueMap.count(node.get())) {
       return valueMap[node.get()];
     }
@@ -318,15 +407,14 @@ public:
 
     switch (node->type) {
       case OpType::Input: {
-        // Will be mapped to function arguments later
-        result = createMemRefAlloc(node->shape);
+        result = createAlloc(node->shape);
         break;
       }
 
       case OpType::Add: {
         Value lhs = compileNode(node->inputs[0]);
         Value rhs = compileNode(node->inputs[1]);
-        Value output = createMemRefAlloc(node->shape);
+        Value output = createAlloc(node->shape);
         builder.create<transformer::AddOp>(loc, lhs, rhs, output);
         result = output;
         break;
@@ -334,39 +422,27 @@ public:
 
       case OpType::LayerNorm: {
         Value input = compileNode(node->inputs[0]);
-        Value output = createMemRefAlloc(node->shape);
-        int64_t dModel = node->shape[1];
-        Value gamma = createMemRefAlloc({dModel});
-        Value beta = createMemRefAlloc({dModel});
+        Value output = createAlloc(node->shape);
+        Value gamma = getParameter(node->gamma.request().ptr);
+        Value beta = getParameter(node->beta.request().ptr);
         builder.create<transformer::LayerNormOp>(loc, input, gamma, beta, output);
-        
-        // Store references for data copying
-        valueMap[reinterpret_cast<GraphNode*>(node->gamma.request().ptr)] = gamma;
-        valueMap[reinterpret_cast<GraphNode*>(node->beta.request().ptr)] = beta;
-        
         result = output;
         break;
       }
 
       case OpType::Linear: {
         Value input = compileNode(node->inputs[0]);
-        Value output = createMemRefAlloc(node->shape);
-        auto weight_info = node->weight.request();
-        auto bias_info = node->bias.request();
-        Value weight = createMemRefAlloc({weight_info.shape[0], weight_info.shape[1]});
-        Value bias = createMemRefAlloc({bias_info.shape[0]});
+        Value output = createAlloc(node->shape);
+        Value weight = getParameter(node->weight.request().ptr);
+        Value bias = getParameter(node->bias.request().ptr);
         builder.create<transformer::LinearOp>(loc, input, weight, bias, output);
-        
-        valueMap[reinterpret_cast<GraphNode*>(node->weight.request().ptr)] = weight;
-        valueMap[reinterpret_cast<GraphNode*>(node->bias.request().ptr)] = bias;
-        
         result = output;
         break;
       }
 
       case OpType::Gelu: {
         Value input = compileNode(node->inputs[0]);
-        Value output = createMemRefAlloc(node->shape);
+        Value output = createAlloc(node->shape);
         builder.create<transformer::GeluOp>(loc, input, output);
         result = output;
         break;
@@ -375,7 +451,7 @@ public:
       case OpType::Matmul: {
         Value lhs = compileNode(node->inputs[0]);
         Value rhs = compileNode(node->inputs[1]);
-        Value output = createMemRefAlloc(node->shape);
+        Value output = createAlloc(node->shape);
         builder.create<transformer::MatmulOp>(loc, lhs, rhs, output);
         result = output;
         break;
@@ -383,7 +459,7 @@ public:
 
       case OpType::Transpose: {
         Value input = compileNode(node->inputs[0]);
-        Value output = createMemRefAlloc(node->shape);
+        Value output = createAlloc(node->shape);
         builder.create<transformer::TransposeOp>(loc, input, output);
         result = output;
         break;
@@ -391,7 +467,7 @@ public:
 
       case OpType::Softmax: {
         Value input = compileNode(node->inputs[0]);
-        Value output = createMemRefAlloc(node->shape);
+        Value output = createAlloc(node->shape);
         builder.create<transformer::SoftmaxOp>(loc, input, output);
         result = output;
         break;
@@ -399,8 +475,8 @@ public:
 
       case OpType::Scale: {
         Value input = compileNode(node->inputs[0]);
-        Value output = createMemRefAlloc(node->shape);
-        Value scale = createMemRefAlloc({1});
+        Value output = createAlloc(node->shape);
+        Value scale = createAlloc({1});
         builder.create<transformer::ScaleOp>(loc, input, scale, output);
         result = output;
         break;
@@ -413,787 +489,170 @@ public:
 };
 
 //===----------------------------------------------------------------------===//
-// Forward declarations for C++ reference implementations
+// JIT Execution (Forward Pass)
 //===----------------------------------------------------------------------===//
 
-py::array_t<float> add_ref(py::array_t<float> lhs, py::array_t<float> rhs);
-py::array_t<float> layer_norm_ref(py::array_t<float> input, py::array_t<float> gamma, py::array_t<float> beta, float epsilon);
-py::array_t<float> linear_ref(py::array_t<float> input, py::array_t<float> weight, py::array_t<float> bias);
-py::array_t<float> gelu_ref(py::array_t<float> input);
-py::array_t<float> matmul_ref(py::array_t<float> lhs, py::array_t<float> rhs);
-py::array_t<float> transpose_ref(py::array_t<float> input);
-py::array_t<float> softmax_ref(py::array_t<float> input);
-py::array_t<float> scale_ref(py::array_t<float> input, float scale_factor);
+py::array_t<float> forward(const Tensor& output) {
+  TransformerCompiler& compiler = getCompiler();
 
-//===----------------------------------------------------------------------===//
-// JIT Compilation
-//===----------------------------------------------------------------------===//
+  // Collect inputs and parameters via topological traversal
+  std::vector<std::shared_ptr<GraphNode>> inputs;
+  std::vector<py::array_t<float>> parameters; // gamma, beta, weight, bias
+  std::unordered_map<GraphNode*, int> visited;
+  std::unordered_map<void*, int> paramIndex; // Map param pointer → arg index
 
-// Simple JIT test: compile and execute a single add operation
-py::array_t<float> jit_add(py::array_t<float> lhs, py::array_t<float> rhs) {
-  // Create MLIR context
-  MLIRContext context;
-  context.loadDialect<transformer::TransformerDialect,
-                      func::FuncDialect, arith::ArithDialect,
-                      memref::MemRefDialect, scf::SCFDialect, math::MathDialect>();
+  std::function<void(std::shared_ptr<GraphNode>)> collect;
+  collect = [&](std::shared_ptr<GraphNode> node) {
+    if (visited.count(node.get())) return;
+    visited[node.get()] = 1;
 
-  OpBuilder builder(&context);
+    if (node->type == OpType::Input) {
+      inputs.emplace_back(node);
+    } else {
+      // Collect parameters
+      if (node->gamma.size() > 0 && paramIndex.count(node->gamma.request().ptr) == 0) {
+        paramIndex[node->gamma.request().ptr] = parameters.size();
+        parameters.emplace_back(node->gamma);
+      }
+      if (node->beta.size() > 0 && paramIndex.count(node->beta.request().ptr) == 0) {
+        paramIndex[node->beta.request().ptr] = parameters.size();
+        parameters.emplace_back(node->beta);
+      }
+      if (node->weight.size() > 0 && paramIndex.count(node->weight.request().ptr) == 0) {
+        paramIndex[node->weight.request().ptr] = parameters.size();
+        parameters.emplace_back(node->weight);
+      }
+      if (node->bias.size() > 0 && paramIndex.count(node->bias.request().ptr) == 0) {
+        paramIndex[node->bias.request().ptr] = parameters.size();
+        parameters.emplace_back(node->bias);
+      }
+
+      for (auto& inp : node->inputs) {
+        collect(inp);
+      }
+    }
+  };
+  collect(output.node);
+
+  // Build MLIR module
+  OpBuilder builder(&compiler.getContext());
   auto module = ModuleOp::create(builder.getUnknownLoc());
   builder.setInsertionPointToEnd(module.getBody());
 
-  // Get shapes
-  auto lhs_info = lhs.request();
-  std::vector<int64_t> shape;
-  for (ssize_t i = 0; i < lhs_info.ndim; i++) {
-    shape.push_back(lhs_info.shape[i]);
+  // Create function signature: (inputs..., parameters..., output) -> ()
+  std::vector<Type> funcInputTypes;
+  for (auto& inp : inputs) {
+    auto memrefType = MemRefType::get(inp->shape, builder.getF32Type());
+    funcInputTypes.emplace_back(memrefType);
   }
-  auto memrefType = MemRefType::get(shape, builder.getF32Type());
+  for (auto& param : parameters) {
+    auto buf = param.request();
+    std::vector<int64_t> shape;
+    for (ssize_t i = 0; i < buf.ndim; i++) {
+      shape.emplace_back(buf.shape[i]);
+    }
+    auto memrefType = MemRefType::get(shape, builder.getF32Type());
+    funcInputTypes.emplace_back(memrefType);
+  }
+  auto outputType = MemRefType::get(output.node->shape, builder.getF32Type());
+  funcInputTypes.emplace_back(outputType); // Output as last argument
 
-  // Create function
-  auto funcType = builder.getFunctionType({memrefType, memrefType, memrefType}, {});
-  auto func = func::FuncOp::create(builder.getUnknownLoc(), "add_func", funcType);
+  auto funcType = builder.getFunctionType(funcInputTypes, {});
+  auto func = func::FuncOp::create(builder.getUnknownLoc(), "compute", funcType);
   auto& entryBlock = *func.addEntryBlock();
   builder.setInsertionPointToStart(&entryBlock);
 
-  // Get arguments
-  Value lhsArg = entryBlock.getArgument(0);
-  Value rhsArg = entryBlock.getArgument(1);
-  Value outArg = entryBlock.getArgument(2);
+  // Map inputs to function arguments
+  IRBuilder irBuilder(builder);
+  irBuilder.paramIndex = &paramIndex;
+  irBuilder.parameterArgOffset = inputs.size();
+  for (size_t i = 0; i < inputs.size(); i++) {
+    irBuilder.valueMap[inputs[i].get()] = entryBlock.getArgument(i);
+  }
 
-  // Call transformer.add
-  builder.create<transformer::AddOp>(builder.getUnknownLoc(), lhsArg, rhsArg, outArg);
+  // Compile computation graph
+  Value resultValue = irBuilder.compileNode(output.node);
+  Value outputArg = entryBlock.getArgument(inputs.size() + parameters.size());
+
+  // Copy result to output
+  builder.create<memref::CopyOp>(builder.getUnknownLoc(), resultValue, outputArg);
   builder.create<func::ReturnOp>(builder.getUnknownLoc());
 
   module.push_back(func);
 
-  // Apply lowering passes
-  PassManager pm(module.getContext());
-  pm.addNestedPass<func::FuncOp>(createLowerTransformerToStandardPass());
-  pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
-  pm.addPass(createConvertSCFToCFPass());
-  pm.addPass(createConvertMathToLibmPass());
-  pm.addPass(createArithToLLVMConversionPass());
-  pm.addPass(createConvertMathToLLVMPass());
-  pm.addPass(createFinalizeMemRefToLLVMConversionPass());
-  pm.addPass(createConvertFuncToLLVMPass());
-  pm.addPass(createReconcileUnrealizedCastsPass());
-
-  if (failed(pm.run(module))) {
-    throw std::runtime_error("Failed to lower module");
+  // Compile to native code
+  void* fnPtr = compiler.compileAndGetFunctionPtr(module, "compute");
+  if (!fnPtr) {
+    throw std::runtime_error("Failed to compile function");
   }
 
-  // Register translations
-  registerBuiltinDialectTranslation(context);
-  registerLLVMDialectTranslation(context);
-
-  // Create ExecutionEngine
-  ExecutionEngineOptions engineOptions;
-  engineOptions.transformer = makeOptimizingTransformer(3, 0, nullptr);
-
-  auto maybeEngine = ExecutionEngine::create(module, engineOptions);
-  if (!maybeEngine) {
-    throw std::runtime_error("Failed to create ExecutionEngine");
+  // Prepare arguments: inputs, parameters, output
+  std::vector<void*> args;
+  for (auto& inp : inputs) {
+    marshal_memref_2d(args, inp->data);
   }
-  auto engine = std::move(*maybeEngine);
-
-  // Look up function
-  auto expectedFPtr = engine->lookup("add_func");
-  if (!expectedFPtr) {
-    throw std::runtime_error("Failed to lookup function");
+  for (auto& param : parameters) {
+    auto buf = param.request();
+    if (buf.ndim == 1) {
+      marshal_memref_1d(args, param);
+    } else if (buf.ndim == 2) {
+      marshal_memref_2d(args, param);
+    } else {
+      throw std::runtime_error("Only 1D and 2D parameters supported");
+    }
   }
 
   // Allocate output
-  py::array_t<float> result(shape);
+  py::array_t<float> result(output.node->shape);
+  marshal_memref_2d(args, result);
 
-  // Prepare memref descriptors
-  auto lhs_ptr = static_cast<float*>(lhs_info.ptr);
-  auto rhs_ptr = static_cast<float*>(rhs.request().ptr);
-  auto result_ptr = static_cast<float*>(result.request().ptr);
-
-  // Call JIT function with proper memref descriptors (7 args each for 2D)
-  if (lhs_info.ndim == 2) {
-    using AddFn = void(*)(
-      float*, float*, int64_t, int64_t, int64_t, int64_t, int64_t,  // lhs
-      float*, float*, int64_t, int64_t, int64_t, int64_t, int64_t,  // rhs
-      float*, float*, int64_t, int64_t, int64_t, int64_t, int64_t   // out
-    );
-    auto addFn = reinterpret_cast<AddFn>(*expectedFPtr);
-
-    int64_t stride0 = shape[1];  // Row-major: stride for rows is # of columns
-    int64_t stride1 = 1;          // Column stride is always 1
-
-    addFn(
-      lhs_ptr, lhs_ptr, 0, shape[0], shape[1], stride0, stride1,
-      rhs_ptr, rhs_ptr, 0, shape[0], shape[1], stride0, stride1,
-      result_ptr, result_ptr, 0, shape[0], shape[1], stride0, stride1
-    );
-  } else {
-    throw std::runtime_error("JIT currently only supports 2D tensors");
+  // Execute using libffi
+  size_t num_args = args.size();
+  std::vector<ffi_type*> arg_types(num_args, &ffi_type_pointer);
+  std::vector<void*> arg_values(num_args);
+  for (size_t i = 0; i < num_args; ++i) {
+    arg_values[i] = &args[i];
   }
+
+  ffi_cif cif;
+  if (ffi_prep_cif(&cif, FFI_DEFAULT_ABI, num_args, &ffi_type_void, arg_types.data()) != FFI_OK) {
+    throw std::runtime_error("libffi ffi_prep_cif failed");
+  }
+
+  ffi_call(&cif, FFI_FN(fnPtr), nullptr, arg_values.data());
 
   return result;
 }
 
-py::array_t<float> forward(const Tensor& output) {
-  // Execute computation graph using C++ reference implementations (for now)
-  std::map<GraphNode*, py::array_t<float>> resultMap;
-
-  std::function<py::array_t<float>(std::shared_ptr<GraphNode>)> execute;
-  execute = [&](std::shared_ptr<GraphNode> node) -> py::array_t<float> {
-    if (resultMap.count(node.get())) {
-      return resultMap[node.get()];
-    }
-
-    py::array_t<float> result;
-
-    switch (node->type) {
-      case OpType::Input:
-        result = node->data;
-        break;
-
-      case OpType::Add: {
-        auto lhs = execute(node->inputs[0]);
-        auto rhs = execute(node->inputs[1]);
-        result = add_ref(lhs, rhs);
-        break;
-      }
-
-      case OpType::LayerNorm: {
-        auto input = execute(node->inputs[0]);
-        result = layer_norm_ref(input, node->gamma, node->beta, node->epsilon);
-        break;
-      }
-
-      case OpType::Linear: {
-        auto input = execute(node->inputs[0]);
-        result = linear_ref(input, node->weight, node->bias);
-        break;
-      }
-
-      case OpType::Gelu: {
-        auto input = execute(node->inputs[0]);
-        result = gelu_ref(input);
-        break;
-      }
-
-      case OpType::Matmul: {
-        auto lhs = execute(node->inputs[0]);
-        auto rhs = execute(node->inputs[1]);
-        result = matmul_ref(lhs, rhs);
-        break;
-      }
-
-      case OpType::Transpose: {
-        auto input = execute(node->inputs[0]);
-        result = transpose_ref(input);
-        break;
-      }
-
-      case OpType::Softmax: {
-        auto input = execute(node->inputs[0]);
-        result = softmax_ref(input);
-        break;
-      }
-
-      case OpType::Scale: {
-        auto input = execute(node->inputs[0]);
-        result = scale_ref(input, node->scale_factor);
-        break;
-      }
-    }
-
-    resultMap[node.get()] = result;
-    return result;
-  };
-
-  return execute(output.node);
-}
-
 //===----------------------------------------------------------------------===//
-// C++ Reference Implementation (for interpreter)
-//===----------------------------------------------------------------------===//
-
-py::array_t<float> add_ref(py::array_t<float> lhs, py::array_t<float> rhs) {
-  auto lhs_buf = lhs.request();
-  auto rhs_buf = rhs.request();
-
-  if (lhs_buf.ndim != rhs_buf.ndim) {
-    throw std::runtime_error("Dimension mismatch in add");
-  }
-
-  // Allocate output
-  py::array_t<float> result(lhs_buf.shape);
-  auto result_buf = result.request();
-
-  float* lhs_ptr = static_cast<float*>(lhs_buf.ptr);
-  float* rhs_ptr = static_cast<float*>(rhs_buf.ptr);
-  float* result_ptr = static_cast<float*>(result_buf.ptr);
-
-  size_t size = 1;
-  for (ssize_t i = 0; i < lhs_buf.ndim; i++) {
-    size *= lhs_buf.shape[i];
-  }
-
-  for (size_t i = 0; i < size; i++) {
-    result_ptr[i] = lhs_ptr[i] + rhs_ptr[i];
-  }
-
-  return result;
-}
-
-py::array_t<float> layer_norm_ref(py::array_t<float> input, 
-                                   py::array_t<float> gamma,
-                                   py::array_t<float> beta,
-                                   float epsilon = 1e-5f) {
-  auto input_buf = input.request();
-  auto gamma_buf = gamma.request();
-  auto beta_buf = beta.request();
-
-  if (input_buf.ndim != 2) {
-    throw std::runtime_error("Input must be 2D");
-  }
-
-  int64_t seq_len = input_buf.shape[0];
-  int64_t d_model = input_buf.shape[1];
-
-  auto output = py::array_t<float>({seq_len, d_model});
-  auto output_buf = output.request();
-
-  float* input_ptr = static_cast<float*>(input_buf.ptr);
-  float* gamma_ptr = static_cast<float*>(gamma_buf.ptr);
-  float* beta_ptr = static_cast<float*>(beta_buf.ptr);
-  float* output_ptr = static_cast<float*>(output_buf.ptr);
-
-  for (int64_t i = 0; i < seq_len; i++) {
-    // Compute mean
-    float mean = 0.0f;
-    for (int64_t j = 0; j < d_model; j++) {
-      mean += input_ptr[i * d_model + j];
-    }
-    mean /= d_model;
-
-    // Compute variance
-    float variance = 0.0f;
-    for (int64_t j = 0; j < d_model; j++) {
-      float diff = input_ptr[i * d_model + j] - mean;
-      variance += diff * diff;
-    }
-    variance /= d_model;
-
-    // Normalize
-    float inv_std = 1.0f / std::sqrt(variance + epsilon);
-    for (int64_t j = 0; j < d_model; j++) {
-      float normalized = (input_ptr[i * d_model + j] - mean) * inv_std;
-      output_ptr[i * d_model + j] = normalized * gamma_ptr[j] + beta_ptr[j];
-    }
-  }
-
-  return output;
-}
-
-py::array_t<float> linear_ref(py::array_t<float> input,
-                               py::array_t<float> weight,
-                               py::array_t<float> bias) {
-  auto input_buf = input.request();
-  auto weight_buf = weight.request();
-  auto bias_buf = bias.request();
-
-  if (input_buf.ndim != 2 || weight_buf.ndim != 2) {
-    throw std::runtime_error("Input and weight must be 2D");
-  }
-
-  int64_t seq_len = input_buf.shape[0];
-  int64_t in_features = input_buf.shape[1];
-  int64_t out_features = weight_buf.shape[0];
-
-  if (weight_buf.shape[1] != in_features) {
-    throw std::runtime_error("Input/weight dimension mismatch");
-  }
-
-  auto output = py::array_t<float>({seq_len, out_features});
-  auto output_buf = output.request();
-
-  float* input_ptr = static_cast<float*>(input_buf.ptr);
-  float* weight_ptr = static_cast<float*>(weight_buf.ptr);
-  float* bias_ptr = static_cast<float*>(bias_buf.ptr);
-  float* output_ptr = static_cast<float*>(output_buf.ptr);
-
-  // output[i, j] = sum_k(input[i, k] * weight[j, k]) + bias[j]
-  for (int64_t i = 0; i < seq_len; i++) {
-    for (int64_t j = 0; j < out_features; j++) {
-      float sum = 0.0f;
-      for (int64_t k = 0; k < in_features; k++) {
-        sum += input_ptr[i * in_features + k] * weight_ptr[j * in_features + k];
-      }
-      output_ptr[i * out_features + j] = sum + bias_ptr[j];
-    }
-  }
-
-  return output;
-}
-
-py::array_t<float> gelu_ref(py::array_t<float> input) {
-  auto input_buf = input.request();
-  auto output = py::array_t<float>(input_buf.shape);
-  auto output_buf = output.request();
-
-  float* input_ptr = static_cast<float*>(input_buf.ptr);
-  float* output_ptr = static_cast<float*>(output_buf.ptr);
-
-  size_t size = 1;
-  for (ssize_t i = 0; i < input_buf.ndim; i++) {
-    size *= input_buf.shape[i];
-  }
-
-  // GELU: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-  const float sqrt_2_over_pi = 0.7978845608f;
-  const float coeff = 0.044715f;
-
-  for (size_t i = 0; i < size; i++) {
-    float x = input_ptr[i];
-    float x3 = x * x * x;
-    float inner = sqrt_2_over_pi * (x + coeff * x3);
-    float tanh_val = std::tanh(inner);
-    output_ptr[i] = 0.5f * x * (1.0f + tanh_val);
-  }
-
-  return output;
-}
-
-py::array_t<float> ffn_ref(py::array_t<float> input,
-                            py::array_t<float> w1, py::array_t<float> b1,
-                            py::array_t<float> w2, py::array_t<float> b2) {
-  auto hidden = linear_ref(input, w1, b1);
-  auto activated = gelu_ref(hidden);
-  return linear_ref(activated, w2, b2);
-}
-
-py::array_t<float> matmul_ref(py::array_t<float> lhs, py::array_t<float> rhs) {
-  auto lhs_buf = lhs.request();
-  auto rhs_buf = rhs.request();
-
-  if (lhs_buf.ndim != 2 || rhs_buf.ndim != 2) {
-    throw std::runtime_error("Inputs must be 2D");
-  }
-
-  int64_t M = lhs_buf.shape[0];
-  int64_t K = lhs_buf.shape[1];
-  int64_t N = rhs_buf.shape[1];
-
-  if (rhs_buf.shape[0] != K) {
-    throw std::runtime_error("Matrix dimension mismatch");
-  }
-
-  auto output = py::array_t<float>({M, N});
-  auto output_buf = output.request();
-
-  float* lhs_ptr = static_cast<float*>(lhs_buf.ptr);
-  float* rhs_ptr = static_cast<float*>(rhs_buf.ptr);
-  float* output_ptr = static_cast<float*>(output_buf.ptr);
-
-  for (int64_t i = 0; i < M; i++) {
-    for (int64_t j = 0; j < N; j++) {
-      float sum = 0.0f;
-      for (int64_t k = 0; k < K; k++) {
-        sum += lhs_ptr[i * K + k] * rhs_ptr[k * N + j];
-      }
-      output_ptr[i * N + j] = sum;
-    }
-  }
-
-  return output;
-}
-
-py::array_t<float> transpose_ref(py::array_t<float> input) {
-  auto input_buf = input.request();
-
-  if (input_buf.ndim != 2) {
-    throw std::runtime_error("Input must be 2D");
-  }
-
-  int64_t M = input_buf.shape[0];
-  int64_t N = input_buf.shape[1];
-
-  auto output = py::array_t<float>({N, M});
-  auto output_buf = output.request();
-
-  float* input_ptr = static_cast<float*>(input_buf.ptr);
-  float* output_ptr = static_cast<float*>(output_buf.ptr);
-
-  for (int64_t i = 0; i < M; i++) {
-    for (int64_t j = 0; j < N; j++) {
-      output_ptr[j * M + i] = input_ptr[i * N + j];
-    }
-  }
-
-  return output;
-}
-
-py::array_t<float> softmax_ref(py::array_t<float> input) {
-  auto input_buf = input.request();
-
-  if (input_buf.ndim != 2) {
-    throw std::runtime_error("Input must be 2D");
-  }
-
-  int64_t rows = input_buf.shape[0];
-  int64_t cols = input_buf.shape[1];
-
-  auto output = py::array_t<float>({rows, cols});
-  auto output_buf = output.request();
-
-  float* input_ptr = static_cast<float*>(input_buf.ptr);
-  float* output_ptr = static_cast<float*>(output_buf.ptr);
-
-  for (int64_t i = 0; i < rows; i++) {
-    // Find max for numerical stability
-    float max_val = input_ptr[i * cols];
-    for (int64_t j = 1; j < cols; j++) {
-      max_val = std::max(max_val, input_ptr[i * cols + j]);
-    }
-
-    // Compute sum of exp(x - max)
-    float sum_exp = 0.0f;
-    for (int64_t j = 0; j < cols; j++) {
-      sum_exp += std::exp(input_ptr[i * cols + j] - max_val);
-    }
-
-    // Normalize
-    for (int64_t j = 0; j < cols; j++) {
-      output_ptr[i * cols + j] = std::exp(input_ptr[i * cols + j] - max_val) / sum_exp;
-    }
-  }
-
-  return output;
-}
-
-py::array_t<float> scale_ref(py::array_t<float> input, float scale_factor) {
-  auto input_buf = input.request();
-  auto output = py::array_t<float>(input_buf.shape);
-  auto output_buf = output.request();
-
-  float* input_ptr = static_cast<float*>(input_buf.ptr);
-  float* output_ptr = static_cast<float*>(output_buf.ptr);
-
-  size_t size = 1;
-  for (ssize_t i = 0; i < input_buf.ndim; i++) {
-    size *= input_buf.shape[i];
-  }
-
-  for (size_t i = 0; i < size; i++) {
-    output_ptr[i] = input_ptr[i] * scale_factor;
-  }
-
-  return output;
-}
-
-py::array_t<float> scaled_dot_product_attention_ref(py::array_t<float> Q,
-                                                     py::array_t<float> K,
-                                                     py::array_t<float> V) {
-  // Attention(Q, K, V) = softmax(Q @ K^T / sqrt(d_k)) @ V
-  int64_t d_k = K.request().shape[1];
-  float scale_factor = 1.0f / std::sqrt(static_cast<float>(d_k));
-
-  auto K_T = transpose_ref(K);
-  auto scores = matmul_ref(Q, K_T);
-  auto scaled_scores = scale_ref(scores, scale_factor);
-  auto attn_weights = softmax_ref(scaled_scores);
-  return matmul_ref(attn_weights, V);
-}
-
-py::array_t<float> multi_head_attention_ref(py::array_t<float> input,
-                                             py::array_t<float> w_q, py::array_t<float> b_q,
-                                             py::array_t<float> w_k, py::array_t<float> b_k,
-                                             py::array_t<float> w_v, py::array_t<float> b_v,
-                                             py::array_t<float> w_o, py::array_t<float> b_o) {
-  auto Q = linear_ref(input, w_q, b_q);
-  auto K = linear_ref(input, w_k, b_k);
-  auto V = linear_ref(input, w_v, b_v);
-
-  auto attn_output = scaled_dot_product_attention_ref(Q, K, V);
-  return linear_ref(attn_output, w_o, b_o);
-}
-
-py::array_t<float> transformer_block_ref(py::array_t<float> input,
-                                          // Attention weights
-                                          py::array_t<float> w_q, py::array_t<float> b_q,
-                                          py::array_t<float> w_k, py::array_t<float> b_k,
-                                          py::array_t<float> w_v, py::array_t<float> b_v,
-                                          py::array_t<float> w_o, py::array_t<float> b_o,
-                                          // LayerNorm 1 params
-                                          py::array_t<float> gamma1, py::array_t<float> beta1,
-                                          // FFN weights
-                                          py::array_t<float> w1, py::array_t<float> b1,
-                                          py::array_t<float> w2, py::array_t<float> b2,
-                                          // LayerNorm 2 params
-                                          py::array_t<float> gamma2, py::array_t<float> beta2) {
-  // Pre-norm architecture
-  // x = x + attention(layer_norm(x))
-  auto normed1 = layer_norm_ref(input, gamma1, beta1);
-  auto attn_out = multi_head_attention_ref(normed1, w_q, b_q, w_k, b_k, w_v, b_v, w_o, b_o);
-
-  // Add residual
-  auto input_buf = input.request();
-  auto attn_buf = attn_out.request();
-  auto residual1 = py::array_t<float>(input_buf.shape);
-  auto res1_buf = residual1.request();
-
-  float* input_ptr = static_cast<float*>(input_buf.ptr);
-  float* attn_ptr = static_cast<float*>(attn_buf.ptr);
-  float* res1_ptr = static_cast<float*>(res1_buf.ptr);
-
-  size_t size = 1;
-  for (ssize_t i = 0; i < input_buf.ndim; i++) {
-    size *= input_buf.shape[i];
-  }
-
-  for (size_t i = 0; i < size; i++) {
-    res1_ptr[i] = input_ptr[i] + attn_ptr[i];
-  }
-
-  // x = x + ffn(layer_norm(x))
-  auto normed2 = layer_norm_ref(residual1, gamma2, beta2);
-  auto ffn_out = ffn_ref(normed2, w1, b1, w2, b2);
-
-  // Add residual
-  auto ffn_buf = ffn_out.request();
-  auto output = py::array_t<float>(input_buf.shape);
-  auto output_buf = output.request();
-
-  float* ffn_ptr = static_cast<float*>(ffn_buf.ptr);
-  float* output_ptr = static_cast<float*>(output_buf.ptr);
-
-  for (size_t i = 0; i < size; i++) {
-    output_ptr[i] = res1_ptr[i] + ffn_ptr[i];
-  }
-
-  return output;
-}
-
-py::array_t<float> multi_layer_transformer_ref(py::array_t<float> input,
-                                                const std::vector<py::array_t<float>>& all_weights) {
-  // Expect 16 weights per layer
-  if (all_weights.size() % 16 != 0) {
-    throw std::runtime_error("Expected 16 weights per layer");
-  }
-
-  int num_layers = all_weights.size() / 16;
-  auto output = input;
-
-  for (int layer = 0; layer < num_layers; layer++) {
-    int base = layer * 16;
-    output = transformer_block_ref(
-        output,
-        all_weights[base + 0],  all_weights[base + 1],   // w_q, b_q
-        all_weights[base + 2],  all_weights[base + 3],   // w_k, b_k
-        all_weights[base + 4],  all_weights[base + 5],   // w_v, b_v
-        all_weights[base + 6],  all_weights[base + 7],   // w_o, b_o
-        all_weights[base + 8],  all_weights[base + 9],   // gamma1, beta1
-        all_weights[base + 10], all_weights[base + 11],  // w1, b1
-        all_weights[base + 12], all_weights[base + 13],  // w2, b2
-        all_weights[base + 14], all_weights[base + 15]   // gamma2, beta2
-    );
-  }
-
-  return output;
-}
-
-//===----------------------------------------------------------------------===//
-// Python Module
+// Python Bindings
 //===----------------------------------------------------------------------===//
 
 PYBIND11_MODULE(ch12, m) {
-  m.doc() = "Chapter 12: Transformer with Tensor API";
+  m.doc() = "Chapter 12: Transformer with Pure MLIR JIT";
 
-  py::class_<Tensor>(m, "Tensor")
+  py::class_<Tensor, std::shared_ptr<Tensor>>(m, "Tensor")
       .def(py::init<py::array_t<float>>())
-      .def("shape", &Tensor::shape)
-      .def("__add__", &Tensor::operator+, "Add two tensors (operator overloading)");
+      .def("__add__", &Tensor::operator+)
+      .def("shape", &Tensor::shape);
 
-  m.def("layer_norm", &layer_norm, 
-        py::arg("input"), 
-        py::arg("gamma"), 
-        py::arg("beta"), 
-        py::arg("epsilon") = 1e-5f,
-        "Layer normalization");
+  m.def("layer_norm", &layer_norm,
+        py::arg("input"), py::arg("gamma"), py::arg("beta"), py::arg("epsilon") = 1e-5f);
+  m.def("linear", &linear);
+  m.def("gelu", &gelu);
+  m.def("add", &add);
+  m.def("matmul", &matmul);
+  m.def("transpose", &transpose);
+  m.def("softmax", &softmax);
+  m.def("scale", &scale);
 
-  m.def("linear", &linear,
-        py::arg("input"),
-        py::arg("weight"),
-        py::arg("bias"),
-        "Linear transformation");
-
-  m.def("gelu", &gelu,
-        py::arg("input"),
-        "GELU activation");
-
-  m.def("add", &add,
-        py::arg("lhs"),
-        py::arg("rhs"),
-        "Element-wise addition");
-
-  m.def("matmul", &matmul,
-        py::arg("lhs"),
-        py::arg("rhs"),
-        "Matrix multiplication");
-
-  m.def("transpose", &transpose,
-        py::arg("input"),
-        "Matrix transpose");
-
-  m.def("softmax", &softmax,
-        py::arg("input"),
-        "Softmax activation");
-
-  m.def("scale", &scale,
-        py::arg("input"),
-        py::arg("scale_factor"),
-        "Scale by constant");
-
-  m.def("ffn", &ffn,
-        py::arg("input"),
-        py::arg("w1"),
-        py::arg("b1"),
-        py::arg("w2"),
-        py::arg("b2"),
-        "Feed-forward network (Linear -> GELU -> Linear)");
-
-  m.def("scaled_dot_product_attention", &scaled_dot_product_attention,
-        py::arg("Q"),
-        py::arg("K"),
-        py::arg("V"),
-        "Scaled dot-product attention");
-
-  m.def("multi_head_attention", &multi_head_attention,
-        py::arg("input"),
-        py::arg("w_q"),
-        py::arg("b_q"),
-        py::arg("w_k"),
-        py::arg("b_k"),
-        py::arg("w_v"),
-        py::arg("b_v"),
-        py::arg("w_o"),
-        py::arg("b_o"),
-        "Multi-head attention");
-
-  m.def("transformer_block", &transformer_block,
-        py::arg("input"),
-        py::arg("w_q"),
-        py::arg("b_q"),
-        py::arg("w_k"),
-        py::arg("b_k"),
-        py::arg("w_v"),
-        py::arg("b_v"),
-        py::arg("w_o"),
-        py::arg("b_o"),
-        py::arg("gamma1"),
-        py::arg("beta1"),
-        py::arg("w1"),
-        py::arg("b1"),
-        py::arg("w2"),
-        py::arg("b2"),
-        py::arg("gamma2"),
-        py::arg("beta2"),
-        "Transformer block (pre-norm architecture)");
-
-  m.def("multi_layer_transformer", &multi_layer_transformer,
-        py::arg("input"),
-        py::arg("all_weights"),
-        "Multi-layer transformer (stack of N blocks)");
+  m.def("ffn", &ffn);
+  m.def("scaled_dot_product_attention", &scaled_dot_product_attention);
+  m.def("attention", &multi_head_attention);
+  m.def("transformer_block", &transformer_block);
+  m.def("multi_layer_transformer", &multi_layer_transformer);
 
   m.def("forward", &forward,
         py::arg("output"),
-        "Execute computation graph using interpreter");
-
-  m.def("jit_add", &jit_add,
-        py::arg("lhs"),
-        py::arg("rhs"),
-        "JIT-compiled element-wise add using MLIR ExecutionEngine");
-
-  // C++ reference implementations
-  m.def("layer_norm_ref", &layer_norm_ref,
-        py::arg("input"),
-        py::arg("gamma"),
-        py::arg("beta"),
-        py::arg("epsilon") = 1e-5f,
-        "Layer normalization (C++ reference)");
-
-  m.def("linear_ref", &linear_ref,
-        py::arg("input"),
-        py::arg("weight"),
-        py::arg("bias"),
-        "Linear transformation (C++ reference)");
-
-  m.def("gelu_ref", &gelu_ref,
-        py::arg("input"),
-        "GELU activation (C++ reference)");
-
-  m.def("ffn_ref", &ffn_ref,
-        py::arg("input"),
-        py::arg("w1"),
-        py::arg("b1"),
-        py::arg("w2"),
-        py::arg("b2"),
-        "Feed-forward network (C++ reference)");
-
-  m.def("matmul_ref", &matmul_ref,
-        py::arg("lhs"),
-        py::arg("rhs"),
-        "Matrix multiplication (C++ reference)");
-
-  m.def("transpose_ref", &transpose_ref,
-        py::arg("input"),
-        "Matrix transpose (C++ reference)");
-
-  m.def("softmax_ref", &softmax_ref,
-        py::arg("input"),
-        "Softmax activation (C++ reference)");
-
-  m.def("scale_ref", &scale_ref,
-        py::arg("input"),
-        py::arg("scale_factor"),
-        "Scale by constant (C++ reference)");
-
-  m.def("scaled_dot_product_attention_ref", &scaled_dot_product_attention_ref,
-        py::arg("Q"),
-        py::arg("K"),
-        py::arg("V"),
-        "Scaled dot-product attention (C++ reference)");
-
-  m.def("multi_head_attention_ref", &multi_head_attention_ref,
-        py::arg("input"),
-        py::arg("w_q"),
-        py::arg("b_q"),
-        py::arg("w_k"),
-        py::arg("b_k"),
-        py::arg("w_v"),
-        py::arg("b_v"),
-        py::arg("w_o"),
-        py::arg("b_o"),
-        "Multi-head attention (C++ reference)");
-
-  m.def("transformer_block_ref", &transformer_block_ref,
-        py::arg("input"),
-        py::arg("w_q"),
-        py::arg("b_q"),
-        py::arg("w_k"),
-        py::arg("b_k"),
-        py::arg("w_v"),
-        py::arg("b_v"),
-        py::arg("w_o"),
-        py::arg("b_o"),
-        py::arg("gamma1"),
-        py::arg("beta1"),
-        py::arg("w1"),
-        py::arg("b1"),
-        py::arg("w2"),
-        py::arg("b2"),
-        py::arg("gamma2"),
-        py::arg("beta2"),
-        "Transformer block (C++ reference)");
-
-  m.def("multi_layer_transformer_ref", &multi_layer_transformer_ref,
-        py::arg("input"),
-        py::arg("all_weights"),
-        "Multi-layer transformer (C++ reference)");
+        "JIT compile and execute computation graph");
 }
