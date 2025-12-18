@@ -38,8 +38,9 @@ jobs:
     - name: Install dependencies
       run: |
           sudo apt install -y libmlir-19-dev libmlir-19 mlir-19-tools
+          sudo apt install -y llvm-19-dev llvm-19
           sudo apt install -y python3-dev python3-numpy ninja-build libzstd-dev
-          sudo apt install -y clang-19
+          sudo apt install -y clang-19 libffi-dev pkg-config
           # Enable this on WSL2 Ubuntu: Fix LLVM header conflict (required for pybind11)
           # sudo mv /usr/lib/llvm-19/include/cxxabi.h /usr/lib/llvm-19/include/cxxabi.h.backup
 

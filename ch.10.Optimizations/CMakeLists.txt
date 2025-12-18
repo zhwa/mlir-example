@@ -64,6 +64,7 @@ target_link_libraries(ch10 PRIVATE
     MLIRTransforms
     MLIRSupport
     MLIROptLib
+    LLVM
     ${FFI_LIBRARIES}
     LLVMX86Info
     LLVMX86AsmParser

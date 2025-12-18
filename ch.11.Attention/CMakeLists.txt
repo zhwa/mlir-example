@@ -79,5 +79,6 @@ target_link_libraries(ch11 PRIVATE
     MLIRVectorToLLVM
     MLIRVectorToSCF
     MLIRLinalgTransforms
+    LLVM
     ${FFI_LIBRARIES}
 )

@@ -79,6 +79,7 @@ target_link_libraries(ch12 PRIVATE
   MLIRMemRefToLLVM
   MLIRReconcileUnrealizedCasts
   MLIRSCFToControlFlow
+  LLVM
   ${FFI_LIBRARIES}
 )
 

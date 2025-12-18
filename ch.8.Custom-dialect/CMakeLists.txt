@@ -55,6 +55,7 @@ pybind11_add_module(ch8
 
 target_link_libraries(ch8 PRIVATE
     ${MLIR_LIBS}
+    LLVM
     ${FFI_LIBRARIES}
     LLVMX86Info
     LLVMX86AsmParser
