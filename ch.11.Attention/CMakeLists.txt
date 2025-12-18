@@ -1,6 +1,10 @@
 # Chapter 11: Attention Mechanism with Transformer Dialect
 cmake_minimum_required(VERSION 3.20)
 
+# Find libffi
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(FFI REQUIRED libffi)
+
 # Generate dialect files using TableGen
 set(LLVM_TARGET_DEFINITIONS inc/TransformerDialect.td)
 mlir_tablegen(inc/TransformerDialect.h.inc -gen-dialect-decls -I ${CMAKE_CURRENT_SOURCE_DIR}/inc)
@@ -41,6 +45,7 @@ pybind11_add_module(ch11 src/bindings.cpp)
 target_include_directories(ch11 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/inc
     ${CMAKE_CURRENT_BINARY_DIR}/inc
+    ${FFI_INCLUDE_DIRS}
 )
 
 target_link_libraries(ch11 PRIVATE
@@ -74,5 +79,5 @@ target_link_libraries(ch11 PRIVATE
     MLIRVectorToLLVM
     MLIRVectorToSCF
     MLIRLinalgTransforms
-    ffi  # For universal bindings
+    ${FFI_LIBRARIES}
 )
