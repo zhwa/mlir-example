@@ -476,7 +476,14 @@ public:
       case OpType::Scale: {
         Value input = compileNode(node->inputs[0]);
         Value output = createAlloc(node->shape);
+        
+        // Create constant scale factor
         Value scale = createAlloc({1});
+        Value zeroIdx = builder.create<arith::ConstantIndexOp>(loc, 0);
+        Value scaleConst = builder.create<arith::ConstantFloatOp>(
+            loc, llvm::APFloat(node->scale_factor), builder.getF32Type());
+        builder.create<memref::StoreOp>(loc, scaleConst, scale, ValueRange{zeroIdx});
+        
         builder.create<transformer::ScaleOp>(loc, input, scale, output);
         result = output;
         break;

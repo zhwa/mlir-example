@@ -379,21 +379,22 @@ struct TransposeOpLowering : public OpRewritePattern<TransposeOp> {
     auto inputType = cast<MemRefType>(input.getType());
     auto shape = inputType.getShape();
 
-    // Transpose last two dimensions
-    int64_t dim0 = shape[0];
-    int64_t dim1 = shape[1];
+    // Transpose: input is (dim0, dim1), output is (dim1, dim0)
+    int64_t inputDim0 = shape[0];
+    int64_t inputDim1 = shape[1];
 
-    Value dim0Val = createConstantIndex(rewriter, loc, dim0);
-    Value dim1Val = createConstantIndex(rewriter, loc, dim1);
+    Value inputDim0Val = createConstantIndex(rewriter, loc, inputDim0);
+    Value inputDim1Val = createConstantIndex(rewriter, loc, inputDim1);
     Value zeroIdx = createConstantIndex(rewriter, loc, 0);
     Value oneIdx = createConstantIndex(rewriter, loc, 1);
 
     // output[i, j] = input[j, i]
+    // Output shape is (inputDim1, inputDim0), so iterate accordingly
     rewriter.create<scf::ForOp>(
-        loc, zeroIdx, dim0Val, oneIdx, ValueRange{},
+        loc, zeroIdx, inputDim1Val, oneIdx, ValueRange{},
         [&](OpBuilder &builder, Location loc, Value i, ValueRange iterArgs) {
           builder.create<scf::ForOp>(
-              loc, zeroIdx, dim1Val, oneIdx, ValueRange{},
+              loc, zeroIdx, inputDim0Val, oneIdx, ValueRange{},
               [&](OpBuilder &builder, Location loc, Value j, ValueRange iterArgs) {
                 Value val = builder.create<memref::LoadOp>(loc, input, ValueRange{j, i});
                 builder.create<memref::StoreOp>(loc, val, output, ValueRange{i, j});
