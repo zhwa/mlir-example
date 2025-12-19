@@ -10,10 +10,10 @@ cmake --build build/x64-release --target ch13
 
 # Test
 cd ch.13.GPT
-PYTHONPATH=../build/x64-release/ch.13.GPT python3 test.py
+python3 test.py
 
 # Generate text
-PYTHONPATH=../build/x64-release/ch.13.GPT python3 demo.py
+python3 demo.py
 ```
 
 ## Model Architecture
