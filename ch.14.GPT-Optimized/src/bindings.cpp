@@ -35,6 +35,13 @@
 #include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/Vector/Transforms/Passes.h"
+#include "mlir/Dialect/Transform/IR/TransformDialect.h"
+#include "mlir/Dialect/Transform/IR/TransformOps.h"
+#include "mlir/Dialect/Transform/IR/TransformTypes.h"
+#include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
+#include "mlir/Dialect/Linalg/TransformOps/LinalgTransformOps.h"
+#include "mlir/Dialect/Linalg/TransformOps/DialectExtension.h"
+#include "mlir/Dialect/Vector/TransformOps/VectorTransformOps.h"
 
 #include <llvm/Support/TargetSelect.h>
 
@@ -70,12 +77,181 @@ static struct LLVMInit {
 class TransformerCompiler {
 public:
   TransformerCompiler() {
+    // Register Transform dialect extensions for Linalg and Vector
+    DialectRegistry registry;
+    mlir::linalg::registerTransformDialectExtension(registry);
+    mlir::vector::registerTransformDialectExtension(registry);
+    context_.appendDialectRegistry(registry);
+    
     context_.loadDialect<transformer::TransformerDialect,
                          func::FuncDialect, arith::ArithDialect,
                          linalg::LinalgDialect,  // Phase 1: Add Linalg for optimizations
                          vector::VectorDialect,  // Phase 4: Add Vector for SIMD
                          memref::MemRefDialect, scf::SCFDialect, math::MathDialect,
-                         LLVM::LLVMDialect>();
+                         LLVM::LLVMDialect,
+                         transform::TransformDialect>();  // Phase 6: Transform for vectorization
+  }
+  
+  // Build comprehensive Transform dialect IR for modern optimization
+  // This demonstrates production-grade Transform dialect usage
+  ModuleOp buildOptimizationTransform(OpBuilder &builder, Location loc) {
+    auto transformModule = builder.create<ModuleOp>(loc);
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToEnd(transformModule.getBody());
+    
+    // Create transform.sequence as top-level operation
+    auto anyOpType = transform::OperationType::get(
+        builder.getContext(), builder.getStringAttr("builtin.module"));
+    
+    auto sequence = builder.create<transform::SequenceOp>(
+        loc,
+        /*resultTypes=*/TypeRange{},
+        /*failure_propagation_mode=*/transform::FailurePropagationMode::Suppress,  // Suppress to continue on failure
+        /*root=*/Value(),  // Null value means use top-level
+        /*extra_bindings=*/ValueRange{});
+    
+    Region &region = sequence.getBodyRegion();
+    Block *block = builder.createBlock(&region);
+    block->addArgument(anyOpType, loc);
+    builder.setInsertionPointToStart(block);
+    
+    Value target = block->getArgument(0);
+    
+    // Phase 1: Match and tile matmul operations
+    // Tiling is essential for:
+    // 1. Cache locality (32x32x32 fits in L1 cache)
+    // 2. Vectorization enablement (tiled loops are vectorizable)
+    // 3. Parallelization opportunities
+    
+    // Build array of operation names to match
+    SmallVector<StringRef> matmulOps = {"linalg.matmul"};
+    auto matchMatmul = builder.create<transform::MatchOp>(
+        loc,
+        /*results=*/transform::AnyOpType::get(builder.getContext()),
+        target,
+        /*opNames=*/matmulOps);
+    
+    // Tile matmul: [32, 32, 32] for good cache locality and vectorization
+    // These sizes work well for AVX2 (8-wide float SIMD)
+    SmallVector<int64_t> tileSizes = {32, 32, 32};
+    auto tileMatmul = builder.create<transform::TileUsingForOp>(
+        loc,
+        /*resultTypes=*/TypeRange{transform::AnyOpType::get(builder.getContext()),
+                                   transform::AnyOpType::get(builder.getContext()),
+                                   transform::AnyOpType::get(builder.getContext()),
+                                   transform::AnyOpType::get(builder.getContext())},
+        /*target=*/matchMatmul.getResult(),
+        /*dynamic_sizes=*/ValueRange{},
+        /*static_sizes=*/builder.getDenseI64ArrayAttr(tileSizes),
+        /*interchange=*/DenseI64ArrayAttr(),
+        /*scalable_sizes=*/DenseBoolArrayAttr());
+    
+    Value tiledMatmul = tileMatmul.getResult(0);
+    
+    // Phase 2: Match and tile generic ops (GELU, Add, etc.)
+    // Element-wise ops benefit from tiling for cache and vectorization
+    SmallVector<StringRef> genericOps = {"linalg.generic"};
+    auto matchGeneric = builder.create<transform::MatchOp>(
+        loc,
+        /*results=*/transform::AnyOpType::get(builder.getContext()),
+        target,
+        /*opNames=*/genericOps);
+    
+    // Tile generic ops: [128] - larger tiles for element-wise (less reuse)
+    SmallVector<int64_t> genericTileSizes = {128};
+    auto tileGeneric = builder.create<transform::TileUsingForOp>(
+        loc,
+        /*resultTypes=*/TypeRange{transform::AnyOpType::get(builder.getContext()),
+                                   transform::AnyOpType::get(builder.getContext())},
+        /*target=*/matchGeneric.getResult(),
+        /*dynamic_sizes=*/ValueRange{},
+        /*static_sizes=*/builder.getDenseI64ArrayAttr(genericTileSizes),
+        /*interchange=*/DenseI64ArrayAttr(),
+        /*scalable_sizes=*/DenseBoolArrayAttr());
+    
+    Value tiledGeneric = tileGeneric.getResult(0);
+    
+    // Phase 3: Tile-and-fuse producers into consumers
+    // This is the MODERN way: tile ops and fuse producers greedily
+    // Replaces old createLinalgElementwiseOpFusionPass()
+    // Benefits:
+    // 1. Reduces memory traffic (fused ops share cache)
+    // 2. Enables better vectorization (larger computation kernels)
+    // 3. Declarative and composable with other transforms
+    
+    // Fuse into matmul tiles (32x32x32 tiles with fused producers)
+    // Note: FuseOp expects ArrayAttr for tile sizes
+    SmallVector<Attribute> matmulTileAttrs;
+    for (auto size : tileSizes) {
+      matmulTileAttrs.push_back(builder.getI64IntegerAttr(size));
+    }
+    auto fuseMatmul = builder.create<transform::FuseOp>(
+        loc,
+        /*resultTypes=*/TypeRange{transform::AnyOpType::get(builder.getContext()),
+                                   transform::AnyOpType::get(builder.getContext()),
+                                   transform::AnyOpType::get(builder.getContext()),
+                                   transform::AnyOpType::get(builder.getContext())},
+        /*target=*/tiledMatmul,
+        /*tile_sizes=*/builder.getArrayAttr(matmulTileAttrs),
+        /*tile_interchange=*/ArrayAttr());
+    
+    Value fusedMatmul = fuseMatmul.getResult(0);
+    
+    // Fuse into generic op tiles (128 tiles with fused producers)
+    SmallVector<Attribute> genericTileAttrs;
+    for (auto size : genericTileSizes) {
+      genericTileAttrs.push_back(builder.getI64IntegerAttr(size));
+    }
+    auto fuseGeneric = builder.create<transform::FuseOp>(
+        loc,
+        /*resultTypes=*/TypeRange{transform::AnyOpType::get(builder.getContext()),
+                                   transform::AnyOpType::get(builder.getContext())},
+        /*target=*/tiledGeneric,
+        /*tile_sizes=*/builder.getArrayAttr(genericTileAttrs),
+        /*tile_interchange=*/ArrayAttr());
+    
+    Value fusedGeneric = fuseGeneric.getResult(0);
+    
+    // Phase 4: Vectorize fused operations
+    // Now that ops are tiled AND fused, vectorization creates efficient SIMD kernels
+    // The fused ops will be vectorized as single units
+    builder.create<transform::VectorizeOp>(
+        loc,
+        /*resultTypes=*/TypeRange{},
+        fusedMatmul,
+        /*vector_sizes=*/ValueRange{},
+        /*static_vector_sizes=*/DenseI64ArrayAttr(),
+        /*vectorize_nd_extract=*/UnitAttr(),
+        /*scalable_sizes=*/DenseBoolArrayAttr());
+    
+    builder.create<transform::VectorizeOp>(
+        loc,
+        /*resultTypes=*/TypeRange{},
+        fusedGeneric,
+        /*vector_sizes=*/ValueRange{},
+        /*static_vector_sizes=*/DenseI64ArrayAttr(),
+        /*vectorize_nd_extract=*/UnitAttr(),
+        /*scalable_sizes=*/DenseBoolArrayAttr());
+    
+    // Phase 5: Apply patterns for cleanup and optimization
+    // Use transform.apply_patterns with pattern descriptors
+    auto applyPatterns = builder.create<transform::ApplyPatternsOp>(loc, target);
+    {
+      OpBuilder::InsertionGuard guard(builder);
+      Region &patternsRegion = applyPatterns.getRegion();
+      Block *patternsBlock = builder.createBlock(&patternsRegion);
+      builder.setInsertionPointToStart(patternsBlock);
+      
+      // Canonicalization patterns to clean up after transformations
+      builder.create<transform::ApplyCanonicalizationPatternsOp>(loc);
+      
+      // Tiling-specific canonicalization for linalg
+      builder.create<transform::ApplyTilingCanonicalizationPatternsOp>(loc);
+    }
+    
+    builder.create<transform::YieldOp>(loc);
+    
+    return transformModule;
   }
 
   MLIRContext& getContext() { return context_; }
@@ -88,27 +264,42 @@ public:
     pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
     pm.addNestedPass<func::FuncOp>(createCSEPass());
 
-    // Phase 3: Linalg optimizations (fusion, tiling, etc.)
-    // Fuse element-wise operations (Add, GELU) with adjacent ops
-    pm.addNestedPass<func::FuncOp>(mlir::createLinalgElementwiseOpFusionPass());
-    pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
-    pm.addNestedPass<func::FuncOp>(createCSEPass());
-
-    // Phase 4: Vectorization preparation
-    // Convert linalg to vector dialect for SIMD operations
-    // Note: In MLIR 19, vectorization is done via patterns/transforms, not a standalone pass
-    // For now, we lower linalg to loops (future: use transform dialect for vectorization)
-
-    // Phase 1-2: Lower linalg ops to loops
+    // Phase 3-6: Apply comprehensive Transform dialect optimizations
+    // Modern approach: tile → fuse → vectorize → cleanup (all declarative!)
+    // All done declaratively via Transform dialect (not old-style passes)
+    OpBuilder builder(&context_);
+    auto transformModule = buildOptimizationTransform(builder, module.getLoc());
+    
+    // Apply the transform sequence to the payload module
+    auto sequenceOp = *transformModule.getBody()->getOps<transform::SequenceOp>().begin();
+    RaggedArray<transform::MappedValue> emptyMapping;
+    
+    // Note: Using Suppress mode so we continue even if some ops can't be optimized
+    if (failed(transform::applyTransforms(
+            module, cast<transform::TransformOpInterface>(sequenceOp.getOperation()),
+            emptyMapping,
+            transform::TransformOptions()))) {
+      // This is informational - not a hard error with Suppress mode
+      llvm::errs() << "Note: Some Transform dialect optimizations were not applicable\n";
+    }
+    
+    // Clean up any leftover linalg ops by lowering to loops
     pm.addPass(mlir::createConvertLinalgToLoopsPass());
     pm.addPass(createCanonicalizerPass());
 
-    // Loop optimizations
+    // Loop optimizations that help enable vectorization
     pm.addNestedPass<func::FuncOp>(createLoopInvariantCodeMotionPass());
     pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
+    
+    // Prepare loops for vectorization
+    pm.addPass(createCanonicalizerPass());
+    pm.addPass(createCSEPass());
 
-    // Lower to LLVM
-    pm.addPass(createConvertVectorToLLVMPass());  // Phase 4: Vector → LLVM SIMD
+    // Phase 6: Lower vector operations to LLVM SIMD
+    // Handle vector operations that couldn't be fully lowered
+    pm.addPass(createConvertVectorToSCFPass());  // Vector masking and unrolling
+    pm.addPass(createCanonicalizerPass());
+    pm.addPass(createConvertVectorToLLVMPass());  // Vector → LLVM SIMD intrinsics
     pm.addPass(createConvertMathToLLVMPass());
     pm.addPass(createConvertMathToLibmPass());
     pm.addPass(createConvertSCFToCFPass());

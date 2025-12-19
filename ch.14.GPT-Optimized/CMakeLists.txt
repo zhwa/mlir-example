@@ -67,11 +67,14 @@ target_link_libraries(ch14 PRIVATE
   MLIRFuncDialect
   MLIRLinalgDialect
   MLIRLinalgTransforms
+  MLIRLinalgTransformOps
   MLIRMathDialect
   MLIRMemRefDialect
   MLIRSCFDialect
   MLIRVectorDialect
   MLIRVectorTransforms
+  MLIRVectorTransformOps
+  MLIRTransformDialect
   MLIRTransforms
   MLIRTargetLLVMIRExport
   MLIRLLVMCommonConversion
