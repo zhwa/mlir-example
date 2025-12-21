@@ -15,7 +15,6 @@ ALSO includes performance benchmarks vs Chapter 13 baseline.
 import sys
 import os
 import numpy as np
-import time
 
 # Add build directory to path
 build_paths = [
