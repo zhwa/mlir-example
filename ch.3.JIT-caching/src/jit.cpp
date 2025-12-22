@@ -104,11 +104,12 @@ compileGemmFunction() {
 
   // Create ExecutionEngine with optimization
   mlir::ExecutionEngineOptions options;
-  options.transformer = mlir::makeOptimizingTransformer(
+  auto transformer = mlir::makeOptimizingTransformer(
       /*optLevel=*/3,
       /*sizeLevel=*/0,
       /*targetMachine=*/nullptr
   );
+  options.transformer = std::move(transformer);
   
   auto maybeEngine = mlir::ExecutionEngine::create(*mlirModule, options);
   if (!maybeEngine) {

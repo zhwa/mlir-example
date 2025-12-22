@@ -122,7 +122,8 @@ public:
         }
 
         mlir::ExecutionEngineOptions options;
-        options.transformer = mlir::makeOptimizingTransformer(3, 0, nullptr);
+        auto transformer = mlir::makeOptimizingTransformer(3, 0, nullptr);
+        options.transformer = std::move(transformer);
 
         auto maybeEngine = mlir::ExecutionEngine::create(module, options);
         if (!maybeEngine) {

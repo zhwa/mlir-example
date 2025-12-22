@@ -9,10 +9,10 @@
       "installDir": "${sourceDir}/install/${presetName}",
       "generator": "Ninja",
       "cacheVariables": {
-        "CMAKE_CXX_COMPILER": "clang++-19",
-        "CMAKE_C_COMPILER": "clang-19",
-        "LLVM_DIR": "/usr/lib/llvm-19/lib/cmake/llvm",
-        "MLIR_DIR": "/usr/lib/llvm-19/lib/cmake/mlir"
+        "CMAKE_CXX_COMPILER": "clang++-20",
+        "CMAKE_C_COMPILER": "clang-20",
+        "LLVM_DIR": "/usr/lib/llvm-20/lib/cmake/llvm",
+        "MLIR_DIR": "/usr/lib/llvm-20/lib/cmake/mlir"
       }
     },
     {

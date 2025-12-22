@@ -193,7 +193,8 @@ public:
                                    transform::AnyOpType::get(builder.getContext())},
         /*target=*/tiledMatmul,
         /*tile_sizes=*/builder.getArrayAttr(matmulTileAttrs),
-        /*tile_interchange=*/ArrayAttr());
+        /*tile_interchange=*/ArrayAttr(),
+        /*apply_cleanup=*/false);
     
     Value fusedMatmul = fuseMatmul.getResult(0);
     
@@ -208,7 +209,8 @@ public:
                                    transform::AnyOpType::get(builder.getContext())},
         /*target=*/tiledGeneric,
         /*tile_sizes=*/builder.getArrayAttr(genericTileAttrs),
-        /*tile_interchange=*/ArrayAttr());
+        /*tile_interchange=*/ArrayAttr(),
+        /*apply_cleanup=*/false);
     
     Value fusedGeneric = fuseGeneric.getResult(0);
     
@@ -322,7 +324,8 @@ public:
     }
 
     ExecutionEngineOptions options;
-    options.transformer = makeOptimizingTransformer(3, 0, nullptr);
+    auto transformer = makeOptimizingTransformer(3, 0, nullptr);
+    options.transformer = std::move(transformer);
 
     auto maybeEngine = ExecutionEngine::create(module, options);
     if (!maybeEngine) {

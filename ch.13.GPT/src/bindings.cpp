@@ -101,7 +101,8 @@ public:
     }
 
     ExecutionEngineOptions options;
-    options.transformer = makeOptimizingTransformer(3, 0, nullptr);
+    auto transformer = makeOptimizingTransformer(3, 0, nullptr);
+    options.transformer = std::move(transformer);
 
     auto maybeEngine = ExecutionEngine::create(module, options);
     if (!maybeEngine) {

@@ -85,8 +85,9 @@ void executeGemm(float* A, float* B, float* C) {
   // Create ExecutionEngine with optimization pipeline
   // ExecutionEngine handles LLVM IR translation internally
   mlir::ExecutionEngineOptions options;
-  options.transformer = mlir::makeOptimizingTransformer(
+  auto transformer = mlir::makeOptimizingTransformer(
       /*optLevel=*/3, /*sizeLevel=*/0, /*targetMachine=*/nullptr);
+  options.transformer = std::move(transformer);
 
   auto maybeEngine = mlir::ExecutionEngine::create(*mlirModule, options);
   if (!maybeEngine) {

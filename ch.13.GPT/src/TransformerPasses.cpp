@@ -908,8 +908,8 @@ struct LowerTransformerToStandardPass
                  RoPEOpLowering>(
         &getContext());
 
-    if (failed(applyPatternsAndFoldGreedily(getOperation(),
-                                                std::move(patterns)))) {
+    if (failed(applyPatternsGreedily(getOperation(),
+                                     std::move(patterns)))) {
       signalPassFailure();
     }
   }
