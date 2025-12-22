@@ -4,18 +4,10 @@ project(mlir-gemm-tutorial LANGUAGES CXX C)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# Find system LLVM/MLIR (version 20 or compatible)
-find_package(LLVM 20 CONFIG)
-if(NOT LLVM_FOUND)
-    find_package(LLVM REQUIRED CONFIG)
-endif()
-
-# Force use of shared LLVM library to avoid CommandLine duplicate registration
-set(LLVM_LINK_LLVM_DYLIB ON)
-link_libraries(LLVM)
-
-# Find MLIR once at root level for all chapters to share
+# Find LLVM/MLIR (version specified by LLVM_DIR/MLIR_DIR in preset)
+find_package(LLVM REQUIRED CONFIG)
 find_package(MLIR REQUIRED CONFIG)
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 
@@ -23,18 +15,17 @@ message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
 message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 message(STATUS "Using MLIRConfig.cmake in: ${MLIR_DIR}")
 
+# Add LLVM/MLIR to module path for TableGen
 list(APPEND CMAKE_MODULE_PATH "${MLIR_CMAKE_DIR}")
 list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
 
+# Only include TableGen for ODS/TableGen tasks
 include(TableGen)
-include(AddLLVM)
-include(AddMLIR)
-include(HandleLLVMOptions)
 
+# Standard include directories
 include_directories(SYSTEM ${LLVM_INCLUDE_DIRS})
 include_directories(SYSTEM ${MLIR_INCLUDE_DIRS})
-separate_arguments(LLVM_DEFINITIONS_LIST NATIVE_COMMAND ${LLVM_DEFINITIONS})
-add_definitions(${LLVM_DEFINITIONS_LIST})
+add_definitions(${LLVM_DEFINITIONS})
 
 # Fetch pybind11 once at root level
 set(DEPS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/build/deps)
@@ -51,19 +42,38 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(pybind11)
 
-# LLVM components - use shared library
-set(llvm_libs LLVM)
-
-# Get MLIR dialect/conversion/extension libraries
-get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
-get_property(conversion_libs GLOBAL PROPERTY MLIR_CONVERSION_LIBS)
-get_property(extension_libs GLOBAL PROPERTY MLIR_EXTENSION_LIBS)
-
-# Common MLIR libraries for all subprojects
+# Common MLIR libraries for all chapters
+# Explicitly list targets instead of using get_property to avoid 
+# "targets already defined" errors with system-installed MLIR
 set(MLIR_COMMON_LIBS
-  ${dialect_libs}
-  ${conversion_libs}
-  ${extension_libs}
+  # Dialects
+  MLIRAffineDialect
+  MLIRArithDialect
+  MLIRBufferizationDialect
+  MLIRControlFlowDialect
+  MLIRFuncDialect
+  MLIRGPUDialect
+  MLIRLinalgDialect
+  MLIRLLVMDialect
+  MLIRMemRefDialect
+  MLIRSCFDialect
+  MLIRTensorDialect
+  MLIRVectorDialect
+  
+  # Conversions
+  MLIRAffineToStandard
+  MLIRArithToLLVM
+  MLIRBufferizationToMemRef
+  MLIRControlFlowToLLVM
+  MLIRFuncToLLVM
+  MLIRLinalgToStandard
+  MLIRLLVMToLLVMIRTranslation
+  MLIRMemRefToLLVM
+  MLIRSCFToControlFlow
+  MLIRTensorToLinalg
+  MLIRVectorToLLVM
+  
+  # Core infrastructure
   MLIRAnalysis
   MLIRExecutionEngine
   MLIRIR
@@ -73,7 +83,9 @@ set(MLIR_COMMON_LIBS
   MLIRSupport
   MLIRTargetLLVMIRExport
   MLIRTransforms
-  ${llvm_libs}
+  
+  # LLVM
+  LLVM
 )
 
 # Add all chapter subdirectories
