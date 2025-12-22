@@ -1,7 +1,5 @@
 # Chapter 16: Nano LLM Serving - Complete Tutorial
 
-**Educational Goal**: Learn how modern LLM serving systems achieve high throughput by studying a simplified implementation from scratch.
-
 ---
 
 ## Table of Contents
@@ -74,7 +72,7 @@ This chapter builds a **simplified serving engine** demonstrating these techniqu
                   │ Python API calls
 ┌─────────────────▼───────────────────────────────────┐
 │  C++/MLIR Layer (Model Execution)                   │
-│  - GPT model with MLIR JIT (from Chapter 14)       │
+│  - GPT model with MLIR JIT (from Chapter 14)        │
 │  - KV cache pool (C++ memory management)            │
 │  - Forward pass (JIT-compiled MLIR)                 │
 │  - Pybind11 bindings                                │
@@ -113,7 +111,7 @@ class Request:
     prompt_tokens: List[int] # Input tokens [1, 2, 3, ...]
     max_tokens: int          # How many tokens to generate
     temperature: float       # Sampling randomness (0=greedy, 1=normal)
-    
+
     # State tracking
     output_tokens: List[int] # Generated tokens so far
     kv_pages: List[int]      # Which KV cache pages we're using
@@ -263,21 +261,21 @@ class KVCachePool {
     // Storage: One big array for all pages
     std::vector<std::vector<float>> k_cache_;  // [num_layers][total_cache_size]
     std::vector<std::vector<float>> v_cache_;  // [num_layers][total_cache_size]
-    
+
     // Free page tracking
     std::set<int> free_pages_;  // {0, 1, 2, ..., num_pages-1}
-    
+
     int num_pages_;
     int page_size_;  // Tokens per page
-    
+
 public:
     // Allocate pages for a request
     std::vector<int> allocate(int num_tokens) {
         int num_pages_needed = (num_tokens + page_size_ - 1) / page_size_;
-        
+
         if (free_pages_.size() < num_pages_needed)
             throw std::runtime_error("Out of memory!");
-        
+
         std::vector<int> allocated;
         for (int i = 0; i < num_pages_needed; i++) {
             int page = *free_pages_.begin();
@@ -286,7 +284,7 @@ public:
         }
         return allocated;
     }
-    
+
     // Free pages when request finishes
     void free(const std::vector<int>& pages) {
         for (int page : pages)
@@ -311,10 +309,10 @@ class KVCachePool:
         self._pool = ch16.KVCachePool(
             num_pages, page_size, num_layers, num_heads, head_dim
         )
-    
+
     def allocate(self, num_tokens):
         return self._pool.allocate(num_tokens)
-    
+
     def free(self, pages):
         self._pool.free(pages)
 ```
@@ -345,29 +343,29 @@ class PrefillManager:
     def __init__(self, kv_pool, max_prefill_tokens=2048):
         self.kv_pool = kv_pool
         self.max_prefill_tokens = max_prefill_tokens
-    
+
     def schedule(self, waiting_requests):
         """Select which prefills to run this step"""
         selected = []
         total_tokens = 0
-        
+
         for req in waiting_requests:
             prompt_len = len(req.prompt_tokens)
-            
+
             # Check token budget
             if total_tokens + prompt_len > self.max_prefill_tokens:
                 break  # Too many tokens
-            
+
             # Check memory
             pages_needed = (prompt_len + page_size - 1) // page_size
             if self.kv_pool.num_free_pages < pages_needed:
                 break  # Out of memory
-            
+
             # Allocate and select
             req.kv_pages = self.kv_pool.allocate(prompt_len)
             selected.append(req)
             total_tokens += prompt_len
-        
+
         return Batch.from_prefill(selected)
 ```
 
@@ -383,21 +381,21 @@ class DecodeManager:
     def __init__(self, max_batch_size=32):
         self.running_requests = []
         self.max_batch_size = max_batch_size
-    
+
     def schedule(self):
         """Batch all running requests (up to max_batch_size)"""
         if not self.running_requests:
             return None
-        
+
         # Remove finished requests
         self.running_requests = [
             req for req in self.running_requests 
             if not req.is_finished
         ]
-        
+
         # Select up to max_batch_size
         selected = self.running_requests[:self.max_batch_size]
-        
+
         return Batch.from_decode(selected)
 ```
 
@@ -416,12 +414,12 @@ while has_pending_requests():
     if prefill_batch:
         execute(prefill_batch)
         move_to_running(prefill_batch.requests)
-    
+
     # 2. Schedule decode
     decode_batch = decode_mgr.schedule()
     if decode_batch:
         execute(decode_batch)
-    
+
     # 3. Remove finished
     remove_finished_requests()
 ```
@@ -476,12 +474,12 @@ class ChunkedRequest:
         self.request = request
         self.chunk_size = chunk_size
         self.current_chunk_idx = 0
-    
+
     @property
     def has_more_chunks(self):
         processed = self.current_chunk_idx * self.chunk_size
         return processed < len(self.request.prompt_tokens)
-    
+
     def get_next_chunk(self):
         """Return next chunk of tokens"""
         start = self.current_chunk_idx * self.chunk_size
@@ -499,29 +497,29 @@ class ChunkedPrefillManager:
         self.kv_pool = kv_pool
         self.max_chunk_size = max_chunk_size
         self.chunked_requests = []
-    
+
     def add_request(self, req):
         chunked = ChunkedRequest(req, self.max_chunk_size)
         self.chunked_requests.append(chunked)
-    
+
     def schedule(self):
         """Round-robin: take one chunk from each request"""
         selected_chunks = []
         total_tokens = 0
-        
+
         for chunked_req in self.chunked_requests:
             if not chunked_req.has_more_chunks:
                 continue
-            
+
             chunk = chunked_req.get_next_chunk()
             if total_tokens + len(chunk) <= MAX_BATCH_TOKENS:
                 selected_chunks.append((chunked_req.request, chunk))
                 total_tokens += len(chunk)
-                
+
                 # Allocate pages for this chunk
                 pages = self.kv_pool.allocate(len(chunk))
                 chunked_req.request.kv_pages.extend(pages)
-        
+
         return Batch.from_chunks(selected_chunks)
 ```
 
@@ -615,13 +613,13 @@ class RadixNode:
         self.kv_pages = []                      # KV cache pages for this token
         self.ref_count = 0                      # How many requests use this?
         self.last_access_time = 0.0             # For LRU eviction
-    
+
     def add_child(self, token, kv_page):
         child = RadixNode(token)
         child.kv_pages = [kv_page]
         self.children[token] = child
         return child
-    
+
     def get_child(self, token):
         return self.children.get(token, None)
 ```
@@ -633,31 +631,31 @@ class RadixCache:
     def __init__(self, kv_pool):
         self.root = RadixNode(token=None)
         self.kv_pool = kv_pool
-    
+
     def match_prefix(self, tokens):
         """Find longest matching prefix in cache"""
         node = self.root
         matched_len = 0
-        
+
         for i, token in enumerate(tokens):
             if token in node.children:
                 node = node.children[token]
                 matched_len = i + 1
             else:
                 break  # No longer matching
-        
+
         return matched_len, node
-    
+
     def insert(self, tokens, kv_pages):
         """Insert a sequence into the cache"""
         node = self.root
-        
+
         for token, page in zip(tokens, kv_pages):
             if token not in node.children:
                 node = node.add_child(token, page)
             else:
                 node = node.children[token]
-            
+
             node.ref_count += 1
             node.last_access_time = time.time()
 ```
@@ -669,44 +667,44 @@ class RadixCacheManager:
     def __init__(self, kv_pool):
         self.cache = RadixCache(kv_pool)
         self.kv_pool = kv_pool
-        
+
         # Statistics
         self.cache_hits = 0
         self.cache_misses = 0
-    
+
     def get_or_allocate(self, tokens):
         """
         Main API: Get cached pages or allocate new ones
-        
+
         Returns:
             (cached_len, new_pages)
         """
         # Step 1: Check cache for prefix
         cached_len, last_node = self.cache.match_prefix(tokens)
-        
+
         if cached_len > 0:
             self.cache_hits += cached_len
-        
+
         uncached_len = len(tokens) - cached_len
-        
+
         if uncached_len == 0:
             # Everything cached!
             return cached_len, []
-        
+
         # Step 2: Allocate pages for uncached suffix
         self.cache_misses += uncached_len
         new_pages = []
-        
+
         for _ in range(uncached_len):
             page = self.kv_pool.allocate(1)  # 1 page per token
             new_pages.extend(page)
-        
+
         # Step 3: Insert complete sequence into cache
         all_pages = self._get_cached_pages(tokens[:cached_len]) + new_pages
         self.cache.insert(tokens, all_pages)
-        
+
         return cached_len, new_pages
-    
+
     @property
     def cache_hit_rate(self):
         total = self.cache_hits + self.cache_misses
@@ -722,20 +720,20 @@ def evict_lru_leaf(self):
     """Find and evict the least recently used leaf node"""
     oldest_leaf = None
     oldest_time = float('inf')
-    
+
     # DFS to find oldest leaf
     def find_oldest_leaf(node, parent):
         nonlocal oldest_leaf, oldest_time
-        
+
         if node.is_leaf() and node.last_access_time < oldest_time:
             oldest_leaf = (node, parent)
             oldest_time = node.last_access_time
-        
+
         for child in node.children.values():
             find_oldest_leaf(child, node)
-    
+
     find_oldest_leaf(self.root, None)
-    
+
     if oldest_leaf:
         node, parent = oldest_leaf
         # Free KV pages
@@ -795,16 +793,16 @@ while has_pending_requests():
         if req.is_finished:
             running.remove(req)
             finished.append(req)
-    
+
     # 2. Add new requests (if space)
     while len(running) < max_batch_size and waiting:
         req = waiting.pop(0)
         running.append(req)
-    
+
     # 3. Generate one token for all running requests
     batch = make_batch(running)
     outputs = model.forward(batch)
-    
+
     # 4. Update requests with new tokens
     for req, output in zip(running, outputs):
         req.output_tokens.append(output)
@@ -823,17 +821,17 @@ class RequestPool:
         self.waiting = []
         self.running = []
         self.finished = []
-    
+
     def add_requests(self, reqs):
         self.waiting.extend(reqs)
-    
+
     def move_to_running(self, reqs):
         for req in reqs:
             if req in self.waiting:
                 self.waiting.remove(req)
             if req not in self.running:
                 self.running.append(req)
-    
+
     def move_to_finished(self, reqs):
         for req in reqs:
             if req in self.running:
@@ -841,7 +839,7 @@ class RequestPool:
             if req not in self.finished:
                 self.finished.append(req)
                 req.is_finished = True
-    
+
     def has_pending(self):
         return len(self.waiting) > 0 or len(self.running) > 0
 ```
@@ -856,50 +854,50 @@ class ContinuousBatcher:
         self.prefill_mgr = prefill_mgr
         self.decode_mgr = decode_mgr
         self.request_pool = RequestPool()
-    
+
     def step(self):
         """Execute one batching iteration"""
-        
+
         # 1. Check for finished requests
         finished = [req for req in self.request_pool.running 
                     if self._is_finished(req)]
         self.request_pool.move_to_finished(finished)
-        
+
         # Free KV cache
         for req in finished:
             self.radix_mgr.kv_pool.free(req.kv_pages)
-        
+
         # 2. Schedule prefill (if space available)
         for req in list(self.request_pool.waiting):
             self.prefill_mgr.add_request(req)
             self.request_pool.waiting.remove(req)
-        
+
         prefill_batch = self.prefill_mgr.schedule()
         if prefill_batch:
             logits = self.executor.execute_prefill(prefill_batch)
             self._process_prefill_output(prefill_batch, logits)
             self.request_pool.move_to_running(prefill_batch.requests)
-            
+
             # Add to decode manager
             for req in prefill_batch.requests:
                 self.decode_mgr.add_request(req)
-        
+
         # 3. Schedule decode
         self.decode_mgr.remove_finished()
         decode_batch = self.decode_mgr.schedule()
         if decode_batch:
             logits = self.executor.execute_decode(decode_batch)
             self._process_decode_output(decode_batch, logits)
-        
+
         return decode_batch.size if decode_batch else 0
-    
+
     def run_until_complete(self, requests):
         """Run continuous batching until all requests finish"""
         self.request_pool.add_requests(requests)
-        
+
         while self.request_pool.has_pending():
             self.step()
-        
+
         return self.request_pool.finished
 ```
 
@@ -952,17 +950,17 @@ class NanoServingEngine:
             num_heads=config.n_head,
             head_dim=config.head_dim
         )
-        
+
         # Initialize radix cache
         self.radix_mgr = RadixCacheManager(self.kv_pool)
-        
+
         # Initialize schedulers
         self.prefill_mgr = ChunkedPrefillManager(self.kv_pool)
         self.decode_mgr = DecodeManager()
-        
+
         # Initialize model executor
         self.executor = ModelExecutor(config, weights, self.kv_pool)
-        
+
         # Initialize continuous batcher
         self.batcher = ContinuousBatcher(
             self.executor,
@@ -970,7 +968,7 @@ class NanoServingEngine:
             self.prefill_mgr,
             self.decode_mgr
         )
-    
+
     def generate(self, prompt_tokens_list, sampling_params=None):
         """Main API: Generate completions"""
         # Create requests
@@ -985,12 +983,12 @@ class NanoServingEngine:
                 zip(prompt_tokens_list, sampling_params)
             )
         ]
-        
+
         # Run continuous batching
         finished = self.batcher.run_until_complete(requests)
-        
+
         return finished
-    
+
     def get_stats(self):
         """Get performance statistics"""
         return {
@@ -1080,7 +1078,7 @@ print(f"Memory utilization: {stats['memory_utilization']:.2%}")
          ▼      ▼
 ┌─────────────────────────────────────────────────┐
 │ ModelExecutor (C++/MLIR)                        │
-│ - GPT forward pass with MLIR JIT               │
+│ - GPT forward pass with MLIR JIT                │
 │ - Read/write KV cache                           │
 │ - Return logits                                 │
 └──────────────────┬──────────────────────────────┘
@@ -1311,33 +1309,3 @@ Modern serving systems (vLLM, SGLang, TensorRT-LLM) all use these techniques:
 ### Courses
 1. "Large Language Models" - Stanford CS324
 2. "MLSys: The New Frontier of Machine Learning Systems" - Berkeley CS294
-
----
-
-## Conclusion
-
-You've built a complete LLM serving engine from scratch! 🎉
-
-**What you accomplished**:
-- ✅ 67 tests across 6 phases
-- ✅ ~3000 lines of Python + C++ code
-- ✅ All core techniques from production systems
-- ✅ 100-500x speedup vs naive implementation
-
-**Skills gained**:
-- Systems programming (memory management, scheduling)
-- Data structures (radix trees, paging)
-- Performance optimization
-- Python/C++ integration
-
-**Next steps**:
-- Try the exercises
-- Port to GPU (PyTorch/CUDA)
-- Read the papers
-- Contribute to vLLM/SGLang!
-
-**Most importantly**: You now understand how modern LLM serving works at a deep level. You can read papers, understand optimizations, and build your own serving systems! 🚀
-
----
-
-*This tutorial is part of the MLIR Example Project. For questions or contributions, see the main README.*
