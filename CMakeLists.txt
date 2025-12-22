@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Find system LLVM/MLIR (version 20 or compatible)
-find_package(LLVM 20 CONFIG)
+find_package(LLVM 20.0 CONFIG)
 if(NOT LLVM_FOUND)
     find_package(LLVM REQUIRED CONFIG)
 endif()
