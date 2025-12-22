@@ -4,13 +4,7 @@ project(ch9-tablegen-dialect)
 # Find Python
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 
-# Find MLIR
-find_package(MLIR REQUIRED CONFIG)
-message(STATUS "Using MLIRConfig.cmake in: ${MLIR_DIR}")
-message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
-
-list(APPEND CMAKE_MODULE_PATH "${MLIR_CMAKE_DIR}")
-list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
+# MLIR is already found by root CMakeLists.txt
 
 include(TableGen)
 include(AddLLVM)

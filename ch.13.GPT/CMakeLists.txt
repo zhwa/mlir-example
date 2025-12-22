@@ -1,8 +1,7 @@
 # Chapter 13: Minimal GPT with RoPE
 project(ch13-gpt)
 
-# Find MLIR
-find_package(MLIR REQUIRED CONFIG)
+# MLIR is already found by root CMakeLists.txt
 
 list(APPEND CMAKE_MODULE_PATH "${MLIR_CMAKE_DIR}")
 list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
