@@ -47,13 +47,15 @@ jobs:
     - name: Test Python Chapters (1-14)
       run: |
           echo "Running JIT-based tests (Chapters 1-14)..."
+          export BUILD_DIR="${{ github.workspace }}/build/x64-release"
           for chapter in ch.{1..14}.*; do
             if [ -d "$chapter" ]; then
               echo "Testing $chapter..."
+              chapter_build="$BUILD_DIR/$chapter"
               for test in "$chapter"/*.py; do
-                if [ -f "$test" ] && [[ ! "$test" =~ (graph_builder|lowering|generation|demo|benchmark) ]]; then
+                if [ -f "$test" ] && [[ ! "$test" =~ (generation|demo|benchmark) ]]; then
                   echo "  Running $(basename $test)..."
-                  python3 "$test" || echo "  ⚠️ Warning: $test failed"
+                  PYTHONPATH="$chapter_build:$PYTHONPATH" python3 "$test" || echo "  ⚠️ Warning: $test failed"
                 fi
               done
             fi

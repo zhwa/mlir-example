@@ -52,7 +52,6 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(FFI REQUIRED libffi)
 
 # Python bindings (pybind11 is already fetched at root level)
-
 pybind11_add_module(ch13 src/bindings.cpp)
 
 target_link_libraries(ch13 PRIVATE
