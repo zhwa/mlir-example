@@ -1,6 +1,6 @@
 # Chapter 2: Dynamic Shapes and Tensors
 
-In Chapter 1, we compiled and executed our first MLIR program: an 8×32 matrix multiplied by a 32×16 matrix. The operation worked perfectly, but with a significant limitation—the dimensions were hardcoded into the function signature. If we wanted to multiply matrices of different sizes, we would need to generate and compile separate functions for each dimension combination. This approach is impractical for real machine learning workloads, where batch sizes vary, sequences have different lengths, and models process inputs of diverse shapes.
+In Chapter 1, we compiled and executed our first MLIR program: an 8×32 matrix multiplied by a 32×16 matrix using the `linalg.matmul` operation. The operation worked perfectly, but with a significant limitation—the dimensions were hardcoded into the function signature. If we wanted to multiply matrices of different sizes, we would need to generate and compile separate functions for each dimension combination. This approach is impractical for real machine learning workloads, where batch sizes vary, sequences have different lengths, and models process inputs of diverse shapes.
 
 This chapter addresses the fundamental question: **How do we write MLIR code that works with matrices and tensors of any size?** The answer involves understanding MLIR's distinction between **tensors** and **memrefs**, the concept of dynamic dimensions, and the runtime data structures that make shape-polymorphic code possible.
 
@@ -53,11 +53,7 @@ Before diving into dynamic shapes, we need to understand how MLIR represents mul
 
 **The Tensor Dialect** defines immutable, value-semantic multi-dimensional arrays. Types like `tensor<8x32xf32>` represent abstract mathematical tensors—similar to how you think about matrices in linear algebra or immutable arrays in functional programming.
 
-**Key characteristics:**
-- **Immutable values**: Operations create new tensors rather than modifying existing ones
-- **SSA semantics**: Like integers or floats in SSA form—once defined, never changed
-- **No aliasing**: No concerns about whether two tensor values point to the same memory
-- **Optimization-friendly**: Compiler can aggressively reorder, fuse, and eliminate operations
+The tensor dialect emphasizes immutable values: operations create new tensors rather than modifying existing ones, following the same SSA semantics as integers or floats—once defined, a tensor value never changes. This immutability eliminates aliasing concerns entirely; there's no question about whether two tensor values point to the same memory because they're separate values in the dataflow graph. As a result, tensors are extremely optimization-friendly—the compiler can aggressively reorder, fuse, and eliminate operations without worrying about hidden side effects or memory dependencies.
 
 **Example operations:**
 
@@ -86,11 +82,7 @@ Notice how each operation either creates a new tensor or extracts a value—ther
 
 **The MemRef Dialect** defines mutable, reference-semantic memory buffers. Types like `memref<8x32xf32>` represent pointers to concrete memory locations with shape and stride information—essentially typed pointers with multi-dimensional indexing.
 
-**Key characteristics:**
-- **Mutable references**: Operations directly read from and write to memory
-- **Pointer semantics**: A memref is fundamentally a pointer to a buffer
-- **Aliasing possible**: Multiple memrefs can reference the same underlying memory
-- **Execution-ready**: Maps directly to CPU/GPU memory operations
+Unlike tensors, memrefs embrace mutability: operations directly read from and write to memory. A memref is fundamentally a pointer to a buffer, which means aliasing is possible—multiple memrefs can reference the same underlying memory, and the compiler must be conservative about reordering operations. However, this mutable, pointer-based model is exactly what makes memrefs execution-ready: they map directly to the CPU and GPU memory operations that hardware actually supports.
 
 **Example operations:**
 
@@ -164,20 +156,13 @@ This leads to a **two-phase compilation strategy** common in modern ML compilers
 
 ### Our Pragmatic Choice: Skip Tensors Entirely
 
-For this book, we take a pragmatic shortcut: **we work directly with memrefs** and skip the tensor phase entirely. This decision has important implications:
+For this book, we take a pragmatic shortcut: **we work directly with memrefs** and skip the tensor phase entirely. This decision has important implications.
 
-**Advantages**:
-- **Simpler to understand**: We avoid the complexity of bufferization (though we cover it conceptually in Chapter 4).
-- **Closer to execution**: The IR we write directly corresponds to how the code will execute—no hidden transformations.
-- **Easier Python integration**: NumPy arrays are memory buffers, so they map naturally to memrefs.
-- **Faster initial development**: We can focus on MLIR fundamentals without navigating the bufferization pipeline.
+Working with memrefs offers several advantages for learning MLIR fundamentals. First, it's simpler to understand because we avoid the complexity of bufferization (though Chapter 4 will cover the conceptual foundations of this transformation in depth). Second, the IR we write directly corresponds to how the code will execute—there are no hidden transformations that might surprise us along the way. Third, NumPy arrays are memory buffers at their core, so they map naturally to memrefs, making Python integration straightforward (Chapter 8 will show how the binding code works in detail). Finally, this approach enables faster initial development because we can focus on MLIR's core concepts without navigating the bufferization pipeline.
 
-**Trade-offs**:
-- **Limited high-level optimizations**: Some tensor-level transformations (fusion, tiling) are more difficult or less effective on memrefs.
-- **Manual memory management**: We must be explicit about allocation and mutation, whereas tensor operations leave these concerns to the bufferization pass.
-- **Not representative of production pipelines**: Real ML compilers (TensorFlow/MLIR, PyTorch 2.0, JAX) use tensors extensively at high levels.
+However, this choice involves trade-offs that readers should understand. By skipping tensors, we forgo some high-level optimizations—tensor-level transformations like fusion and tiling are more difficult or less effective when working directly with mutable memrefs. We must also be explicit about allocation and mutation, whereas tensor operations delegate these concerns to the bufferization pass. Finally, our approach isn't fully representative of production ML compiler pipelines; real systems like TensorFlow/MLIR, PyTorch 2.0, and JAX use tensors extensively at high levels before lowering to memrefs.
 
-This is an acceptable trade-off for learning. As we build increasingly sophisticated examples (attention mechanisms, transformers, serving engines), working with memrefs keeps the compilation pipeline transparent and the concepts grounded. Readers interested in production-scale tensor-based optimizations can explore MLIR's bufferization documentation and the Linalg-on-tensors workflow after mastering the fundamentals presented here.
+This is an acceptable trade-off for learning. As we build increasingly sophisticated examples (attention mechanisms in Chapter 11, transformers in Chapter 12, serving engines in Chapter 14), working with memrefs keeps the compilation pipeline transparent and the concepts grounded. Readers interested in production-scale tensor-based optimizations can explore MLIR's bufferization documentation and the Linalg-on-tensors workflow after mastering the fundamentals presented here.
 
 ## 2.3 Dynamic Dimensions: The Question Mark Notation
 
@@ -280,13 +265,7 @@ To execute these loops, the compiled code needs:
 1. **Loop bounds**: The values of `M`, `N`, and `K`
 2. **Address computation**: How to calculate the memory address of `A[i,k]` given indices `i` and `k`
 
-The memref descriptor provides this information. Instead of passing a simple pointer, MLIR passes a **structure** containing:
-
-- **Base pointer**: The actual memory address of the first element
-- **Aligned pointer**: A potentially aligned pointer for optimized access
-- **Offset**: A base offset into the buffer
-- **Sizes**: The dimensions (e.g., `[8, 32]` for an 8×32 matrix)
-- **Strides**: How many elements to skip to move one step along each dimension
+The memref descriptor provides this information. Instead of passing a simple pointer, MLIR passes a **structure** containing five key pieces of information. The base pointer holds the actual memory address of the first element in the buffer. The aligned pointer provides a potentially aligned pointer for optimized access, often used for SIMD or cache-efficient operations (in simple cases, this equals the base pointer). The offset stores a base offset into the buffer, which becomes important when working with views and subranges. The sizes array holds the dimensions—for example, `[8, 32]` for an 8×32 matrix—with dynamic dimensions determined at runtime. Finally, the strides array specifies how many elements to skip to move one step along each dimension, enabling flexible memory layouts like row-major, column-major, or transposed views.
 
 ### The Structure in Detail
 
@@ -518,7 +497,7 @@ The `memref.dim` operation extracts the size of a specific dimension from the me
 
 This phase transforms structured control flow (loops, if-then-else) into low-level control flow (branches and basic blocks). But why does MLIR have **two different dialects** for control flow in the first place?
 
-**The SCF (Structured Control Flow) Dialect** provides high-level control flow constructs that programmers understand: `scf.for` (loops with induction variables), `scf.while` (conditional loops), `scf.if` (conditional branches). These operations have **structured semantics**—a `scf.for` loop has a clear beginning, end, loop body, and induction variable that increments. This structure makes them easy to analyze and transform. The compiler can reason about loop bounds, apply loop optimizations (unrolling, vectorization, tiling), and understand the relationship between iterations. SCF operations also compose nicely with SSA values—loop-carried dependencies are expressed explicitly through "iter_args" rather than mutable variables.
+**The SCF (Structured Control Flow) Dialect** provides high-level control flow constructs that programmers understand: `scf.for` (loops with induction variables), `scf.while` (conditional loops), `scf.if` (conditional branches). These operations have **structured semantics**—a `scf.for` loop has a clear beginning, end, loop body, and induction variable that increments. This structure makes them easy to analyze and transform. The compiler can reason about loop bounds, apply loop optimizations (unrolling, vectorization, tiling), and understand the relationship between iterations. SCF operations also compose nicely with SSA values—loop-carried dependencies are expressed explicitly through "iter_args" rather than mutable variables. We'll work extensively with the SCF dialect starting in Chapter 5, where vector operations require explicit loop construction, and again in Chapter 6 when implementing softmax with its reduction patterns.
 
 **The CF (Control Flow) Dialect** provides low-level, unstructured control flow: `cf.br` (unconditional branch), `cf.cond_br` (conditional branch), and basic blocks. This is the control flow model that CPUs actually understand—jump instructions and labels. There's no notion of "loops" or "structured if-then-else" at this level, just "goto" operations between blocks. CF operations are harder to optimize (determining loop structure from arbitrary branches is a hard problem) but necessary for final code generation because LLVM expects this form.
 
@@ -632,11 +611,7 @@ While we've focused on 2D matrices, MLIR's dynamic shape machinery extends natur
 %activations : memref<?x?x12x64xf32>
 ```
 
-This represents a tensor with:
-- Dynamic batch size (`?`)
-- Dynamic sequence length (`?`)
-- Static number of attention heads (`12`)
-- Static head dimension (`64`)
+This represents a tensor with a dynamic batch size (`?`), dynamic sequence length (`?`), static number of attention heads (`12`), and static head dimension (`64`). The flexibility of mixing static and dynamic dimensions is powerful—we can fix aspects of the computation that never change (like architectural hyperparameters) while remaining flexible for dimensions that vary with input data.
 
 The memref descriptor simply has more fields:
 
@@ -700,25 +675,11 @@ These checks add overhead but prevent subtle bugs. In this book, we omit them fo
 
 The choice between static and dynamic shapes involves trade-offs:
 
-**Use Static Shapes When:**
-- Dimensions are truly fixed (e.g., model architectures with constant hidden sizes)
-- You need maximum performance for small operations
-- You can precompile for a small set of common shapes
-- The target hardware has specialized kernels for specific sizes (e.g., TensorCore GEMM requires multiples of 8)
+Static shapes make sense when dimensions are truly fixed—for example, model architectures with constant hidden sizes that never change across batches. They're also preferable when you need maximum performance for small operations, where the overhead of querying descriptors becomes measurable. If you can precompile for a small set of common shapes (say, batch sizes 1, 2, 4, and 8), static shapes let the compiler generate specialized code for each case. Finally, some target hardware has specialized kernels for specific sizes; TensorCore GEMM operations, for instance, require dimensions that are multiples of 8, making static shapes a natural fit.
 
-**Use Dynamic Shapes When:**
-- Dimensions vary at runtime (batch sizes, sequence lengths)
-- Code size matters (one function instead of many variants)
-- Compilation time is a bottleneck (compiling once instead of per-shape)
-- You need flexibility for research or rapid prototyping
+Dynamic shapes, on the other hand, are essential when dimensions vary at runtime—think variable batch sizes in serving systems or changing sequence lengths in language models. They're also valuable when code size matters, since one dynamic function replaces many static variants. If compilation time becomes a bottleneck, compiling once with dynamic shapes beats compiling repeatedly for each possible dimension combination. Dynamic shapes also provide flexibility crucial for research and rapid prototyping, where you don't want to recompile every time you tweak model dimensions.
 
-**Mixed Strategies:**
-Modern serving systems like vLLM and SGLang use **hybrid approaches**:
-- Generate specialized kernels for "hot" shapes (e.g., batch sizes 1, 2, 4, 8)
-- Fall back to dynamic kernels for rare shapes
-- Use JIT compilation to generate kernels on-demand for new shapes
-
-This gives the best of both worlds: performance for common cases, flexibility for edge cases. Chapter 14 explores some of these optimization strategies in the context of GPT inference.
+Modern serving systems like vLLM and SGLang use hybrid approaches that combine both strategies. They generate specialized kernels for "hot" shapes—commonly occurring dimensions like batch sizes 1, 2, 4, and 8—while falling back to dynamic kernels for rare shapes that don't justify the compilation cost. Some systems use JIT compilation to generate kernels on-demand when new shapes appear, caching the results for future use. This gives the best of both worlds: performance for common cases, flexibility for edge cases. Chapter 14 explores these optimization strategies in detail within the context of GPT inference serving.
 
 ## 2.11 Looking Ahead: Bufferization
 

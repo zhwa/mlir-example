@@ -1,6 +1,6 @@
 # Chapter 3: Compilation Infrastructure: AOT, JIT, and the Pass Pipeline
 
-In the first two chapters, we generated MLIR IR and compiled it to executable code using MLIR's `ExecutionEngine`. We treated compilation as a black box—feed it IR, get back a callable function. This simplicity was intentional for learning, but now we need to understand what's happening inside that black box.
+In Chapters 1 and 2, we generated MLIR IR for matrix multiplication operations and compiled it to executable code using MLIR's `ExecutionEngine`. We used passes like `createConvertLinalgToLoopsPass()` and `createConvertSCFToCFPass()` to progressively lower our IR, treating compilation as a black box—feed it IR, get back a callable function. This simplicity was intentional for learning, but now we need to understand what's happening inside that black box.
 
 This chapter addresses fundamental questions about compilation infrastructure: **What is the difference between ahead-of-time (AOT) and just-in-time (JIT) compilation? Why does MLIR provide an ExecutionEngine, and when should you use it? How does MLIR's pass infrastructure orchestrate transformations? And critically for production systems, how do you compile MLIR to standalone executables or libraries?**
 
@@ -12,46 +12,19 @@ Compilers have two fundamentally different approaches to generating executable c
 
 ### Ahead-of-Time (AOT) Compilation
 
-**AOT compilation** is the traditional compilation model exemplified by C, C++, Rust, and Go compilers. The workflow is strictly separated into two phases:
+**AOT compilation** is the traditional compilation model exemplified by C, C++, Rust, and Go compilers. The workflow is strictly separated into two phases.
 
-**Build time** (happens once):
-1. Read source files
-2. Parse and validate
-3. Optimize intermediate representation
-4. Generate machine code
-5. Link into executables or libraries
-6. Write binary files to disk
-
-**Runtime** (happens many times):
-1. Load precompiled binary from disk
-2. Execute immediately—no compilation overhead
+During build time, which happens once, the compiler reads source files, parses and validates them, optimizes the intermediate representation, generates machine code, links everything into executables or libraries, and writes binary files to disk. At runtime, which happens many times, the system simply loads the precompiled binary from disk and executes immediately with no compilation overhead.
 
 The key characteristic: **all compilation happens before the program runs**. When a user launches your application, they're executing pre-generated machine code. No compiler runs during execution.
 
-**Advantages**:
-- **Zero compilation overhead at runtime**: The program starts instantly and runs at full speed from the first instruction
-- **Predictable performance**: Every execution has identical performance characteristics
-- **Optimized for target hardware**: The compiler can tune code for specific CPU features (AVX-512, ARM NEON, etc.)
-- **Simplified deployment**: Distribute simple binaries—no compiler or source code needed
-- **Startup time**: Critical for services that must respond immediately (web servers, embedded systems)
+AOT compilation offers several compelling advantages. The program starts instantly and runs at full speed from the first instruction with zero compilation overhead at runtime. Every execution has identical performance characteristics, providing predictable performance that's crucial for production systems. The compiler can tune code for specific CPU features like AVX-512 or ARM NEON, optimizing for the target hardware. Deployment is simplified because you distribute simple binaries without requiring the compiler or source code. This minimal startup time is critical for services that must respond immediately, such as web servers and embedded systems.
 
-**Disadvantages**:
-- **No runtime adaptability**: Cannot adjust to runtime information (input shapes, sparsity patterns, hardware differences)
-- **Binary size**: Supporting multiple platforms requires separate binaries (x86_64, ARM64, etc.)
-- **Recompilation required**: Any code change requires rebuilding and redistributing binaries
+However, AOT compilation has important limitations. It cannot adjust to runtime information like input shapes, sparsity patterns, or hardware differences, lacking runtime adaptability. Supporting multiple platforms requires separate binaries for architectures like x86_64 and ARM64, increasing binary size and distribution complexity. Any code change requires rebuilding and redistributing binaries, which can slow development iteration.
 
 ### Just-in-Time (JIT) Compilation
 
-**JIT compilation** delays code generation until runtime. The workflow interleaves compilation with execution:
-
-**Runtime** (single unified phase):
-1. Start with high-level representation (bytecode, IR, source)
-2. As code is needed: compile to machine code on-demand
-3. Cache compiled code for reuse
-4. Execute compiled code
-5. Repeat for new code paths
-
-Modern JIT systems include Java's HotSpot VM, JavaScript engines (V8, SpiderMonkey), PyPy, LuaJIT, and increasingly, ML frameworks (PyTorch 2.0 with torch.compile, JAX).
+**JIT compilation** delays code generation until runtime. The workflow interleaves compilation with execution in a single unified phase. The system starts with a high-level representation—bytecode, IR, or source code. As code is needed, it compiles to machine code on-demand, caches the compiled code for reuse, executes it, and repeats this process for new code paths. Modern JIT systems include Java's HotSpot VM, JavaScript engines (V8, SpiderMonkey), PyPy, LuaJIT, and increasingly, ML frameworks like PyTorch 2.0 with torch.compile and JAX.
 
 **Advantages**:
 - **Runtime adaptability**: Can specialize code based on actual data (input shapes, branch frequencies, type information)
@@ -67,30 +40,13 @@ Modern JIT systems include Java's HotSpot VM, JavaScript engines (V8, SpiderMonk
 
 ### The ML Systems Landscape
 
-Machine learning compilation sits in an interesting position. Consider how different systems choose:
+Machine learning compilation sits in an interesting position. Consider how different systems choose.
 
-**AOT-dominant systems**:
-- **TensorFlow/XLA**: Compiles computation graphs to optimized binaries offline
-- **TensorRT**: Takes a trained model, compiles to GPU kernels, saves to file for deployment
-- **ONNX Runtime**: Loads serialized models, applies graph optimizations, compiles kernels ahead of serving
-- **TVM**: Compiles models for edge devices (mobile, IoT) where no compiler can run
+AOT-dominant systems prioritize predictable latency for production serving. TensorFlow/XLA compiles computation graphs to optimized binaries offline. TensorRT takes a trained model, compiles it to GPU kernels, and saves the result to a file for deployment. ONNX Runtime loads serialized models, applies graph optimizations, and compiles kernels ahead of serving. TVM compiles models for edge devices like mobile phones and IoT hardware where no compiler can run at deployment time. Why AOT? When a user queries a deployed model, the first inference must be as fast as the thousandth inference—compilation overhead is unacceptable. The solution: compile once during model deployment, serve forever.
 
-Why AOT? Production serving prioritizes **predictable latency**. When a user queries a deployed model, the first inference must be as fast as the thousandth inference. Compilation overhead is unacceptable. The solution: compile once during model deployment, serve forever.
+JIT-friendly systems prioritize flexibility for research and experimentation. PyTorch eager mode interprets operations dynamically without compilation. PyTorch 2.0's torch.compile JIT-compiles computation graphs from eager execution traces. JAX JIT-compiles function transformations like jit, grad, and vmap at first invocation. Triton JIT-compiles GPU kernels from Python-like syntax. Why JIT? Researchers change model architectures constantly—recompiling and redeploying for every tweak kills productivity. JIT compilation enables a fast workflow: write code, run immediately, iterate quickly. The compilation overhead (a few seconds on first run) is acceptable compared to hour-long model training times.
 
-**JIT-friendly systems**:
-- **PyTorch eager mode**: Interprets operations dynamically, no compilation
-- **PyTorch 2.0 (torch.compile)**: JIT-compiles computation graphs from eager execution traces
-- **JAX**: JIT-compiles function transformations (jit, grad, vmap) at first invocation
-- **Triton**: JIT-compiles GPU kernels from Python-like syntax
-
-Why JIT? Research and experimentation prioritize **flexibility**. Researchers change model architectures constantly. Recompiling and redeploying for every tweak kills productivity. JIT compilation enables: write code, run immediately, iterate fast. The compilation overhead (a few seconds on first run) is acceptable compared to hour-long model training times.
-
-**The hybrid approach**:
-Many production systems use **both**:
-1. **Development**: JIT for fast iteration
-2. **Deployment**: AOT for predictable performance
-
-PyTorch exemplifies this: researchers use eager mode (no compilation) or torch.compile (JIT) during development, then export models to TorchScript or ONNX for AOT compilation before deployment. This gives the best of both worlds—flexibility during research, performance in production.
+Many production systems use a hybrid approach that combines both strategies. During development, they use JIT for fast iteration; during deployment, they switch to AOT for predictable performance. PyTorch exemplifies this pattern: researchers use eager mode (no compilation) or torch.compile (JIT) during development, then export models to TorchScript or ONNX for AOT compilation before deployment. This gives the best of both worlds—flexibility during research, performance in production.
 
 ## 3.2 MLIR's ExecutionEngine: A Prototyping Tool, Not a Production Solution
 
@@ -156,26 +112,15 @@ Real ML serving systems using MLIR follow an AOT workflow:
 6. Deploy library to servers
 7. Servers load library and call functions—no compilation
 
-**Triton compiler** (despite being "JIT" in spirit):
-1. Parse Triton Python code to IR
-2. Lower to LLVM IR
-3. Generate PTX (NVIDIA) or AMDGPU code
-4. Pass to GPU driver for final compilation
-5. Cache compiled kernels on disk
-6. Reuse cached kernels across runs
-
-Even systems with "JIT" in their name ultimately do AOT compilation—they just do it lazily on first use, then cache the results.
+Triton compiler, despite being "JIT" in spirit, follows a similar AOT pattern: it parses Triton Python code to IR, lowers to LLVM IR, generates PTX (NVIDIA) or AMDGPU code, passes the code to the GPU driver for final compilation, caches the compiled kernels on disk, and reuses those cached kernels across runs. Even systems with "JIT" in their name ultimately do AOT compilation—they just do it lazily on first use, then cache the results.
 
 ### The Right Tool for the Job
 
 Think of ExecutionEngine as **scaffolding**—temporary infrastructure that supports development but isn't part of the final product. You wouldn't ship a building with scaffolding still attached, and you shouldn't ship a production service with ExecutionEngine embedded.
 
-For this book, we use ExecutionEngine because:
-1. It simplifies learning—focus on IR, not build systems
-2. Enables rapid experimentation—change code, test immediately
-3. Makes Python integration trivial—no linking or loading complexity
+For this book, we use ExecutionEngine for three pragmatic reasons. It simplifies learning by letting us focus on IR rather than build systems. It enables rapid experimentation—we can change code and test immediately without rebuild cycles. It makes Python integration trivial, avoiding the complexity of linking and loading compiled libraries.
 
-But as we progress toward production-grade systems (Chapters 14-16 on GPT serving), we'll discuss how real deployments work: compile MLIR to object files, link to create libraries, deploy statically compiled binaries.
+But as we progress toward production-grade systems—particularly in Chapters 13-14 when we build GPT inference engines—we'll see how real deployments work: compile MLIR to object files, link to create libraries, and deploy statically compiled binaries for predictable latency and minimal memory overhead.
 
 ## 3.3 The Pass Infrastructure: Orchestrating Transformations
 
@@ -183,36 +128,19 @@ At the heart of MLIR's compilation model is the **pass infrastructure**—a fram
 
 ### What is a Pass?
 
-A **pass** is a self-contained transformation or analysis that operates on MLIR IR. Think of a pass as a single, focused task in the compilation pipeline:
+A **pass** is a self-contained transformation or analysis that operates on MLIR IR. Think of a pass as a single, focused task in the compilation pipeline.
 
-**Transformation passes** modify the IR:
-- **Canonicalization**: Simplifies IR to canonical forms (e.g., `x + 0` → `x`)
-- **Inlining**: Replaces function calls with function bodies
-- **Loop unrolling**: Replicates loop bodies to eliminate loop overhead
-- **Constant folding**: Evaluates constant expressions at compile time
-- **Dead code elimination**: Removes operations that don't affect the result
+Transformation passes modify the IR in specific ways. Canonicalization simplifies IR to canonical forms, such as reducing `x + 0` to just `x`. Inlining replaces function calls with function bodies. Loop unrolling replicates loop bodies to eliminate loop overhead. Constant folding evaluates constant expressions at compile time. Dead code elimination removes operations that don't affect the result.
 
-**Analysis passes** gather information without modification:
-- **Liveness analysis**: Which values are live at each program point?
-- **Alias analysis**: Can two memrefs point to the same memory?
-- **Call graph construction**: What functions call which other functions?
+Analysis passes gather information without modification. Liveness analysis determines which values are live at each program point. Alias analysis determines whether two memrefs can point to the same memory. Call graph construction identifies which functions call which other functions.
 
-**Lowering passes** convert between abstraction levels:
-- **Linalg → Loops**: Transform `linalg.matmul` into nested `scf.for` loops
-- **SCF → CF**: Convert structured control flow to basic blocks and branches
-- **MemRef → LLVM**: Lower memref operations to LLVM pointer operations
+Lowering passes convert between abstraction levels. The Linalg-to-Loops pass transforms high-level operations like `linalg.matmul` into nested `scf.for` loops. The SCF-to-CF pass converts structured control flow to basic blocks and branches. The MemRef-to-LLVM pass lowers memref operations to LLVM pointer operations.
 
 Each pass has a narrow responsibility. This modularity is powerful: you can understand, test, and debug each pass independently. Composing passes creates complex transformations from simple building blocks.
 
 ### The PassManager: The Conductor
 
-The **PassManager** orchestrates pass execution. It's responsible for:
-
-1. **Scheduling passes** in the correct order
-2. **Managing pass dependencies** (some passes require others to run first)
-3. **Providing context** (access to MLIRContext, analyses, etc.)
-4. **Handling errors** (if a pass fails, propagate the failure)
-5. **Enabling parallelism** (run passes on different operations concurrently)
+The **PassManager** orchestrates pass execution. It's responsible for scheduling passes in the correct order, managing pass dependencies (some passes require others to run first), providing context (access to MLIRContext, analyses, etc.), handling errors (propagating failures when a pass fails), and enabling parallelism (running passes on different operations concurrently when safe).
 
 Creating a pass pipeline looks like this:
 
@@ -237,25 +165,11 @@ The PassManager ensures passes execute in order, manages memory efficiently, and
 
 Passes don't just operate on entire modules—they operate on **specific operation types**. This granularity is crucial for modularity and performance.
 
-**ModulePass**: Operates on an entire `ModuleOp`
-- Use when transformation needs whole-program view
-- Example: interprocedural optimizations, dead function elimination
-- Cannot be parallelized across modules (each module is independent)
+A ModulePass operates on an entire `ModuleOp`, suitable when transformations need a whole-program view, such as interprocedural optimizations or dead function elimination. Module passes cannot be parallelized across modules since each module is independent.
 
-**FunctionPass**: Operates on individual functions
-- Use for most function-level optimizations
-- Example: loop transformations, local optimizations
-- Can be parallelized: PassManager runs the same pass on multiple functions simultaneously
+A FunctionPass operates on individual functions, making it appropriate for most function-level optimizations like loop transformations and local optimizations. Function passes can be parallelized: the PassManager runs the same pass on multiple functions simultaneously, utilizing available CPU cores.
 
-**OperationPass** (op-agnostic): Operates on any operation type
-- Use for generic transformations that work on any IR
-- Example: canonicalization, CSE (common subexpression elimination)
-- Most flexible but requires careful implementation (don't assume operation structure)
-
-**OperationPass** (op-specific): Operates on specific operation types
-- Use when transformation only makes sense for certain ops
-- Example: a pass that optimizes `linalg.matmul` specifically
-- Type-safe: compiler enforces you're operating on the right op type
+An OperationPass can be either op-agnostic or op-specific. Op-agnostic passes work on any operation type, making them suitable for generic transformations like canonicalization and common subexpression elimination. They're the most flexible but require careful implementation since they can't assume specific operation structure. Op-specific passes target particular operation types, such as a pass that optimizes `linalg.matmul` specifically. These are type-safe—the compiler enforces that you're operating on the right operation type.
 
 This granularity matters for performance. In Chapter 1, when we ran passes on a single function, the PassManager could optimize aggressively. In a real application with hundreds of functions, the PassManager runs function passes in parallel, utilizing all CPU cores.
 
@@ -345,30 +259,15 @@ MLIR IR exists at multiple levels simultaneously:
 - Operations like `transformer.attention`, `graph.conv2d`
 - Semantics: "what computation to perform" (mathematical specification)
 
-**Level 4 - Structured compute**:
-- Linalg dialect: `linalg.matmul`, `linalg.conv`, `linalg.reduce`
-- Operations express structured linear algebra
-- Semantics: iteration spaces, index maps, declarative operations
+At Level 4, structured compute is represented through the Linalg dialect, with operations like `linalg.matmul`, `linalg.conv`, and `linalg.reduce` that express structured linear algebra using iteration spaces, index maps, and declarative operations.
 
-**Level 3 - Loops and structured control flow**:
-- SCF dialect: `scf.for`, `scf.while`, `scf.if`
-- Control flow with explicit structure (loop bounds, loop bodies)
-- Semantics: imperative computation with structured control
+Level 3 introduces loops and structured control flow via the SCF dialect, with operations like `scf.for`, `scf.while`, and `scf.if` that provide control flow with explicit structure including loop bounds and loop bodies. The semantics represent imperative computation with structured control.
 
-**Level 2 - Basic blocks and branches**:
-- CF dialect: `cf.br`, `cf.cond_br`
-- Unstructured control flow (gotos)
-- Semantics: assembly-level control flow
+At Level 2, we find basic blocks and branches in the CF dialect, with unstructured control flow operations like `cf.br` and `cf.cond_br` that resemble assembly-level gotos.
 
-**Level 1 - LLVM IR**:
-- LLVM dialect: `llvm.load`, `llvm.store`, `llvm.fadd`
-- Close to machine instructions
-- Semantics: register-based virtual machine
+Level 1 represents LLVM IR through the LLVM dialect, with operations like `llvm.load`, `llvm.store`, and `llvm.fadd` that are close to machine instructions, operating on a register-based virtual machine model.
 
-**Level 0 - Machine code** (lowest abstraction):
-- x86_64, ARM64, RISC-V, etc.
-- Actual CPU instructions
-- Semantics: what the silicon does
+Finally, Level 0 is machine code itself—the lowest abstraction—comprising actual CPU instructions for architectures like x86_64, ARM64, and RISC-V, with semantics defined by what the silicon does.
 
 MLIR's progressive lowering walks down this ladder one step at a time. Each pass lowers operations by one level, maintaining well-formed IR at every step.
 
@@ -919,15 +818,7 @@ But scenario 3 has a critical difference: **latency distribution**. With AOT, al
 
 ### Memory Footprint
 
-**ExecutionEngine overhead**:
-- LLVM's JIT infrastructure: 50-150 MB
-- Compiled code: 10-500 KB per function
-- Symbol tables and metadata: 5-20 MB
-
-For a single process, this is manageable. But serving systems run hundreds of worker processes. If each worker loads ExecutionEngine:
-- 100 workers × 100 MB = 10 GB of wasted RAM
-
-AOT-compiled libraries have **zero compiler overhead**—the binary contains only compiled code, no LLVM infrastructure. Memory footprint: just the code itself (kilobytes).
+**ExecutionEngine overhead**: LLVM's JIT infrastructure consumes 50-150 MB of memory, compiled code takes 10-500 KB per function, and symbol tables and metadata require 5-20 MB. For a single process, this is manageable. But serving systems run hundreds of worker processes. If each worker loads ExecutionEngine, the memory waste adds up quickly: 100 workers × 100 MB equals 10 GB of wasted RAM. AOT-compiled libraries have **zero compiler overhead**—the binary contains only compiled code without LLVM infrastructure. The memory footprint is just the code itself, measured in kilobytes.
 
 ### Code Size and Bloat
 
@@ -955,19 +846,13 @@ This is why iOS **prohibits JIT compilation** (except in Safari, which has speci
 
 ### Development vs Production: The Right Tool for Each Phase
 
-The industry has converged on a best practice:
+The industry has converged on a best practice that separates concerns by phase.
 
-**Development and research**:
-- Use JIT (ExecutionEngine, torch.compile, JAX jit)
-- Prioritize: fast iteration, flexibility, immediate feedback
-- Accept: compilation overhead, memory usage, unpredictable latency
+For development and research, use JIT compilation tools like ExecutionEngine, torch.compile, or JAX jit. Prioritize fast iteration, flexibility, and immediate feedback, accepting the trade-offs of compilation overhead, memory usage, and unpredictable latency.
 
-**Production deployment**:
-- Use AOT (compile to object files, link to libraries)
-- Prioritize: predictable latency, minimal memory, security, startup time
-- Accept: longer build times, platform-specific binaries, less runtime flexibility
+For production deployment, use AOT compilation: compile to object files and link to libraries. Prioritize predictable latency, minimal memory footprint, security, and fast startup time, accepting the trade-offs of longer build times, platform-specific binaries, and less runtime flexibility.
 
-This separation of concerns is clean and effective. Researchers don't worry about deployment complexity; production engineers don't fight with compilation overhead.
+This separation is clean and effective. Researchers don't worry about deployment complexity; production engineers don't fight with compilation overhead.
 
 ## 3.8 Summary
 

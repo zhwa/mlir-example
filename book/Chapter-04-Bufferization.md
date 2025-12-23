@@ -1,8 +1,8 @@
 # Chapter 4: Bufferization - Bridging Functional and Imperative Worlds
 
-In Chapters 1-3, we worked directly with memrefs—mutable memory buffers that behave like C pointers. This imperative style is intuitive for programmers familiar with C/C++, but it has limitations. Modern MLIR code typically starts with **tensors**—immutable values with functional semantics—and transforms them into memrefs through a process called **bufferization**.
+In Chapters 1-3, we worked directly with memrefs—mutable memory buffers that behave like C pointers. We explored their runtime structure (the memref descriptor with its base pointer, sizes, and strides) in Chapter 2 when discussing dynamic shapes, without delving into why MLIR provides this particular abstraction. This imperative style is intuitive for programmers familiar with C/C++, but it has limitations. Modern MLIR code typically starts with **tensors**—immutable values with functional semantics—and transforms them into memrefs through a process called **bufferization**.
 
-This chapter answers a fundamental question: **Why does MLIR have two ways to represent multi-dimensional data (tensors and memrefs), and how do you convert between them?** Understanding bufferization is crucial because it's the bridge between high-level ML frameworks (which think in terms of immutable tensors) and low-level execution (which requires mutable memory buffers).
+This chapter answers a fundamental question: **Why does MLIR have two ways to represent multi-dimensional data (tensors and memrefs), and how do you convert between them?** We've seen memrefs from the execution side; now let's understand how they fit into the broader compilation story. Bufferization is the bridge between high-level ML frameworks (which think in terms of immutable tensors) and low-level execution (which requires mutable memory buffers).
 
 The transformation is non-trivial. Converting functional semantics (where operations return new values) to imperative semantics (where operations mutate memory in-place) requires careful analysis to ensure correctness and efficiency. MLIR's One-Shot Bufferize pass solves this problem systematically.
 
@@ -39,13 +39,7 @@ func.func @add_tensors(%A: tensor<8x16xf32>, %B: tensor<8x16xf32>)
 
 Key characteristics:
 
-**Immutability**: Once created, a tensor's values never change. Operations produce new tensors rather than modifying existing ones.
-
-**SSA (Static Single Assignment)**: Each tensor value has exactly one defining operation. You never reassign or mutate. This makes data flow explicit in the IR.
-
-**No aliasing**: Since tensors are immutable, two tensor values never refer to the same underlying storage. No pointer aliasing issues.
-
-**Optimization-friendly**: Functional semantics enable aggressive transformations. The compiler can reorder, fuse, or eliminate operations freely without worrying about side effects.
+Tensors are fundamentally immutable—once created, a tensor's values never change. Operations produce new tensors rather than modifying existing ones. They follow SSA (Static Single Assignment) semantics, where each tensor value has exactly one defining operation; you never reassign or mutate, making data flow explicit in the IR. Since tensors are immutable, there's no aliasing—two tensor values never refer to the same underlying storage, eliminating pointer aliasing issues entirely. This immutability makes tensors optimization-friendly: functional semantics enable aggressive transformations where the compiler can reorder, fuse, or eliminate operations freely without worrying about side effects.
 
 ### The MemRef Reality: Imperative Semantics
 
@@ -65,29 +59,15 @@ func.func @add_memrefs(%A: memref<8x16xf32>,
 
 Key characteristics:
 
-**Mutability**: MemRefs point to storage that can be modified. Operations mutate the contents in-place.
-
-**Aliasing**: Multiple memrefs can point to the same memory. Aliasing analysis becomes essential for correctness.
-
-**Explicit memory management**: Allocations (`memref.alloc`), deallocations (`memref.dealloc`), and lifetimes must be managed explicitly.
-
-**Execution reality**: This is how programs actually execute. CPUs operate on memory addresses, not abstract immutable values.
+As we explored in Chapter 2, memrefs embrace mutability—they point to storage that can be modified, and operations mutate the contents in-place. Aliasing is possible: multiple memrefs can point to the same memory, making aliasing analysis essential for correctness. Memory management becomes explicit, requiring careful handling of allocations (`memref.alloc`), deallocations (`memref.dealloc`), and lifetimes. This imperative model reflects execution reality—CPUs operate on memory addresses, not abstract immutable values, and the memref descriptor structure (with its base pointer, aligned pointer, offset, sizes, and strides) provides exactly the metadata needed for efficient runtime execution.
 
 ### Why Both? Different Stages, Different Needs
 
-The duality exists because different compilation stages have different priorities:
+The duality exists because different compilation stages have different priorities.
 
-**High-level optimization** (framework → MLIR):
-- **Input**: Models from PyTorch, TensorFlow, JAX (all tensor-based)
-- **Priority**: Aggressive optimization (fusion, reordering, constant folding)
-- **Representation**: Tensors (functional, optimization-friendly)
-- **Freedom**: Can reorder operations, fuse ops, eliminate redundancy without worrying about side effects
+During high-level optimization, when converting from frameworks to MLIR, the input consists of models from PyTorch, TensorFlow, and JAX—all tensor-based systems. The priority is aggressive optimization: fusion, reordering, and constant folding. The natural representation is tensors with their functional, optimization-friendly semantics, giving the compiler freedom to reorder operations, fuse ops, and eliminate redundancy without worrying about side effects.
 
-**Low-level compilation** (MLIR → machine code):
-- **Output**: Assembly code for CPU/GPU
-- **Priority**: Correct memory management, efficient execution
-- **Representation**: MemRefs (imperative, matches hardware)
-- **Constraints**: Must respect memory layout, cache hierarchy, call ABI
+During low-level compilation, when generating machine code from MLIR, the output is assembly code for CPU or GPU. The priority shifts to correct memory management and efficient execution. The representation must be memrefs—imperative structures that match hardware reality. The compiler faces constraints: it must respect memory layout, cache hierarchy, and call ABI conventions.
 
 Bufferization is the bridge between these worlds. It converts high-level tensor IR (optimized easily) into low-level memref IR (executable efficiently).
 
@@ -134,7 +114,7 @@ linalg.mul ins(%T1, %C) outs(%T2) // Does %T2 alias %T1 or %C?
 // Fusion only safe if no aliasing
 ```
 
-With tensors, immutability guarantees no aliasing—fusion is always safe. With memrefs, the compiler must conservatively check aliasing, often missing optimization opportunities.
+With tensors, immutability guarantees no aliasing—fusion is always safe. With memrefs, the compiler must conservatively check aliasing, often missing optimization opportunities. We'll see the power of this distinction in Chapter 10 when we optimize GPT inference, where operation fusion at the tensor level significantly reduces memory bandwidth requirements.
 
 ## 4.2 One-Shot Bufferization: The Transformation Architecture
 
@@ -216,29 +196,15 @@ This is a **correctness bug**, not just an optimization issue. Naive bufferizati
 
 ### The One-Shot Bufferize Algorithm
 
-One-Shot Bufferize performs a whole-program analysis to **prevent read-after-write hazards** while maximizing in-place updates. The algorithm:
+One-Shot Bufferize performs a whole-program analysis to **prevent read-after-write hazards** while maximizing in-place updates. The algorithm operates in four phases.
 
-**Step 1: Alias analysis and conflict detection**
-- Analyze the entire function to understand tensor data flow
-- Determine which tensors can share buffers (in-place updates) **safely**
-- Build an alias set: which operations create new values vs reuse existing buffers
-- **Detect RAW conflicts**: If a tensor is read after being potentially written, mark it as requiring a separate buffer
+During alias analysis and conflict detection, the pass analyzes the entire function to understand tensor data flow. It determines which tensors can share buffers safely through in-place updates, building an alias set that tracks which operations create new values versus reuse existing buffers. Crucially, it detects RAW (read-after-write) conflicts: if a tensor is read after being potentially written, the analysis marks it as requiring a separate buffer.
 
-**Step 2: Buffer allocation insertion**
-- Insert `memref.alloc` operations where new buffers are needed
-- Place allocations as late as possible (minimize live ranges)
-- Deallocations inserted automatically (based on liveness analysis)
-- **Allocate separate buffers** when RAW analysis detects conflicts
+Next comes buffer allocation insertion. The pass inserts `memref.alloc` operations where new buffers are needed, placing allocations as late as possible to minimize live ranges. Deallocations are inserted automatically based on liveness analysis. Whenever RAW analysis detects conflicts, the pass allocates separate buffers to maintain correctness.
 
-**Step 3: Type conversion**
-- Replace `tensor<...>` types with `memref<...>` types throughout
-- Update operation signatures to use memrefs
-- Convert tensor operations to memref operations
+The type conversion phase replaces `tensor<...>` types with `memref<...>` types throughout the IR, updates operation signatures to use memrefs, and converts tensor operations to their memref equivalents.
 
-**Step 4: In-place mutation (when safe)**
-- Where possible, convert functional "return new tensor" style to imperative "mutate buffer" style
-- This eliminates unnecessary copies
-- **Only when alias analysis proves no RAW hazards exist**
+Finally, in-place mutation optimization kicks in. Where possible, the pass converts functional "return new tensor" style to imperative "mutate buffer" style, eliminating unnecessary copies. However, this optimization only applies when alias analysis proves no RAW hazards exist—correctness always takes priority over performance.
 
 ### Example: Bufferization in Action
 
@@ -304,15 +270,9 @@ bufferization::OneShotBufferizationOptions options;
 options.bufferizeFunctionBoundaries = true;  // Bufferize signatures
 ```
 
-**With `bufferizeFunctionBoundaries = true`** (what we use):
-- Function signatures change: `tensor<...>` → `memref<...>`
-- Return types converted to out-parameters
-- The entire IR becomes memref-based
+When `bufferizeFunctionBoundaries` is set to true (which is what we use), function signatures change from `tensor<...>` to `memref<...>`, return types are converted to out-parameters, and the entire IR becomes memref-based. This creates a complete transformation suitable for execution.
 
-**With `bufferizeFunctionBoundaries = false`**:
-- Function signatures unchanged (still use tensors)
-- Only function bodies bufferized
-- Useful for gradual migration or when interfacing with tensor-based APIs
+With `bufferizeFunctionBoundaries` set to false, function signatures remain unchanged and still use tensors, with only function bodies bufferized. This approach is useful for gradual migration or when interfacing with tensor-based APIs.
 
 For standalone compilation (Chapters 1-4), we use `true` because we're compiling the entire program to native code. For library APIs or when integrating with Python (where tensors might be more natural), `false` can be appropriate.
 
@@ -325,10 +285,7 @@ options.setFunctionBoundaryTypeConversion(
     bufferization::LayoutMapOption::IdentityLayoutMap);
 ```
 
-**IdentityLayoutMap** means "use row-major (C-style) layout with unit strides":
-- For `tensor<8x16xf32>` → `memref<8x16xf32>` with default strides
-- Element `[i,j]` stored at offset `i*16 + j`
-- Matches NumPy default layout (`C_CONTIGUOUS`)
+IdentityLayoutMap means "use row-major (C-style) layout with unit strides." For example, `tensor<8x16xf32>` becomes `memref<8x16xf32>` with default strides, where element `[i,j]` is stored at offset `i*16 + j`. This matches NumPy's default layout (`C_CONTIGUOUS`).
 
 Other options exist for specialized layouts (column-major, tiled, padded), but identity layout is standard for CPU execution and Python integration.
 
@@ -377,10 +334,7 @@ func.func @compute(%A: memref<8x16xf32>, %out: memref<8x16xf32>) {
 ```
 
 Now:
-- Caller allocates output buffer before calling
-- Callee writes results into caller-provided buffer
-- No ambiguity about ownership (caller owns everything)
-- Standard C calling convention (all arguments passed, nothing returned)
+This transformation clarifies memory ownership and simplifies calling conventions. The caller allocates the output buffer before calling the function, and the callee writes results into the caller-provided buffer. There's no ambiguity about ownership—the caller owns everything. This matches the standard C calling convention where all arguments are passed and nothing is returned (void return type).
 
 ### How It Works: Signature Transformation
 
@@ -438,23 +392,9 @@ With out-parameters, Python controls memory allocation and deallocation through 
 
 ### Performance Benefits
 
-Out-parameters enable important optimizations:
+Out-parameters enable important optimizations.
 
-**Caller-side allocation**:
-```python
-# Reuse buffer across calls (amortize allocation)
-result = np.zeros((8, 16), dtype=np.float32)
-for i in range(1000):
-    lib.compute(inputs[i], result.ctypes.data)  # Same buffer each time
-```
-
-**Pre-allocated output arrays**:
-```python
-# Allocate once, reuse forever
-output_buffer = np.zeros((1024, 1024), dtype=np.float32)
-for batch in data_loader:
-    lib.process(batch, output_buffer)  # Zero allocation cost
-```
+With caller-side allocation, Python code can reuse buffers across calls to amortize allocation costs. For example, a single result buffer can be passed to a function 1000 times in a loop, with the same buffer reused each iteration. Pre-allocated output arrays take this further: allocate once and reuse forever. A 1024×1024 output buffer can be allocated once and then passed to a processing function for every batch in a data loader, achieving zero allocation cost per call.
 
 This pattern is fundamental to high-performance Python libraries (NumPy, PyTorch, TensorFlow). By matching this calling convention, MLIR-compiled code integrates seamlessly.
 
@@ -495,11 +435,7 @@ func.func @gemm(%A: tensor<?x?xf32>,
 ```
 
 Characteristics:
-- Purely functional (no mutation)
-- Operations return new tensors
-- Dynamic shapes (`?` dimensions)
-- Shape queries (`tensor.dim`)
-- Declarative operations (`linalg.fill`, `linalg.matmul`)
+The starting point is purely functional tensor IR with no mutation. Operations return new tensors rather than modifying existing ones. Dynamic shapes use `?` dimensions, and the code can query shapes using `tensor.dim`. Declarative operations like `linalg.fill` and `linalg.matmul` express what to compute without specifying how.
 
 ### Pass 1: Canonicalization
 
@@ -591,11 +527,7 @@ func.func @gemm(%A: memref<?x?xf32>,
 ```
 
 Critical changes:
-- New parameter `%C` added (output buffer)
-- `memref.alloc` removed (caller allocates!)
-- Operations write to `%C` instead of temporary buffer
-- Function returns void
-- Signature matches C calling convention
+After buffer-results-to-out-params transformation, a new parameter `%C` is added for the output buffer. The `memref.alloc` is removed because the caller now allocates the buffer. Operations write to `%C` instead of a temporary buffer, the function returns void, and the signature now matches C calling convention perfectly.
 
 ### Pass 4: Bufferization-To-MemRef
 
@@ -612,7 +544,7 @@ func.func @gemm(%A: memref<?x?xf32>,
 
 ### Passes 5-7: Progressive Lowering to LLVM
 
-After bufferization, the remaining passes lower from high-level memref/linalg operations to low-level LLVM IR. We covered this in Chapter 3, but here's a quick recap in the context of bufferization:
+After bufferization, the remaining passes lower from high-level memref/linalg operations to low-level LLVM IR. We covered these transformations in detail in Chapter 3 when discussing MLIR's pass infrastructure and progressive lowering. Here's a quick recap in the context of bufferization:
 
 **Pass 5: Linalg → Loops**
 ```mlir
@@ -1292,4 +1224,4 @@ With bufferization mastered, we've completed the foundational infrastructure (Ch
 - Compilation strategies and pass infrastructure (Chapter 3)
 - Functional-to-imperative transformation with correctness guarantees (Chapter 4)
 
-We're ready to build increasingly sophisticated operations, starting with neural network primitives in Part II.
+We're ready to build increasingly sophisticated operations. Part II begins with Chapter 5, where we'll explore vector operations and SIMD programming, followed by Chapter 6's implementation of softmax—the first complete neural network operation. These chapters will apply the bufferization concepts we've learned here to build production-quality ML primitives.

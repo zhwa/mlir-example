@@ -298,22 +298,7 @@ A **dialect** is a collection of operations, types, and attributes forming a coh
 
 This hierarchy enables **progressive lowering**: high-level operations transform into mid-level, then low-level, finally reaching LLVM IR or machine code.
 
-### Dialects in This Book
-
-Throughout the book, we'll work primarily with these dialects:
-
-| Dialect | Purpose | Key Operations | Chapters |
-|---------|---------|----------------|----------|
-| `func` | Function definitions | func.func, func.call, func.return | All |
-| `linalg` | Linear algebra | matmul, transpose, fill, generic | 1-11 |
-| `memref` | Memory management | alloc, load, store, dealloc | 1-8 |
-| `tensor` | Immutable arrays | empty, extract, insert | 2, 4 |
-| `arith` | Arithmetic | constant, addf, mulf, cmpf | All |
-| `scf` | Control flow loops | for, while, if, yield | 5-7 |
-| `math` | Math functions | exp, log, sqrt, tanh | 6-14 |
-| `affine` | Polyhedral loops | affine.for, affine.load | 10 |
-| `vector` | SIMD operations | vector.load, vector.fma | 10 |
-| Custom | Our own dialects | nn.linear, transformer.attention | 8-14 |
+Throughout this book, we'll work with several key dialects. The `func` dialect handles function definitions and calls (used in all chapters). The `linalg` dialect provides linear algebra operations like matrix multiply and convolutions (Chapters 1-11). The `memref` dialect manages memory with operations for allocation, loading, and storing (Chapters 1-8). The `tensor` dialect represents immutable arrays (Chapters 2 and 4). The `arith` dialect supplies arithmetic operations like addition and multiplication (used throughout). The `scf` dialect offers structured control flow with loops and conditionals (Chapters 5-7). Additional dialects like `math` (mathematical functions), `affine` (polyhedral optimization), and `vector` (SIMD operations) appear in later chapters. In Chapters 8-14, we'll even create our own custom dialects.
 
 ### Extensibility: Creating Custom Dialects
 
@@ -497,33 +482,72 @@ Once we've lowered to LLVM dialect, we have two execution strategies:
 
 ### Our Approach: JIT Throughout
 
-This book uses JIT compilation exclusively for three reasons:
-
-1. **Immediate feedback**: Compile and test in seconds, not minutes
-2. **Pedagogical clarity**: See IR transformations interactively
-3. **Python integration**: Natural fit for Python-first ML workflows
-
-Chapter 3 will address JIT's compilation overhead through caching—compile once, reuse many times.
+This book uses JIT compilation exclusively for three reasons: immediate feedback (compile and test in seconds, not minutes), pedagogical clarity (see IR transformations interactively), and Python integration (natural fit for Python-first ML workflows). Chapter 3 will address JIT's compilation overhead through caching—compile once, reuse many times.
 
 ---
 
-## 1.6 Your First MLIR Program: Matrix Multiply
+## 1.6 Understanding the MLIR Programming Model
+
+Before we dive into implementing matrix multiply, we need to understand how MLIR programs are constructed. Coming from Python or C++, MLIR's programming model may seem unusual at first. This section introduces the core concepts that underpin all MLIR code you'll write throughout this book.
+
+### Building a Computation Graph
+
+When you write MLIR code programmatically (using the C++ API), you're not writing imperative code that executes immediately. Instead, you're **building a computation graph**—a data structure that represents your program. Think of it like constructing a recipe before cooking: you specify all the steps and ingredients first, then execute the recipe later.
+
+In MLIR, you construct this graph by adding **operations** to it. An operation is a node in the graph that represents a computation or action. Operations produce **values** (the results of computations) and consume values (the inputs). These values flow through the graph along edges, defining the program's data flow.
+
+Here's a crucial insight that surprises many newcomers: **even creating a constant is an operation**. When you need the number 0.0 in your program, you don't just write `0.0` and have it appear. Instead, you add a "constant operation" to the graph. This operation takes no inputs but produces one output: the constant value you specified.
+
+Consider this MLIR text IR:
+
+```mlir
+%zero = arith.constant 0.0 : f32
+%result = arith.addf %input, %zero : f32
+```
+
+This represents two operations in the graph:
+1. A constant operation that produces the value `%zero` (which is 0.0)
+2. An addition operation that consumes `%input` and `%zero`, producing `%result`
+
+The `arith.constant` operation creates a new node in the computation graph. The value `0.0` itself is stored as an **attribute**—compile-time data attached to the operation. Think of it this way: the operation is the action ("create a constant"), while the attribute is the data ("the constant's value is 0.0").
+
+This distinction between operations (actions in the graph) and attributes (data attached to operations) is fundamental to MLIR. Operations can execute at runtime and produce values that flow through your program. Attributes are compile-time constants that parameterize operations.
+
+### Operations, Values, and Types
+
+Every operation in MLIR has:
+- **Operands**: Input values consumed by the operation (like function arguments)
+- **Results**: Output values produced by the operation
+- **Attributes**: Compile-time constant data (numbers, strings, types, etc.)
+- **Regions**: Optional nested blocks of code (like function bodies)
+
+When you build IR programmatically, you use an `OpBuilder` to create operations. The builder maintains an **insertion point**—a location in the graph where new operations will be added. As you create operations, they're inserted at this point and connected to other operations through their inputs and outputs.
+
+Values in MLIR are strongly typed. Every value has a **type** that describes its data: `f32` for 32-bit floating point, `i64` for 64-bit integers, `memref<8x32xf32>` for a 2D array of floats, and so on. The type system ensures that you don't accidentally add an integer to a floating-point number or pass a matrix where a scalar is expected. Types are verified when you construct the IR, catching errors early.
+
+### The Three-Phase Pattern
+
+Nearly every MLIR project follows the same three-phase structure:
+
+**Phase 1: IR Generation** - Build the computation graph using high-level operations. In our matrix multiply example, this means creating operations like `linalg.matmul` that declaratively specify "multiply these matrices." You're not specifying *how* to multiply them (nested loops? SIMD instructions? parallel threads?), just *what* to compute.
+
+**Phase 2: Transformation and Lowering** - Apply optimization passes that transform the graph. These passes progressively lower high-level operations into lower-level implementations. A pass might convert `linalg.matmul` into nested loops, then another pass converts those loops into conditional branches, and finally another pass converts everything into LLVM IR. Each pass operates on the graph, rewriting operations and transforming the structure.
+
+**Phase 3: Compilation and Execution** - Translate the final low-level IR to machine code and execute it. For JIT compilation (what we use in this book), this happens at runtime. The IR gets compiled to executable machine instructions stored in memory, and we get back a function pointer we can call from C++ or Python.
+
+Understanding this pattern helps you reason about where code lives and when it executes. The IR generation code (Phase 1) runs in your program to *build* the computation graph. The optimization passes (Phase 2) run to *transform* the graph. The generated code (Phase 3) runs to *execute* the computation you described. These are three distinct execution phases with different responsibilities.
+
+With this foundation, we're ready to implement our first complete example: a JIT-compiled matrix multiply. As you read the code, remember: we're building a graph of operations that will be optimized and compiled later, not writing code that executes immediately.
+
+---
+
+## 1.7 Your First MLIR Program: Matrix Multiply
 
 Now that we understand the foundations, let's implement a complete example. We'll build an 8×32 × 32×16 matrix multiply using MLIR's `linalg` dialect, compile it with JIT, and execute it from Python.
 
 ### Problem Statement
 
-Implement:
-```
-C = A @ B
-
-where:
-  A: 8 × 32 matrix (float32)
-  B: 32 × 16 matrix (float32)  
-  C: 8 × 16 matrix (float32)
-```
-
-This is GEMM (General Matrix Multiply)—the fundamental operation in neural networks. Every linear layer, attention mechanism, and feed-forward network relies on matrix multiplication.
+We're implementing matrix multiplication: C = A @ B, where A is an 8×32 matrix, B is 32×16, and C is 8×16 (all float32). This is GEMM (General Matrix Multiply)—the fundamental operation in neural networks. Every linear layer, attention mechanism, and feed-forward network relies on matrix multiplication.
 
 ### The High-Level MLIR IR
 
@@ -540,30 +564,19 @@ func.func @gemm_8x16x32(%arg0: memref<8x32xf32>,   // Input A
 }
 ```
 
-Let's break this down:
+Let's break this down operation by operation. The function signature `func.func @gemm_8x16x32` uses the `func` dialect for function definitions. It takes three arguments: A, B, and C, all represented as memrefs (memory references—think "pointers with shape information"). The type `memref<8x32xf32>` describes a 2D array with shape 8×32 and element type f32 (32-bit float).
 
-**Function signature**: `func.func @gemm_8x16x32`
-- Uses the `func` dialect for function definitions
-- Takes 3 arguments: A, B, and C (all memrefs—think "pointers to arrays")
+We use memrefs instead of tensors here to keep the example simple. Memrefs directly map to memory buffers and require no additional transformation. Tensors, while more optimization-friendly, need a bufferization pass to convert them to memrefs before execution. Chapter 2 will introduce tensors, and Chapter 4 will dive deep into bufferization. For this introductory example, memrefs suffice.
 
-**Types**: `memref<8x32xf32>`
-- `memref` = memory reference (like a pointer with shape info)
-- `8x32` = 2D shape
-- `f32` = 32-bit float
-- We use memrefs instead of tensors to avoid complexity (Chapter 4 will explain)
+The function body contains three operations. First, `arith.constant 0.0` creates a constant zero value (from the `arith` dialect, which we'll see more of in Chapter 5). Second, `linalg.fill` initializes the output matrix C to all zeros—matrix multiply accumulates results, so we start with zero. Third, `linalg.matmul` performs the actual multiplication.
 
-**Operations**:
-1. `arith.constant 0.0` - Create a zero value
-2. `linalg.fill` - Initialize output matrix to zeros
-3. `linalg.matmul` - The actual matrix multiply (declarative!)
-
-**Key Insight**: The `linalg.matmul` operation is *declarative*—it specifies **what** to compute, not **how**. There are no explicit loops, no SIMD instructions, no memory layout decisions. MLIR's optimization passes will make those decisions during lowering.
+The key insight here is that `linalg.matmul` is declarative. It specifies *what* to compute (multiply matrices A and B, accumulate into C) without specifying *how*. There are no explicit loops, no SIMD instructions, no memory layout decisions. MLIR's optimization passes will make those decisions during the lowering phase, choosing the best implementation for the target hardware.
 
 ---
 
-## 1.7 Generating IR with the C++ API
+## 1.8 Generating IR with the C++ API
 
-MLIR provides a C++ API for programmatic IR construction. Let's walk through the implementation in `ch.1.Fixed-size/src/ir.cpp`.
+MLIR provides a C++ API for programmatic IR construction. Let's walk through the implementation in `ch.1.Fixed-size/src/ir.cpp`, understanding how we build the computation graph piece by piece.
 
 ### Loading Dialects
 
@@ -576,7 +589,7 @@ OwningOpRef<ModuleOp> createGemmModule(MLIRContext& context) {
   context.getOrLoadDialect<arith::ArithDialect>();   // arith.constant
 ```
 
-**Dialects are vocabularies**. Each dialect provides a set of operations. We must load the ones we need before using their operations.
+Before using any dialect's operations, we must load that dialect into the context. The context stores all MLIR state—types, attributes, and loaded dialects. Loading a dialect registers its operations, making them available for use. Each dialect provides a vocabulary of operations: `func` for functions, `linalg` for linear algebra, `memref` for memory operations, and `arith` for arithmetic.
 
 ### Creating the Module and Builder
 
@@ -589,9 +602,9 @@ OwningOpRef<ModuleOp> createGemmModule(MLIRContext& context) {
   builder.setInsertionPointToStart(module.getBody());
 ```
 
-- `OpBuilder` is the tool for constructing operations
-- `ModuleOp` is the top-level container
-- **The insertion point tells the builder where to add new operations**—forgetting to set it is a common error
+The `OpBuilder` is our tool for constructing operations. Every operation we create goes through this builder. The builder maintains an insertion point—the location where new operations will be added. Setting the insertion point to the module's body means operations we create will be added as top-level entities in the module (like function definitions).
+
+The `ModuleOp` is MLIR's top-level container. A module holds functions, global variables, and other top-level declarations. Every MLIR program is organized as a module containing one or more functions. The `loc` parameter represents source location information for debugging, but since we're generating IR programmatically rather than parsing source files, we use `getUnknownLoc()`.
 
 ### Defining Types
 
@@ -607,7 +620,9 @@ OwningOpRef<ModuleOp> createGemmModule(MLIRContext& context) {
   );
 ```
 
-MLIR types are first-class objects. We create memref types with explicit shapes. The fixed sizes (8, 32, 16) simplify the implementation; Chapter 2 introduces dynamic shapes.
+Types in MLIR are first-class objects that describe the structure of data. We create memref types by specifying their shape (dimensions) and element type. The `MemRefType::get({8, 32}, f32Type)` creates a type representing an 8×32 matrix of 32-bit floats. The fixed sizes simplify this first example—Chapter 2 will show how to handle dynamic shapes where dimensions aren't known until runtime.
+
+The function type is created using `getFunctionType`, which takes two lists: input types and output types. Our function takes three memref inputs and returns nothing (the output is written in-place to the third argument). This pattern of passing output buffers as arguments is common in systems programming and will be explored more deeply in Chapter 4 when we discuss calling conventions.
 
 ### Creating the Function
 
@@ -625,11 +640,13 @@ MLIR types are first-class objects. We create memref types with explicit shapes.
   auto matrixC = entryBlock->getArgument(2);
 ```
 
-- `func::FuncOp` represents a function
-- We add an entry block to hold operations
-- Arguments are accessed via `getArgument(index)`
+Now we create the function operation itself. The `func::FuncOp` represents a function definition—it's the MLIR equivalent of a C++ function. We provide a name ("gemm_8x16x32") and the function type we just defined. Calling `setPublic()` marks the function as externally visible, which we need since we'll call it from outside the MLIR module (from our Python code).
 
-### Generating the Matrix Multiply
+Every function needs a body—a sequence of operations to execute. In MLIR, function bodies are organized as basic blocks. A basic block is a straight-line sequence of operations with one entry point and one exit point (no branches in the middle). We call `addEntryBlock()` to create the first block and set our builder's insertion point there, so subsequent operations we create will be added to this block.
+
+The function's arguments (the three memrefs) are available through the entry block. Each argument is a value that we can use as an input to operations. We retrieve them with `getArgument(index)` and store them in variables for convenient reference.
+
+### Generating the Matrix Multiply Operations
 
 ```cpp
   // Create zero constant for initialization
@@ -651,15 +668,23 @@ MLIR types are first-class objects. We create memref types with explicit shapes.
 }
 ```
 
-Notice the abstraction level: we're not writing loops or specifying memory access patterns. The `linalg.matmul` operation is declarative—it carries semantic meaning ("matrix multiply") that later passes will expand into efficient implementation.
+Now we add the operations that actually perform the computation. Remember from section 1.6 that even constants are operations in MLIR. To get the value 0.0, we create a constant operation. The `builder.getFloatAttr(f32Type, 0.0)` creates an attribute (compile-time data) holding the value 0.0, and `builder.create<arith::ConstantOp>` creates the operation that produces this constant as a runtime value. We call `zero.getResult()` to get the value produced by this operation, which we can then use as an input to other operations.
+
+The `linalg::FillOp` initializes the output matrix C to all zeros. Matrix multiplication is an accumulation operation (C += A @ B), so we need to start with zero. The fill operation takes two arguments: the value to fill with (our zero) and the memref to fill (matrixC).
+
+Finally, we create the `linalg::MatmulOp`. This is the high-level operation that represents our matrix multiplication. Notice we don't specify any implementation details—no loops, no memory access patterns, no vectorization. The operation carries high-level semantic meaning ("multiply these two matrices"), and later compilation passes will decide how to implement it efficiently. This declarative approach is central to MLIR's design philosophy.
+
+We end the function with a `func::ReturnOp`. Since our function has void return type, the return takes no arguments. With all operations created, we return the complete module.
+
+Notice the abstraction level throughout this code: we're building a computation graph using high-level operations. We're not writing loops or specifying how the GPU schedules work. That's the power of MLIR—start at a high level, let the compiler handle the low-level details.
 
 ---
 
-## 1.8 The Compilation Pipeline
+## 1.9 The Compilation Pipeline: Progressive Lowering
 
-With IR generated, we apply a series of passes to lower it to executable machine code. The implementation resides in `lowering.cpp`.
+With the IR generated, we need to transform it from high-level operations into executable machine code. This happens through a series of transformation passes, each lowering the IR one step closer to the machine. The implementation resides in `lowering.cpp`.
 
-### The Pass Sequence
+### The Pass Manager and Pass Sequence
 
 ```cpp
 void applyOptimizationPasses(ModuleOp module) {
@@ -679,48 +704,69 @@ void applyOptimizationPasses(ModuleOp module) {
 }
 ```
 
-### Understanding Each Pass
+The `PassManager` orchestrates the transformation pipeline. Each pass is a transformation that walks the IR and rewrites it according to specific rules. We add passes to the manager in the order they should run, and then `pm.run(module)` executes them sequentially. Each pass transforms the IR in place, modifying the module. Later passes see the results of earlier passes, creating a progressive lowering pipeline.
 
-**Canonicalization**  
-Simplifies patterns like `x + 0 → x`, removes dead code, and normalizes IR to standard forms. This is a general cleanup pass run between major transformations.
+### Understanding Progressive Lowering: Step by Step
 
-**Linalg → Loops**  
-Converts `linalg.matmul` into nested `scf.for` loops with explicit memory accesses:
-  ```mlir
-  // Before:
-  linalg.matmul ins(%A, %B) outs(%C)
-  
-  // After:
-  scf.for %i = 0 to 8 {
-    scf.for %j = 0 to 16 {
-      scf.for %k = 0 to 32 {
-        %a = memref.load %A[%i, %k]
-        %b = memref.load %B[%k, %j]
-        %c = memref.load %C[%i, %j]
-        %prod = arith.mulf %a, %b
-        %sum = arith.addf %c, %prod
-        memref.store %sum, %C[%i, %j]
-      }
+Let's trace how our matrix multiply transforms through each pass. Understanding this progression is key to working effectively with MLIR.
+
+**Pass 1: Canonicalization**
+
+The canonicalizer applies algebraic simplifications and normalizes patterns. For our matrix multiply, it might simplify constant expressions, eliminate dead code, or normalize operation orders. For example, if we had `x + 0`, it would simplify to `x`. This is a cleanup pass that makes subsequent transformations easier by ensuring the IR is in a standard form. Canonicalization is cheap and effective, so it often runs multiple times throughout compilation.
+
+**Pass 2: Linalg to Loops**
+
+This is where high-level semantics meet implementation. The `convertLinalgToLoops` pass replaces our declarative `linalg.matmul` operation with explicit nested loops using the SCF (Structured Control Flow) dialect. Here's conceptually what happens:
+
+```mlir
+// Before:
+linalg.matmul ins(%A, %B) outs(%C)
+
+// After:
+scf.for %i = 0 to 8 {
+  scf.for %j = 0 to 16 {
+    scf.for %k = 0 to 32 {
+      %a = memref.load %A[%i, %k]
+      %b = memref.load %B[%k, %j]
+      %c = memref.load %C[%i, %j]
+      %prod = arith.mulf %a, %b
+      %sum = arith.addf %c, %prod
+      memref.store %sum, %C[%i, %j]
     }
   }
-  ```
+}
+}
+```
 
-The transformation is mechanical: one declarative operation becomes explicit loops. This exposes the computation for subsequent optimizations like tiling, vectorization, and parallelization.
+Now we have explicit loops iterating over matrix dimensions. The outer loops (i, j) iterate over output positions in C, while the inner loop (k) accumulates the dot product. Inside the innermost loop, we see the fundamental operations: load elements from A and B, multiply them, add to the accumulator, and store back to C. The SCF dialect provides structured loops with well-defined semantics—we'll explore it thoroughly in Chapter 5.
 
-**SCF → CF**  
-Converts structured loops (`scf.for`) into basic blocks and branches (`cf.br`). Structured control flow is easier to analyze and optimize; control flow graph representation prepares for LLVM lowering.
+This transformation exposes the computation's structure, making it accessible to subsequent optimizations. Notice how much detail is now explicit: memory access patterns, loop bounds, arithmetic operations. Later passes can apply optimizations like loop tiling (breaking large loops into cache-friendly blocks), vectorization (processing multiple elements per iteration with SIMD), and parallelization (running iterations concurrently).
 
-**MemRef → LLVM**  
-Converts memref types to LLVM pointers and lowers memory operations (`memref.load` → `llvm.load`). Chapter 2 will reveal the complexity hidden here: memrefs with dynamic shapes require descriptor structs with stride and offset information.
+**Pass 3: SCF to Control Flow**
 
-**Final Lowering Passes**  
-The remaining three passes convert all high-level dialects (func, arith, cf) to LLVM dialect. After this pipeline, we have pure LLVM IR in MLIR's representation—ready for JIT compilation.
+The next pass converts structured loops into unstructured control flow—basic blocks and branches. The `scf.for` operation becomes a header block (checks loop condition), a body block (executes loop iteration), and branch operations connecting them. This is a lowering from structured to unstructured control flow.
+
+Structured control flow makes optimization easier because the compiler can reason about loop structure, invariants, and dependencies. But eventually we need unstructured control flow because that's what CPU's execute: conditional and unconditional branches. This pass makes the transition, converting loops into basic blocks connected by branches—the CF (Control Flow) dialect, which we'll see more of in Chapter 5.
+
+**Pass 4: MemRef to LLVM**
+
+This pass is deceptively complex. It converts memref types to LLVM pointer types and transforms memory operations (`memref.load`, `memref.store`) into LLVM load and store instructions. For our fixed-size memrefs, this is straightforward: a `memref<8x32xf32>` becomes a pointer to float with some address arithmetic for indexing.
+
+But there's hidden complexity that Chapter 2 will reveal. Memrefs can have dynamic dimensions (unknown until runtime), non-contiguous layouts (strided or transposed), and complex addressing schemes. The lowering pass handles all this by generating code that computes addresses from base pointers, offsets, and strides. For now, our fixed-size example avoids this complexity, but keep in mind that memref lowering can generate significant code for complex cases.
+
+**Passes 5-7: Final Dialect Lowering**
+
+The final three passes convert remaining high-level dialects to LLVM dialect. The `ConvertFuncToLLVM` pass converts function definitions and calls. The `ConvertArithToLLVM` pass converts arithmetic operations like `arith.mulf` to `llvm.fmul`. The `ConvertControlFlowToLLVM` pass converts branches and control flow. After these passes complete, every operation in our IR is from the LLVM dialect.
+
+The result is LLVM dialect IR—MLIR operations that directly correspond to LLVM IR constructs. We haven't left MLIR yet; we're still working with MLIR's representation. But the operations are now LLVM operations represented in MLIR's infrastructure. This enables one final translation step to actual LLVM IR for compilation.
 
 ---
 
-## 1.9 JIT Compilation and Execution
+## 1.10 JIT Compilation and Execution
 
-With lowered LLVM dialect IR, we use MLIR's ExecutionEngine to compile and execute it. The implementation is in `jit.cpp`.
+With our IR fully lowered to LLVM dialect, we can now compile it to executable machine code and run it. MLIR provides the `ExecutionEngine` class that wraps LLVM's JIT compiler, making this process straightforward. The implementation resides in `jit.cpp`.
+
+### Creating the Execution Engine
 
 ```cpp
 void* jitCompileFunction(ModuleOp module) {
@@ -743,9 +789,13 @@ void* jitCompileFunction(ModuleOp module) {
 }
 ```
 
-The `makeOptimizingTransformer` applies LLVM's `-O3` optimizations (instruction selection, register allocation, etc.). We link against the C standard library for malloc and free—memref operations require dynamic memory allocation.
+The `ExecutionEngine::create` method performs several steps internally. First, it translates the MLIR LLVM dialect to actual LLVM IR (a format LLVM's optimizer and code generator understand). Second, it applies LLVM optimizations through the transformer we configured—the `makeOptimizingTransformer(3, 0, nullptr)` creates an optimization pipeline equivalent to `-O3` compiler flags. This includes instruction selection, register allocation, instruction scheduling, and architecture-specific optimizations like vectorization.
 
-### Invoking the Compiled Function
+Third, the execution engine JIT-compiles the optimized LLVM IR to native machine code for the host architecture (x86_64, ARM, etc.). This generated code is stored in memory and is immediately executable. Finally, we use `lookup` to find our function by name, getting back a pointer to the compiled code.
+
+The transformer is crucial for performance. Without optimization (transformer level 0), we'd get naive code with redundant loads, no vectorization, and poor register usage. With `-O3` (level 3), LLVM applies aggressive optimizations that can match hand-written assembly for many computations. Chapter 3 will explore the execution engine in more depth, including caching strategies to avoid recompiling the same code repeatedly.
+
+### Invoking the Compiled Function from C++
 
 ```cpp
 typedef void (*GemmFunc)(float*, float*, float*);
@@ -756,11 +806,13 @@ void callGemmJIT(void* funcPtr, float* A, float* B, float* C) {
 }
 ```
 
-We cast the void pointer to a function pointer matching our MLIR signature. In memory, memrefs are simply float pointers for fixed-size arrays. Chapter 2 will reveal the additional complexity for dynamic shapes.
+Once we have the function pointer from JIT compilation, calling it is straightforward. We cast the void pointer to a function pointer type matching our signature: three float pointers (one for each matrix) and no return value. The memrefs in our MLIR code compile down to simple pointers for fixed-size arrays—the dimensions are baked into the generated code as loop bounds.
 
-### Python Integration
+In memory, the arrays are just contiguous sequences of floats in row-major order. When we pass NumPy arrays from Python, NumPy ensures the data is contiguous, so we can safely pass the underlying memory pointers to compiled code. Chapter 2 will reveal additional complexity when we introduce dynamic shapes: memrefs become descriptor structs containing size and stride information, requiring more complex calling conventions.
 
-Pybind11 exposes our JIT compiler to Python (implementation in `bindings.cpp`):
+### Python Integration with Pybind11
+
+The final piece is exposing our JIT compiler to Python so we can easily test and use it. Pybind11 provides seamless C++/Python integration. The implementation in `bindings.cpp` wraps our JIT compiler in a Python-friendly interface:
 
 ```cpp
 py::array_t<float> gemm(py::array_t<float> A, py::array_t<float> B) {
@@ -793,9 +845,7 @@ PYBIND11_MODULE(ch1_fixed_size, m) {
 
 This workflow validates shapes, generates IR, applies passes, JIT compiles, and executes—all triggered by a Python function call. Chapter 3 will optimize this by caching compiled functions.
 
----
-
-## 1.10 Testing and Validation
+### Testing and Validation
 
 We verify correctness by comparing against NumPy's optimized BLAS implementation (from `test_jit.py`):
 
@@ -836,7 +886,7 @@ The ones matrix test provides easy manual verification: each element should be 3
 
 ## 1.11 Summary
 
-This chapter introduced MLIR's foundational concepts and implemented a complete JIT-compiled matrix multiply. We covered:
+This chapter introduced MLIR's foundational concepts and implemented a complete JIT-compiled matrix multiply. Let's reflect on what we've learned.
 
 **Conceptual Foundations**:
 - The multi-level problem in ML compilation
@@ -847,9 +897,7 @@ This chapter introduced MLIR's foundational concepts and implemented a complete 
 
 **Practical Implementation**:
 - Generating MLIR IR programmatically with the C++ API
-- Applying a pass pipeline (Linalg → SCF → CF → LLVM)
-- JIT compilation with ExecutionEngine
-- Python integration via pybind11
+###n integration via pybind11
 - Testing against NumPy for correctness
 
 **Key Insights**:
@@ -863,4 +911,18 @@ This chapter introduced MLIR's foundational concepts and implemented a complete 
 - Fixed dimensions (8×32×16) for pedagogical clarity
 - JIT compilation for rapid iteration
 
-Chapter 2 tackles the next challenge: handling arbitrary matrix sizes with dynamic shapes. This introduces the memref descriptor—a 21-parameter structure that will significantly complicate our implementation.
+This chapter introduced MLIR's foundational concepts and implemented a complete JIT-compiled matrix multiply. Let's reflect on what we've learned.
+
+We began by understanding the traditional compiler pipeline and why one intermediate representation isn't sufficient for modern heterogeneous computing. The ML compiler landscape before MLIR was fragmented, with each framework (TensorFlow, PyTorch, XLA) building its own complete compilation stack. MLIR unified this ecosystem by providing extensible dialects—vocabularies of operations at different abstraction levels that can coexist and transform between each other.
+
+The dialect system is central to MLIR's design. Each dialect provides operations appropriate for its abstraction level: high-level operations like `linalg.matmul` declare what to compute, mid-level operations like `scf.for` specify structured loops, and low-level operations like `llvm.load` directly map to machine instructions. Progressive lowering through passes transforms operations from one level to the next, maintaining optimization opportunities at each stage.
+
+We learned a crucial programming model concept: in MLIR, you're building a computation graph, not writing imperative code. Operations are nodes in this graph, and even creating a constant requires an operation. Attributes store compile-time data (like the value 0.0), while operations execute at runtime and produce values. Understanding this distinction—operations versus attributes, graph construction versus execution—is fundamental to working with MLIR effectively.
+
+Our matrix multiply implementation demonstrated the three-phase pattern that underlies nearly every MLIR project. Phase 1 generates IR using high-level operations (`linalg.matmul`). Phase 2 applies transformation passes that progressively lower the IR (Linalg → SCF → CF → LLVM). Phase 3 compiles to machine code and executes. Each phase has distinct responsibilities: building the graph, transforming it, and executing the result.
+
+We chose specific design simplifications for this introductory example. Using memrefs instead of tensors avoided the complexity of bufferization (covered in Chapter 4). Fixed dimensions (8×32×16) kept the interface simple—dynamic shapes introduce memref descriptors that complicate calling conventions, as we'll see in Chapter 2. JIT compilation provided immediate feedback, though Chapter 3 will address its compilation overhead through caching.
+
+The testing strategy validated correctness by comparing against NumPy's battle-tested implementations. Small floating-point differences (around 10⁻⁷) are expected due to different operation ordering, but the results match within acceptable tolerance. This testing pattern—comparing against reference implementations—will continue throughout the book.
+
+Chapter 2 tackles the next challenge: arbitrary matrix sizes with dynamic dimensions. The `?` notation in types like `memref<?x?xf32>` represents dimensions unknown until runtime. This flexibility comes at a cost: memrefs become complex descriptor structures with multiple fields, and the calling convention between Python and compiled code becomes significantly more involved. But this complexity is necessary for production systems where input sizes vary.
