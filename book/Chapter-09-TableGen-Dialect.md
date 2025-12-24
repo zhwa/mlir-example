@@ -58,7 +58,7 @@ def lower_add(self, result_id: int, lhs_id: int, rhs_id: int, shape: List[int]) 
 
 The operation's syntax, semantics, and constraints existed only in this Python function. If you wanted to know what `nn.add` looked like in MLIR, you'd run the code and inspect the generated string. There was no declaration saying "the add operation takes two memrefs of the same shape and writes to a third," you just generated text that hopefully did that. Verification happened at MLIR parsing time, when mlir::parseSourceString tried to interpret your generated text. Errors appeared as parser diagnostics, not at operation generation time.
 
-**Chapter 9: Explicit Declaration in TableGen**. With TableGen, operations are declared formally in `.td` files before any IR is generated. The `nn.add` operation in [inc/NNOps.td](\mlir-example\\ch.9.TableGen-dialect\\inc\\NNOps.td):
+**Chapter 9: Explicit Declaration in TableGen**. With TableGen, operations are declared formally in `.td` files before any IR is generated. The `nn.add` operation in [inc/NNOps.td](../ch.9.TableGen-dialect/inc/NNOps.td):
 
 ```tablegen
 def NN_AddOp : NN_Op<"add"> {
@@ -186,7 +186,7 @@ The `list<Trait> traits = []` syntax provides a default empty trait list, which 
 
 Standard C-style guard preventing multiple definition errors. TableGen processes includes textually, so these guards matter for complex project structures where files include each other.
 
-**Code Generation**. When you run mlir-tblgen on this file, it generates [inc/NNDialect.h.inc](\mlir-example\\build\\x64-release\\ch.9.TableGen-dialect\\inc\\NNDialect.h.inc) (included by your hand-written `NNDialect.h`) and [src/NNDialect.cpp.inc](\mlir-example\\build\\x64-release\\ch.9.TableGen-dialect\\src\\NNDialect.cpp.inc) (included by `NNDialect.cpp`). These generated files contain:
+**Code Generation**. When you run mlir-tblgen on this file, it generates [inc/NNDialect.h.inc](../build/x64-release/ch.9.TableGen-dialect/inc/NNDialect.h.inc) (included by your hand-written `NNDialect.h`) and [src/NNDialect.cpp.inc](../build/x64-release/ch.9.TableGen-dialect/src/NNDialect.cpp.inc) (included by `NNDialect.cpp`). These generated files contain:
 
 ```cpp
 // NNDialect.h.inc
@@ -350,7 +350,7 @@ With this language foundation, let's examine specific operation definitions and 
 
 ## 9.4 Operation Definition Syntax: The Add Operation
 
-Individual operations are defined in [inc/NNOps.td](\mlir-example\\ch.9.TableGen-dialect\\inc\\NNOps.td), each as a `def` record inheriting from our `NN_Op` base class. Let's examine the `add` operation in detail, understanding every line of its TableGen specification and what it means for code generation and usage.
+Individual operations are defined in [inc/NNOps.td](../ch.9.TableGen-dialect/inc/NNOps.td), each as a `def` record inheriting from our `NN_Op` base class. Let's examine the `add` operation in detail, understanding every line of its TableGen specification and what it means for code generation and usage.
 
 **The Complete Definition**:
 
@@ -658,7 +658,7 @@ The matmul definition shows that complex operations with rich semantics still fo
 
 ## 9.6 Generated C++ Code: What TableGen Produces
 
-Understanding generated code is crucial for effective TableGen use: you need to know what methods are available, how to call builders, and what the operation class interface provides. Let's examine the generated `AddOp` class in detail, understanding each piece and how it integrates with MLIR's infrastructure. The generated code lives in [build/x64-release/ch.9.TableGen-dialect/inc/NNOps.h.inc](\mlir-example\\build\\x64-release\\ch.9.TableGen-dialect\\inc\\NNOps.h.inc) and is included by hand-written header files.
+Understanding generated code is crucial for effective TableGen use: you need to know what methods are available, how to call builders, and what the operation class interface provides. Let's examine the generated `AddOp` class in detail, understanding each piece and how it integrates with MLIR's infrastructure. The generated code lives in [build/x64-release/ch.9.TableGen-dialect/inc/NNOps.h.inc](../build/x64-release/ch.9.TableGen-dialect/inc/NNOps.h.inc) and is included by hand-written header files.
 
 **Class Declaration and Inheritance**. The generated `AddOp` class looks like:
 
@@ -1174,7 +1174,7 @@ The next subsection shows how to define custom interfaces in TableGen, but under
 
 ### 9.7.3 Lowering Add Operation
 
-Let's examine the add operation's lowering in [src/NNToStandard.cpp](\\wsl.localhost\\Ubuntu\\home\\zhe\\mlir-example\\ch.9.TableGen-dialect\\src\\NNToStandard.cpp), understanding the C++ pattern matching and IR construction APIs.
+Let's examine the add operation's lowering in [src/NNToStandard.cpp](../ch.9.TableGen-dialect/src/NNToStandard.cpp), understanding the C++ pattern matching and IR construction APIs.
 
 **Pattern Class Structure**:
 
@@ -1383,7 +1383,7 @@ This C++ pattern rewriting approach—type-safe, composable, integrated with MLI
 
 ## 9.8 OpBuilder and Python Integration
 
-The Python API in Chapter 9 differs fundamentally from Chapter 8: instead of generating MLIR text strings, it uses C++ OpBuilder to construct IR directly. This approach matches production ML frameworks like Torch-MLIR and JAX—Python provides high-level APIs, C++ handles IR construction, and the two integrate through pybind11 bindings. Let's examine the architecture in [src/bindings.cpp](\mlir-example\\ch.9.TableGen-dialect\\src\\bindings.cpp), understanding how Python tensor operations become MLIR operations.
+The Python API in Chapter 9 differs fundamentally from Chapter 8: instead of generating MLIR text strings, it uses C++ OpBuilder to construct IR directly. This approach matches production ML frameworks like Torch-MLIR and JAX—Python provides high-level APIs, C++ handles IR construction, and the two integrate through pybind11 bindings. Let's examine the architecture in [src/bindings.cpp](../ch.9.TableGen-dialect/src/bindings.cpp), understanding how Python tensor operations become MLIR operations.
 
 **The Tensor Class**. Python users work with a `Tensor` class wrapping NumPy arrays:
 
@@ -1715,31 +1715,3 @@ Chapter 10 introduces optimization passes that transform NN dialect operations b
 Chapter 11 explores attention mechanisms, demonstrating complex operations with multiple operands, optional inputs, and stateful computations. TableGen's expressiveness shines here: complex operation signatures that would require hundreds of lines of C++ boilerplate reduce to tens of lines of declarative specifications.
 
 Chapter 12 builds complete transformer models, combining attention, feed-forward networks, and layer normalization into cohesive dialect operations. The composability we've established—TableGen for definitions, OpRewritePattern for lowering, OpBuilder for construction—scales to arbitrarily complex models.
-
-**Practical Advice**:
-
-Start new dialects with TableGen. The initial learning curve pays off quickly—after defining two or three operations, the pattern becomes clear. Organize TableGen definitions by functionality: core operations in one file, advanced operations in another, experimental operations in a third. This modularity simplifies maintenance as dialects grow.
-
-Write tests early using mlir-opt to verify generated operations parse and print correctly. Custom assemblyFormat specifications can have subtle bugs, so testing immediately after definition catches issues before lowering patterns depend on operations.
-
-Invest time learning MLIR's trait system—traits like Commutative, Idempotent, and SameOperandsAndResultType encode operation properties that optimizations exploit. Properly-specified traits enable automatic optimization without custom pattern code.
-
-**Resources for Deeper Learning**:
-
-MLIR's official documentation provides comprehensive TableGen references:
-- **DefiningDialects/Operations.md**: Complete ODS syntax reference with examples for every feature
-- **DefiningDialects/Constraints.md**: Type constraints, trait definitions, interface specifications
-- **Tutorials/CreatingADialect.md**: Step-by-step dialect creation guide with TableGen
-
-Study existing dialects in MLIR source:
-- **mlir/include/mlir/Dialect/Arith/IR/ArithOps.td**: Arithmetic operations, showing common patterns
-- **mlir/include/mlir/Dialect/Linalg/IR/LinalgStructuredOps.td**: Complex structured operations with regions
-- **mlir/include/mlir/Dialect/Func/IR/FuncOps.td**: Function dialect, demonstrating symbol table operations
-
-For pattern rewriting:
-- **PatternRewrite.md**: OpRewritePattern documentation with best practices
-- **mlir/lib/Dialect/Linalg/Transforms**: Real-world lowering patterns in production code
-
-Part II concludes with a toolkit for building custom MLIR dialects: fixed-size tensors (Chapter 5), dynamic shapes (Chapter 6), sophisticated operations (Chapter 7), custom dialects (Chapter 8), and production TableGen definitions (Chapter 9). Part III builds on this foundation, exploring optimizations that transform high-level operations into efficient low-level code.
-
-Continue to Chapter 10, where we optimize this dialect's operations, unlocking performance through algebraic simplifications, loop transformations, and memory optimizations—the techniques that distinguish research toys from production compilers.

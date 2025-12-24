@@ -491,7 +491,7 @@ For our purposes, libffi solves the memref calling problem elegantly: we describ
 
 **How execute_generic() Works with libffi**
 
-Let's walk through the complete implementation in [bindings.cpp](\\wsl.localhost\\Ubuntu\\home\\zhe\\mlir-example\\ch.7.Neural-ops\\src\\bindings.cpp):
+Let's walk through the complete implementation in [bindings.cpp](../ch.7.Neural-ops/src/bindings.cpp):
 
 ```cpp
 py::array_t<float> execute_generic(intptr_t fnPtr,

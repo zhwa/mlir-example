@@ -100,7 +100,7 @@ This dialect—five operations, tensor types, straightforward semantics—provid
 
 ## 8.4 Graph Builder: Constructing nn Dialect IR
 
-The `Graph` class in [python/graph_builder.py](\\wsl.localhost\\Ubuntu\\home\\zhe\\mlir-example\\ch.8.Custom-dialect\\python\\graph_builder.py) provides a Python API for constructing computation graphs that emit `nn` dialect IR. This class is structurally similar to Chapter 7's graph builder—operations return symbolic values (operation IDs), which subsequent operations consume—but instead of generating standard MLIR immediately, it generates high-level `nn` operations. Let's examine the implementation to understand how symbolic execution in Python produces MLIR text.
+The `Graph` class in [python/graph_builder.py](../ch.8.Custom-dialect/python/graph_builder.py) provides a Python API for constructing computation graphs that emit `nn` dialect IR. This class is structurally similar to Chapter 7's graph builder—operations return symbolic values (operation IDs), which subsequent operations consume—but instead of generating standard MLIR immediately, it generates high-level `nn` operations. Let's examine the implementation to understand how symbolic execution in Python produces MLIR text.
 
 **Data Structures**. The graph uses two simple dataclasses:
 
@@ -240,7 +240,7 @@ This graph builder establishes our high-level IR generation. Next, we'll impleme
 
 ## 8.5 Lowering nn Dialect to Standard MLIR
 
-The `MLIRLowering` class in [python/lowering.py](\\wsl.localhost\\Ubuntu\\home\\zhe\\mlir-example\\ch.8.Custom-dialect\\python\\lowering.py) implements transformation logic that converts high-level `nn` operations into standard MLIR using Linalg, Arith, and MemRef dialects. This lowering happens entirely in Python through string manipulation—a pedagogical choice that makes transformation logic explicit without requiring familiarity with MLIR's C++ pattern rewriting infrastructure. Let's examine each lowering pattern to understand how high-level semantics map to implementation details.
+The `MLIRLowering` class in [python/lowering.py](../ch.8.Custom-dialect/python/lowering.py) implements transformation logic that converts high-level `nn` operations into standard MLIR using Linalg, Arith, and MemRef dialects. This lowering happens entirely in Python through string manipulation—a pedagogical choice that makes transformation logic explicit without requiring familiarity with MLIR's C++ pattern rewriting infrastructure. Let's examine each lowering pattern to understand how high-level semantics map to implementation details.
 
 **Why Lower to Standard Dialects?** MLIR provides no execution engine for custom dialects directly. To JIT compile and run our `nn` operations, we must convert them to dialects that have lowering paths to LLVM IR. The Linalg dialect provides high-level structured operations (matmul, generic), Arith provides scalar arithmetic (addf, mulf, maximumf), and MemRef provides buffer management (alloc, load, store). Together, these dialects express any computational pattern, and MLIR's built-in passes know how to lower them progressively to executable code. Our lowering transforms `nn` operations into combinations of these standard operations, leveraging existing infrastructure rather than implementing code generation from scratch.
 
@@ -525,7 +525,7 @@ This completes the lowering pipeline: high-level `nn` operations become standard
 
 ## 8.9 C++ Compilation: Parsing and Pass Pipeline
 
-The C++ side of our system handles three responsibilities: parsing MLIR text into in-memory IR, applying lowering passes to convert standard dialects to LLVM, and JIT compiling the result to executable machine code. This implementation in [src/compiler.cpp](\\wsl.localhost\\Ubuntu\\home\\zhe\\mlir-example\\ch.8.Custom-dialect\\src\\compiler.cpp) is remarkably concise—under 150 lines—because MLIR's infrastructure provides the heavy lifting. We configure components and let the framework handle complexity.
+The C++ side of our system handles three responsibilities: parsing MLIR text into in-memory IR, applying lowering passes to convert standard dialects to LLVM, and JIT compiling the result to executable machine code. This implementation in [src/compiler.cpp](../ch.8.Custom-dialect/src/compiler.cpp) is remarkably concise—under 150 lines—because MLIR's infrastructure provides the heavy lifting. We configure components and let the framework handle complexity.
 
 **Parsing MLIR Text**. The first step is converting string IR to MLIR's in-memory representation:
 
@@ -668,7 +668,7 @@ This C++ implementation—150 lines managing parsing, passes, and compilation—
 
 ## 8.10 Universal Execution with libffi
 
-The execution layer in [src/bindings.cpp](\\wsl.localhost\\Ubuntu\\home\\zhe\\mlir-example\\ch.8.Custom-dialect\\src\\bindings.cpp) implements the universal `execute()` function that calls JIT-compiled functions with arbitrary signatures using libffi. This is the same technique we introduced in Chapter 7.13, but here it's the only execution path—no explicit parameter-count cases, just pure dynamic dispatch. The implementation demonstrates production-grade flexibility: one function handles 1D arrays, 2D arrays, any number of inputs, any output shape, without code changes.
+The execution layer in [src/bindings.cpp](../ch.8.Custom-dialect/src/bindings.cpp) implements the universal `execute()` function that calls JIT-compiled functions with arbitrary signatures using libffi. This is the same technique we introduced in Chapter 7.13, but here it's the only execution path—no explicit parameter-count cases, just pure dynamic dispatch. The implementation demonstrates production-grade flexibility: one function handles 1D arrays, 2D arrays, any number of inputs, any output shape, without code changes.
 
 **The Universal API**:
 
@@ -834,7 +834,7 @@ The universal execution layer completes our implementation. Python generates hig
 
 ## 8.11 Composing Operations: Building Multi-Layer Networks
 
-With our custom dialect and compilation infrastructure complete, let's examine how operations compose into larger computations. The [test_jit.py](\\wsl.localhost\\Ubuntu\\home\\zhe\\mlir-example\\ch.8.Custom-dialect\\test_jit.py) test suite demonstrates this progression from simple operations to multi-layer neural networks. Understanding these examples shows how the abstractions scale from primitives to production-sized models.
+With our custom dialect and compilation infrastructure complete, let's examine how operations compose into larger computations. The [test_jit.py](../ch.8.Custom-dialect/test_jit.py) test suite demonstrates this progression from simple operations to multi-layer neural networks. Understanding these examples shows how the abstractions scale from primitives to production-sized models.
 
 **Two-Layer MLP**. The test suite's most complex example builds a two-layer multi-layer perceptron:
 
@@ -1026,14 +1026,6 @@ Chapter 7's graph builder contains IR generation, lowering, and compilation in o
 - **C++**: Text parsing, pass management, compilation, execution
 
 This layering matches production ML frameworks. TensorFlow's Python API builds graphs, C++ handles optimization and execution. PyTorch's JIT traces Python functions, C++ compiles them. Our architecture demonstrates this pattern at small scale. The advantage: each language does what it's good at. Python handles dynamism and string manipulation. C++ handles performance-critical compilation and execution.
-
-**When to Use Each Approach**
-
-- **Use Chapter 7's approach when**: Teaching fundamental concepts, building simple single-purpose tools, needing absolute performance (no libffi overhead), targeting one platform with known shape patterns, or wanting complete code transparency.
-
-- **Use Chapter 8's approach when**: Building production compilers, supporting multiple targets or optimization levels, handling dynamic/unknown shapes, implementing user-extensible operation sets, or separating concerns across Python/C++ boundaries.
-
-Most production systems evolve from Chapter 7-style implementations (simple, direct) to Chapter 8-style implementations (layered, flexible) as requirements grow. Understanding both approaches prepares you for this evolution. Chapter 9 will show the next step: TableGen-based dialect definition, which provides the benefits of Chapter 8's custom dialects with Chapter 7's compile-time safety.
 
 ## 8.13 Looking Ahead: From Python Strings to TableGen
 

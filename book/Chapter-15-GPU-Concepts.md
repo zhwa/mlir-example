@@ -1060,13 +1060,7 @@ Chapter 15 introduced GPU programming fundamentals through CPU emulation using M
 
 The only difference is execution model: CPU runs loops serially, GPU runs them in parallel. The code structure is identical. When you transition to real GPU code (CUDA, ROCm, Metal), you're writing the same kernels with different syntax.
 
-**AOT Compilation Benefits**. Chapter 15 switched from JIT to AOT compilation:
-- ✅ **Reliability**: No runtime compilation failures
-- ✅ **Performance**: Zero runtime compilation overhead
-- ✅ **Debugging**: Inspect assembly, use standard tools (gdb, perf)
-- ✅ **Production Reality**: Matches real serving systems (IREE, XLA, TVM)
-
-Production ML systems compile models once, serve many times. AOT compilation reflects this reality.
+Chapter 15 switched from JIT to AOT compilation. Production ML systems compile models once, serve many times. AOT compilation reflects this reality.
 
 **Looking Ahead**. Chapter 16 builds a production LLM serving engine using GPU concepts from this chapter. We implement modern serving techniques: continuous batching (process multiple requests concurrently), paged attention (efficient KV cache memory management), chunked prefill (split prompt processing across iterations), and request scheduling. These techniques transform nano GPT from an educational example into a production-capable serving system—the capstone project synthesizing all 16 chapters.
 

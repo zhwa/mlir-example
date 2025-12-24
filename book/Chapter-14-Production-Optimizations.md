@@ -885,18 +885,6 @@ Chapter 14 introduced production-grade optimization techniques spanning declarat
 - **Transform Dialect is Production Standard**: Declarative transformations are more maintainable than imperative passes
 - **KV Caching Dominates**: Algorithmic optimization (O(N²) → O(N)) provides 10-100× speedup at any scale
 
-**Theoretical vs Practical**:
-
-- **Nano GPT**: KV caching, DRR, interfaces show value; compiler optimizations demonstrate technique but limited speedup
-- **Production GPT**: All techniques critical—compiler optimizations (3-5×) combine with KV caching (10-100×) for orders-of-magnitude improvement
-
-**Chapter 9 Promises Fulfilled**:
-
-✅ **DRR (Declarative Rewrite Rules)**: Covered in Section 14.3
-✅ **Canonicalization patterns**: Covered in Section 14.4  
-✅ **Custom OpInterface**: Covered in Section 14.5
-✅ **Interface-based passes**: Demonstrated in Section 14.5
-
 **Looking Ahead**. Chapter 15 introduces GPU concepts: CUDA programming model, memory hierarchy (global, shared, registers), kernel programming, and MLIR's GPU dialect. Chapter 16 completes the book with production serving: batching, dynamic batching, model parallelism, and multi-GPU inference. These chapters build on Chapter 14's optimization foundation to achieve true production-scale performance.
 
 Chapter 14 completed the optimization arc: from basic operations (Chapters 1-9) through transformer architecture (Chapters 10-13) to production-grade optimizations. You now understand modern MLIR compilation—declarative, composable, and extensible. The techniques are production-ready; the scale is educational. Apply these to real models, and you'll achieve the theoretical speedups documented here.

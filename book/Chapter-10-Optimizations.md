@@ -805,8 +805,6 @@ This defines a DAG:
   a ----→ c ----→ d ----→ e ----→ result
   |       ↑
   b ------┘
-  |
-  └-------------→ d
 ```
 
 Multiple execution orders satisfy dependencies:

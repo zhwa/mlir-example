@@ -377,8 +377,6 @@ This distinction between operations (actions in the graph) and attributes (data 
 
 ### Operations, Values, and Types
 
-### Operations, Values, and Types
-
 Every operation in MLIR has four key components. **Operands** are input values consumed by the operation, similar to function arguments. **Results** are output values produced by the operation—the computed results that flow to subsequent operations. **Attributes** store compile-time constant data like numbers, strings, and types that parameterize the operation. Finally, **regions** are optional nested blocks of code, such as function bodies or loop bodies, that allow operations to contain hierarchical structure.
 
 When you build IR programmatically, you use an `OpBuilder` to create operations. The builder maintains an **insertion point**—a location in the graph where new operations will be added. As you create operations, they're inserted at this point and connected to other operations through their inputs and outputs.
