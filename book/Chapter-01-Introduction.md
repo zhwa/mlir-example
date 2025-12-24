@@ -281,49 +281,49 @@ A pass is a transformation that walks the IR and rewrites it. Passes can **lower
 MLIR's power comes from maintaining operations at multiple abstraction levels simultaneously. Here's the complete picture of how high-level operations progressively transform into machine code:
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    ABSTRACTION LADDER                           │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  HIGH LEVEL: "What to compute"                                 │
-│  ┌───────────────────────────────────────┐                     │
-│  │ Tensor/Linalg Dialect                 │                     │
-│  │  • linalg.matmul                      │                     │
-│  │  • tensor.extract, tensor.insert      │                     │
-│  │  Declarative: describes computation    │                     │
-│  └─────────────┬─────────────────────────┘                     │
-│                │ Linalg-to-Loops                               │
-│                ▼                                                │
-│  MID LEVEL: "How to iterate"                                   │
-│  ┌───────────────────────────────────────┐                     │
-│  │ SCF/Arith Dialect                     │                     │
-│  │  • scf.for (structured loops)         │                     │
-│  │  • arith.addf, arith.mulf             │                     │
-│  │  • memref.load, memref.store          │                     │
-│  │  Imperative: explicit control flow    │                     │
-│  └─────────────┬─────────────────────────┘                     │
-│                │ SCF-to-CF                                      │
-│                ▼                                                │
-│  LOW LEVEL: "Basic blocks & branches"                          │
-│  ┌───────────────────────────────────────┐                     │
-│  │ CF/LLVM Dialect                       │                     │
-│  │  • cf.br, cf.cond_br                  │                     │
-│  │  • llvm.load, llvm.store              │                     │
-│  │  Unstructured: just control flow      │                     │
-│  └─────────────┬─────────────────────────┘                     │
-│                │ LLVM Translation                               │
-│                ▼                                                │
-│  ┌───────────────────────────────────────┐                     │
-│  │ Machine Code (x86, ARM, etc.)         │                     │
-│  │  • mov, add, mul (registers)          │                     │
-│  │  • Memory addressing, jumps           │                     │
-│  └───────────────────────────────────────┘                     │
-│                                                                 │
-│  Each level enables appropriate optimizations:                 │
-│  • High: operation fusion, algebraic simplification            │
-│  • Mid: loop optimization, vectorization                       │
-│  • Low: register allocation, instruction scheduling            │
-└─────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────┐
+│                    ABSTRACTION LADDER                 │
+├───────────────────────────────────────────────────────┤
+│                                                       │
+│  HIGH LEVEL: "What to compute"                        │
+│  ┌───────────────────────────────────────┐            │
+│  │ Tensor/Linalg Dialect                 │            │
+│  │  • linalg.matmul                      │            │
+│  │  • tensor.extract, tensor.insert      │            │
+│  │  Declarative: describes computation   │            │
+│  └─────────────┬─────────────────────────┘            │
+│                │ Linalg-to-Loops                      │
+│                ▼                                      │
+│  MID LEVEL: "How to iterate"                          │
+│  ┌───────────────────────────────────────┐            │
+│  │ SCF/Arith Dialect                     │            │
+│  │  • scf.for (structured loops)         │            │
+│  │  • arith.addf, arith.mulf             │            │
+│  │  • memref.load, memref.store          │            │
+│  │  Imperative: explicit control flow    │            │
+│  └─────────────┬─────────────────────────┘            │
+│                │ SCF-to-CF                            │
+│                ▼                                      │
+│  LOW LEVEL: "Basic blocks & branches"                 │
+│  ┌───────────────────────────────────────┐            │
+│  │ CF/LLVM Dialect                       │            │
+│  │  • cf.br, cf.cond_br                  │            │
+│  │  • llvm.load, llvm.store              │            │
+│  │  Unstructured: just control flow      │            │
+│  └─────────────┬─────────────────────────┘            │
+│                │ LLVM Translation                     │
+│                ▼                                      │
+│  ┌───────────────────────────────────────┐            │
+│  │ Machine Code (x86, ARM, etc.)         │            │
+│  │  • mov, add, mul (registers)          │            │
+│  │  • Memory addressing, jumps           │            │
+│  └───────────────────────────────────────┘            │
+│                                                       │
+│  Each level enables appropriate optimizations:        │
+│  • High: operation fusion, algebraic simplification   │
+│  • Mid: loop optimization, vectorization              │
+│  • Low: register allocation, instruction scheduling   │
+└───────────────────────────────────────────────────────┘
 ```
 
 **Why Progressive?** Each abstraction level provides different optimization opportunities. High-level operations enable semantic optimizations ("these two matrix multiplies can fuse"). Mid-level loops enable cache optimizations ("tile this loop for L1 cache"). Low-level code enables hardware optimizations ("use SIMD instructions"). By lowering progressively, MLIR applies the right optimizations at the right level.
