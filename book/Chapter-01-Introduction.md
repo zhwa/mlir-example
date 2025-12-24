@@ -743,10 +743,6 @@ The ones matrix test provides easy manual verification: each element should be 3
 
 ## 1.11 Summary
 
-This chapter introduced MLIR's foundational concepts and implemented a complete JIT-compiled matrix multiply. Let's reflect on what we've learned.
-
-## 1.11 Summary
-
 This chapter introduced MLIR's foundational concepts and implemented a complete JIT-compiled matrix multiply. We explored how the multi-level problem emerged from heterogeneous computing, why LLVM IR alone proved insufficient, and how MLIR's dialect system provides extensible operation vocabularies at different abstraction levels. Through progressive lowering and composable passes, MLIR transforms high-level operations into executable machine code while maintaining optimization opportunities at each stage.
 
 We began by understanding the traditional compiler pipeline and why one intermediate representation isn't sufficient for modern heterogeneous computing. The ML compiler landscape before MLIR was fragmented, with each framework (TensorFlow, PyTorch, XLA) building its own complete compilation stack. MLIR unified this ecosystem by providing extensible dialects—vocabularies of operations at different abstraction levels that can coexist and transform between each other.
