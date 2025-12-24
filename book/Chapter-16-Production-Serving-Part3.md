@@ -9,7 +9,7 @@ This chapter completes nano-serving with **Phases 3-6**, culminating in NanoServ
 ```
 Phase 3: Chunked Prefill
   → Split long prompts into chunks (256 tokens)
-  → Fair scheduling (6-8× latency reduction)
+  → Fair scheduling prevents starvation
   → Interleave with decode batches
 
 Phase 4: Radix Cache ⭐ THE KEY INNOVATION
@@ -293,14 +293,7 @@ def test_interleave_prefill_decode():
 
 **Performance Impact**:
 
-| Metric | Without Chunking | With Chunking |
-|--------|------------------|---------------|
-| Short request latency (p50) | 180ms | 22ms (8× better) |
-| Short request latency (p99) | 350ms | 48ms (7× better) |
-| Throughput penalty | 0% | 3-5% (small cost) |
-| Fairness | Poor (starvation) | Excellent (bounded wait) |
-
-Chunked prefill trades **3-5% throughput** for **7-8× latency improvement** on short requests—critical for interactive serving.
+Chunked prefill improves fairness by preventing long requests from blocking short ones. The round-robin scheduling ensures all requests make progress, eliminating starvation. This comes with a small throughput trade-off but dramatically improves user experience for interactive workloads where some requests need low latency.
 
 ## 16.17 Phase 4: Radix Cache - Automatic Prefix Sharing
 
@@ -1344,16 +1337,16 @@ requests = [
 ]
 ```
 
-**Performance Progression**:
+**Optimization Impact**:
 
-| Configuration | Tokens/Step | Steps | Total Time | Speedup |
-|---------------|-------------|-------|------------|---------|
-| Baseline (sequential) | 1.0 | 4,960 | 100% | 1× |
-| + Parallel batching | 8.5 | 584 | 11.8% | 8.5× |
-| + KV cache (paged) | 12.3 | 403 | 8.1% | 12.3× |
-| + Continuous batching | 18.2 | 272 | 5.5% | 18.2× |
-| + Radix cache (60% hit) | 28.7 | 173 | 3.5% | 28.7× |
-| **All optimizations** | **32.1** | **155** | **3.1%** | **32×** |
+Nano-serving demonstrates how each algorithmic technique contributes to serving efficiency:
+
+- **Parallel batching**: Processes multiple requests simultaneously rather than sequentially
+- **Paged KV cache**: Eliminates memory fragmentation that wastes GPU capacity
+- **Continuous batching**: Dynamically adds/removes requests to maintain high utilization
+- **Radix cache**: Reuses computation for shared prefixes when workloads exhibit overlap
+
+The effectiveness of each optimization depends on workload characteristics—batch sizes, prompt lengths, prefix overlap, and generation lengths all influence the relative impact.
 
 **Optimization Breakdown**:
 
@@ -1436,8 +1429,8 @@ Chapter 16 Part 3 completed nano-serving with advanced algorithmic optimizations
 
 **Phase 3: Chunked Prefill**
 - Fair scheduling for long contexts
-- 7-8× latency reduction on short requests
-- Minimal throughput cost (3-5%)
+- Significantly reduces latency for short requests in mixed workloads
+- Small throughput trade-off for improved fairness
 
 **Phase 4: Radix Cache**
 - Automatic prefix detection via radix tree
@@ -1452,7 +1445,7 @@ Chapter 16 Part 3 completed nano-serving with advanced algorithmic optimizations
 
 **Phase 6: Complete Integration**
 - NanoServingEngine with simple API
-- 67 comprehensive tests validating all components
+- Multiple comprehensive tests validating all components
 - Educational implementation demonstrating core algorithms
 
 ## 16.8 From Education to Production: Real Inference Systems
