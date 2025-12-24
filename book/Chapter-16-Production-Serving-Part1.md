@@ -1341,117 +1341,24 @@ def production_serve(requests):
     return engine.generate(requests)
 ```
 
-**Speedup Breakdown** (100 requests, avg 300 tokens prompt, 50 tokens generation):
-
-| Optimization | Speedup | Cumulative |
-|--------------|---------|------------|
-| Baseline | 1.0× | 1.0× |
-| + KV Caching | 10× | 10× |
-| + Continuous Batching | 2.5× | 25× |
-| + Paged Memory | 1.5× | 37.5× |
-| + Radix Cache (60% hit) | 2.6× | 97.5× |
-| + Chunked Prefill | 1.0× | 97.5× (no throughput cost) |
-| **Total** | **~100×** | **~100×** |
-
-**Individual Technique Impact**:
-
-```
-1. KV Caching (10×):
-   - Eliminates O(N²) recomputation
-   - Applies to all requests
-   - No memory overhead with paging
-
-2. Continuous Batching (2.5×):
-   - GPU utilization: 33% → 82%
-   - Dynamic batch size maintains high throughput
-   - Immediate benefit as requests finish
-
-3. Paged Memory (1.5×):
-   - Memory efficiency: 29% → 97% (3.3× more capacity)
-   - Capacity: 256 requests → 845 requests (3.3×)
-   - Throughput scales with capacity
-
-4. Radix Cache (2.6×):
-   - Cache hit rate: 60% (realistic workload)
-   - Computation reduction: 60% on prefill
-   - Memory saving: 60% fewer pages
-
-5. Chunked Prefill (1.0×):
-   - Throughput: -5% (small cost)
-   - Latency: -83% (6× better for short requests)
-   - Fairness: essential for interactive serving
-```
-
-**Realistic Workload** (chatbot with system prompt):
-
-```
-Setup:
-  - System prompt: 800 tokens (reused across requests)
-  - User queries: 50-200 tokens (avg 100)
-  - Generations: 50-300 tokens (avg 150)
-  - Concurrency: 100 requests/sec
-
-Without Radix Cache:
-  Prefill compute: 900 tokens × 100 req/sec = 90,000 tok/sec
-  Decode compute: 150 tokens × 100 req/sec = 15,000 tok/sec
-  Total: 105,000 tok/sec
-
-With Radix Cache (80% hit rate on system prompt):
-  Prefill compute: (800 × 0.2 + 100) × 100 = 26,000 tok/sec
-  Decode compute: 15,000 tok/sec
-  Total: 41,000 tok/sec
-  Reduction: 61% (2.6× speedup)
-```
-
-**Memory Capacity**:
-
-```
-GPU: 40 GB A100
-
-Without Paging (contiguous allocation, max_seq_len=2048):
-  Per request: 2048 tokens × 36 KB/token = 73.7 MB
-  Capacity: 40 GB / 73.7 MB = 542 requests
-
-With Paging (page_size=16, avg usage 350 tokens):
-  Per request: 350 tokens × 36 KB/token = 12.6 MB
-  Capacity: 40 GB / 12.6 MB = 3,174 requests
-  Improvement: 5.9×
-```
-
-Paged memory unlocks **6-10× capacity**, enabling higher concurrency and throughput.
-
 ## 16.9 Summary
 
-Chapter 16 Part 1 introduced production LLM serving framework architecture—the scheduling algorithms, memory management, and system design patterns that power real-world systems like vLLM, SGLang, and TensorRT-LLM.
+Chapter 16 Part 1 explored the algorithms and system design patterns underlying production LLM serving systems. Understanding these techniques—developed and refined by systems like vLLM, SGLang, and TensorRT-LLM—provides the conceptual foundation for building scalable inference infrastructure.
 
-**Core Techniques**:
+**Request Lifecycle Management**. Production serving systems model each user interaction as a request object that transitions through distinct states: waiting in a queue, actively running with allocated resources, and finished after generating the complete response. This abstraction encapsulates prompt text, generation parameters, accumulated output tokens, and crucially, the KV cache state. Clean lifecycle management enables sophisticated scheduling policies that balance latency, throughput, and resource utilization.
 
-1. **Request Lifecycle**: Abstraction managing user tasks through waiting → running → finished states with KV cache tracking
-2. **Paged KV Cache**: Virtual memory for attention cache achieving 6-10× memory efficiency through fixed-size pages and page tables
-3. **Continuous Batching**: Dynamic request scheduling that maximizes GPU utilization by adding/removing requests every iteration (2.5× throughput)
-4. **Radix Cache**: Automatic prefix sharing via radix tree enabling 2-3× speedup on workloads with common prefixes (40-60% hit rate)
-5. **Chunked Prefill**: Fair scheduling splitting long prompts into chunks, reducing short-request latency by 6-8× with minimal throughput cost
-6. **Prefill-Decode Separation**: Specialized optimization for each phase leveraging their different compute vs bandwidth bottlenecks
+**Paged KV Cache**. The key innovation enabling efficient memory management is treating attention cache like operating system virtual memory. Rather than allocating contiguous memory for each request's maximum possible length, paged systems allocate small fixed-size blocks on demand. A page table maps logical token positions to physical memory blocks, allowing non-contiguous storage. This eliminates internal fragmentation from over-allocation and external fragmentation from varied-length requests, substantially increasing the number of concurrent requests the system can handle.
 
-**Performance Impact** (combined):
-- **100-1000× speedup** vs naive sequential serving
-- **6-10× memory capacity** through paging
-- **2-3× additional speedup** via radix cache (prefix sharing)
-- **6-8× latency reduction** for short requests (chunked prefill)
+**Continuous Batching**. Traditional serving processes one batch of requests to completion before starting the next. Continuous batching dynamically adds newly arrived requests and removes finished requests every generation step, maintaining high hardware utilization regardless of workload patterns. This scheduling approach naturally handles the reality that requests finish at different times, preventing idle compute resources while some requests complete their generations.
 
-**Production Architecture**:
-- Multi-component system: API server, tokenizer/detokenizer, scheduler, execution engine
-- Request pool management coordinating waiting, running, and finished requests
-- Radix cache with LRU eviction balancing hit rate and memory
-- Adaptive scheduling responding to load conditions
+**Radix Cache for Prefix Sharing**. Many real-world workloads exhibit significant prefix overlap—chat systems use common system prompts, RAG applications share retrieval context, and multi-turn conversations reuse earlier exchanges. Radix tree data structures automatically detect these shared prefixes, storing computed KV cache entries once and reusing them across requests. This prefix caching can dramatically reduce redundant computation on workloads with high sharing ratios, though effectiveness varies with application patterns.
 
-**Looking Ahead**. Chapter 16 Part 2 demonstrates our nano-serving implementation combining these concepts with MLIR compiler acceleration. We'll see how:
+**Chunked Prefill for Fairness**. When processing a mix of short and long prompts, prefilling long sequences monopolizes compute resources, starving short requests that could generate tokens quickly. Chunked prefill splits long prefill operations into smaller chunks, interleaving them with decode steps for running requests. This ensures short requests aren't stuck waiting behind thousand-token prefills, improving perceived latency for interactive applications. The token budget per iteration balances fairness against prefill throughput efficiency.
 
-- **Python framework** implements scheduling logic (request pool, radix cache, continuous batcher)
-- **C++/MLIR compiler** implements model execution (KV cache pool, forward passes, JIT compilation)
-- **Integration** coordinates Python scheduling with C++ execution through efficient interfaces
-- **Testing** validates each component independently and end-to-end throughput
+**Prefill-Decode Optimization**. Prefill and decode phases have fundamentally different performance characteristics. Prefill is compute-bound—processing many tokens in parallel fully utilizes GPU arithmetic units. Decode is memory bandwidth-bound—generating one token per request involves loading large weight matrices for limited computation. Recognizing this distinction allows specialized optimizations: maximize batch size during decode for bandwidth amortization, but limit prefill batch size to avoid overwhelming memory subsystems. Production systems tune these parameters per hardware platform.
 
-The concepts in Part 1 are portable—they apply to any serving system (PyTorch, TensorFlow, JAX). Part 2 demonstrates MLIR's unique advantages: JIT compilation for custom operations, efficient memory management, and seamless Python/C++ integration. Together, these chapters complete the book's journey from MLIR fundamentals (Chapter 1) to production serving (Chapter 16).
+**Production System Architecture**. Real serving systems compose multiple specialized components: API servers handling HTTP requests, tokenizers converting text to token IDs, schedulers managing the request pool, execution engines running the compiled model, and caching layers for computed results. These components communicate through well-defined interfaces, enabling independent optimization and replacement. The scheduler coordinates waiting and running request pools, the execution engine handles model forward passes with paged KV cache, and the radix cache tracks prefix sharing opportunities across the workload.
 
-Modern LLM serving is algorithmic optimization (KV caching, radix cache), systems engineering (batching, scheduling, memory management), and careful implementation (kernel fusion, tensor parallelism). Understanding these layers—from high-level scheduling to low-level memory access—empowers you to build and optimize production ML systems. Chapter 16 Part 1 provided the conceptual foundation; Part 2 brings it to life with working code.
+**Looking to Part 2**. The next chapter demonstrates these concepts through nano-serving, an educational implementation combining Python orchestration with MLIR-compiled execution. We'll see how high-level scheduling logic in Python coordinates with performance-critical model execution in C++, leveraging MLIR's JIT compilation and clean interoperability. The implementation validates these algorithms work as described and provides a foundation for understanding production systems' source code.
+
+Modern LLM serving combines algorithmic innovation (paged memory, prefix caching), systems engineering (scheduling, resource management), and implementation discipline (testing, interfaces, incremental development). The techniques in this chapter generalize beyond language models to any sequential generation task requiring efficient batching and memory management. Part 1 established the conceptual framework; Part 2 brings these ideas to life with working code that you can experiment with, modify, and extend.

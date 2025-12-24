@@ -4,7 +4,7 @@ Chapters 8 and 9 taught dialect design: building high-level operations (the `nn`
 
 This chapter explores MLIR's **optimization infrastructure**: passes that transform IR to execute faster while preserving semantics. We'll examine Linalg fusion (merging adjacent operations to reduce memory traffic), loop-invariant code motion (hoisting computations out of loops), and vectorization (converting scalar loops to SIMD operations using the `vector` dialect). Unlike Chapters 8-9 where we built a dialect from scratch, Chapter 10 reuses the `nn` dialect unchanged—operations stay the same, Python API stays the same, but the compilation pipeline adds optimization passes between high-level lowering and final code generation. This separation of concerns mirrors production systems: stable user-facing APIs, evolving backend optimizations.
 
-The chapter progresses from understanding why optimizations matter (performance gaps between naive and optimized code), through MLIR's pass infrastructure (how passes compose and interact), to specific optimization techniques (fusion algorithms, vectorization patterns), ending with performance measurement showing 3-5× speedups on realistic workloads. We'll see that MLIR's multi-level IR philosophy enables optimizations at different abstraction levels—Linalg fusion works on structured operations, loop optimizations work on SCF dialect, vectorization works on affine loops—each level providing optimization opportunities unavailable at others. By the end, you'll understand not just how to write optimized pipelines, but **why** MLIR's architecture makes sophisticated optimizations composable and maintainable.
+The chapter progresses from understanding why optimizations matter (performance gaps between naive and optimized code), through MLIR's pass infrastructure (how passes compose and interact), to specific optimization techniques (fusion algorithms, vectorization patterns). We'll see that MLIR's multi-level IR philosophy enables optimizations at different abstraction levels—Linalg fusion works on structured operations, loop optimizations work on SCF dialect, vectorization works on affine loops—each level providing optimization opportunities unavailable at others. By the end, you'll understand not just how to write optimized pipelines, but **why** MLIR's architecture makes sophisticated optimizations composable and maintainable.
 
 ## 10.1 Why Optimizations Matter: The Performance Gap
 
@@ -31,7 +31,7 @@ This performs:
 - **16,384 writes** (fused results)
 - **Total**: 16,384 memory operations
 
-The optimized version does **3× less memory traffic**. On modern CPUs where memory bandwidth often bottlenecks computation, this translates directly to runtime speedup. But the performance story deepens: the optimized code also enables vectorization (processing 8 elements per instruction with AVX2), provides better cache locality (data accessed once stays in cache for ReLU computation), and reduces allocation overhead (one malloc instead of two). Combined, these optimizations deliver **3-5× end-to-end speedup** on realistic workloads.
+The optimized version performs significantly less memory traffic. On modern CPUs where memory bandwidth often bottlenecks computation, reducing memory operations improves performance. The optimized code also enables vectorization (processing multiple elements per instruction with SIMD), provides better cache locality (data accessed once stays in cache for ReLU computation), and reduces allocation overhead (one malloc instead of two). These optimizations combine to substantially improve execution efficiency.
 
 **Why Manual Optimization Doesn't Scale**. You might think "just write fused kernels manually"—implement `matmul_relu_fused()` by hand. This works for small operator sets but fails at scale:
 
@@ -276,7 +276,7 @@ scf.for %i = %c0 to %c128 step %c1 {
 }
 ```
 
-Now the division executes once instead of 16,384 times. For expensive operations (division, transcendentals like `exp`, `log`), hoisting provides substantial speedup.
+Now the division executes once instead of 16,384 times. For expensive operations (division, transcendentals like `exp`, `log`), hoisting eliminates redundant computation.
 
 **LICM's Safety Requirements**. Like fusion, naive hoisting breaks correctness. Consider:
 
@@ -344,7 +344,7 @@ Chapter 10's pipeline exploits these interactions by ordering passes to maximize
 
 ## 10.5 Vectorization: Exploiting SIMD Hardware
 
-Modern CPUs provide **Single Instruction, Multiple Data (SIMD)** capabilities: instructions that operate on vectors of data (4, 8, 16 elements simultaneously) instead of scalars. AVX2 processes 8 floats per instruction; AVX-512 processes 16. Utilizing SIMD can provide near-linear speedups (8× with AVX2, 16× with AVX-512) for data-parallel computations—which ML workloads overwhelmingly are. MLIR's `vector` dialect provides portable SIMD abstraction, generating architecture-specific instructions automatically.
+Modern CPUs provide **Single Instruction, Multiple Data (SIMD)** capabilities: instructions that operate on vectors of data (4, 8, 16 elements simultaneously) instead of scalars. AVX2 processes 8 floats per instruction; AVX-512 processes 16. Utilizing SIMD can significantly accelerate data-parallel computations—which ML workloads overwhelmingly are. MLIR's `vector` dialect provides portable SIMD abstraction, generating architecture-specific instructions automatically.
 
 **The Vectorization Opportunity**. After LICM optimization, our normalization example contains:
 
@@ -372,7 +372,7 @@ scf.for %i = %c0 to %c128 step %c1 {
 }
 ```
 
-The loop now steps by 8, loads 8 elements at once into a vector register, multiplies the entire vector by the broadcasted scale, and stores 8 results. This reduces iterations from 128 to 16 (8× reduction), and each iteration does 8× more work. Ideally, 8× speedup—in practice, 5-7× is typical due to memory bandwidth and overhead.
+The loop now steps by 8, loads 8 elements at once into a vector register, multiplies the entire vector by the broadcasted scale, and stores 8 results. This reduces iterations from 128 to 16, with each iteration processing 8 elements. The SIMD instructions enable substantial performance improvements by exploiting data parallelism, though actual gains depend on memory bandwidth and other system factors.
 
 **The Vector Dialect**. MLIR's `vector` dialect provides hardware-independent SIMD operations:
 
@@ -494,13 +494,7 @@ speedup = time_unopt / time_opt
 print(f"Vectorization speedup: {speedup:.2f}×")
 ```
 
-On typical ML workloads (matmul chains, convolutions), Chapter 10's vectorization provides 3-5× speedup compared to scalar code. The exact speedup depends on:
-
-- **Operation type**: Memory-bound operations (element-wise) see less benefit than compute-bound (reductions)
-- **Data size**: Larger data amortizes vectorization overhead better
-- **Hardware**: AVX-512 (16-wide) beats AVX2 (8-wide) beats SSE (4-wide)
-
-But vectorization is rarely the only optimization applied—it combines with fusion and LICM for multiplicative benefits. Measuring end-to-end speedup (Section 10.7) captures all optimizations' combined impact.
+The exact performance impact depends on several factors: memory-bound operations (element-wise) typically see less benefit than compute-bound operations (reductions), larger data sizes amortize vectorization overhead better, and hardware capabilities vary significantly (AVX-512 provides 16-wide SIMD, AVX2 provides 8-wide, SSE provides 4-wide). Vectorization rarely applies alone—it combines with fusion and LICM for multiplicative benefits.
 
 ## 10.6 The Complete Optimization Pipeline
 
@@ -684,18 +678,18 @@ When debugging, verify invariants at each stage using `-mlir-print-ir-after-all`
 
 This prints IR after every pass. If Stage 2 should eliminate intermediate buffers but doesn't, inspect IR after `LinalgElementwiseOpFusionPass` to see what fusion missed and why. Systematic debugging through pipeline stages beats guessing.
 
-## 10.7 Performance Measurement and Analysis
+## 10.7 Understanding Optimization Effects
 
-Optimizations mean nothing without measurement. This section demonstrates how to benchmark Chapter 10's optimized pipeline against Chapter 9's baseline, quantify speedups, and understand where improvements come from. We'll also discuss performance variability, profiling tools, and the limits of micro-benchmarks.
+Optimization passes transform code to execute more efficiently while preserving semantics. This section discusses how to think about optimization effectiveness, what to look for when examining transformed IR, and the principles that guide performance engineering in compilers.
 
-**Setting Up Fair Comparisons**. Comparing optimized vs. unoptimized code requires care:
+**Measuring Performance**. When developing optimizations, systematic measurement requires careful methodology:
 
 1. **Same input data**: Use identical test cases to eliminate data-dependent variations
 2. **Warm-up runs**: First execution hits cold caches and JIT compilation; discard these measurements
-3. **Multiple trials**: Performance varies due to system noise; average across 10+ runs
-4. **Stable environment**: Disable CPU frequency scaling, close background applications, pin to specific cores if possible
+3. **Multiple trials**: Performance varies due to system noise; average across many runs to reduce variance
+4. **Stable environment**: Minimize interference from CPU frequency scaling, background applications, and other system activity
 
-Chapter 10's `test_jit.py` implements these practices:
+Chapter 10's `test_jit.py` demonstrates these practices:
 
 ```python
 def benchmark_compiler(compiler, input_data, num_trials=20, warmup=5):
@@ -720,27 +714,9 @@ def benchmark_compiler(compiler, input_data, num_trials=20, warmup=5):
     }
 ```
 
-The warmup ensures JIT compilation happens outside measurements. Multiple trials capture variability (standard deviation indicates measurement reliability).
+The warmup ensures JIT compilation happens outside measurements. Multiple trials capture variability, with standard deviation indicating measurement reliability.
 
-**Benchmark Results**. Running on a typical development machine (Intel i7, AVX2, 16GB RAM) with 1024×1024 matrix inputs:
-
-```
-| Operation        | Unoptimized | Optimized | Speedup |
-|------------------|-------------|-----------|---------|
-| Matmul           | 45.2 ms     | 12.3 ms   | 3.67×   |
-| Matmul + ReLU    | 52.1 ms     | 13.1 ms   | 3.98×   |
-| 3-Layer FFN      | 138.4 ms    | 31.7 ms   | 4.37×   |
-| BatchNorm + Act  | 8.9 ms      | 2.1 ms    | 4.24×   |
-```
-
-Speedups range from 3.67× (matmul alone) to 4.37× (three-layer feedforward network). The variance makes sense:
-
-- **Matmul** is compute-bound (O(n³) operations); vectorization helps but memory bandwidth limits gains
-- **Matmul + ReLU** benefits from fusion (eliminates matmul output buffer) **and** vectorization (ReLU is trivially parallelizable)
-- **3-Layer FFN** (three matmuls + activations) gets maximum benefit: fusion eliminates multiple intermediate buffers, vectorization accelerates element-wise operations, LICM hoists activation scalars
-- **BatchNorm + Activation** is memory-bound element-wise; fusion provides largest relative benefit
-
-**Where Does Speedup Come From?** To attribute speedup to specific optimizations, run ablation studies—disable optimizations individually:
+**Understanding Optimization Impact**. To understand which optimizations contribute most, run ablation studies—disable optimizations individually and compare results:
 
 ```python
 # Baseline: No optimizations
@@ -769,26 +745,19 @@ pm_full = PassManager()
 # ... Chapter 10's full pipeline ...
 ```
 
-Results for 3-layer FFN:
+This systematic approach reveals which optimizations provide the most benefit for specific workloads and helps identify optimization interactions—where one optimization enables another to be more effective.
 
-```
-| Pipeline           | Time    | Speedup vs Baseline |
-|--------------------|---------|---------------------|
-| Baseline           | 138.4ms | 1.00×               |
-| Fusion only        | 89.2ms  | 1.55×               |
-| Fusion + LICM      | 76.8ms  | 1.80×               |
-| Full (+ Vector)    | 31.7ms  | 4.37×               |
-```
+**What to Observe**. When examining optimization effects, look for:
 
-Observations:
+**Memory Operations**: Fusion should eliminate intermediate buffers. Count memory allocation operations in the IR before and after fusion passes. Fewer allocations and reduced load/store operations indicate successful fusion.
 
-- **Fusion** provides moderate improvement (1.55×) by reducing memory operations
-- **LICM** adds incremental benefit (1.80× total) by eliminating recomputation
-- **Vectorization** delivers the largest gain (4.37× total) by exploiting SIMD hardware
+**Loop Structure**: LICM should hoist invariant computations outside loops. Examine loop bodies—computations not depending on loop iterators should appear before loop entry.
 
-This demonstrates that optimizations are multiplicative, not additive: 1.55 × 1.16 × 2.43 ≈ 4.37. Fusion enables better vectorization (fewer memory operations mean more time in vectorizable computation), LICM simplifies loops for vectorization, and vectorization leverages the cleaned-up code. The whole exceeds the sum of parts.
+**Vectorization**: Optimized code should use vector operations where possible. Look for `vector.load`, `vector.store`, and vector arithmetic operations in the IR, indicating SIMD utilization.
 
-**Profiling for Deeper Insights**. Micro-benchmarks show end-to-end speedup but not where time is spent. Use profiling tools for detailed analysis:
+**Multiplicative Effects**: Optimizations often enable each other. Fusion creates larger basic blocks that vectorization can process more effectively. LICM simplifies loop bodies, making vectorization patterns easier to match. The combined effect exceeds individual contributions.
+
+**Profiling for Insights**. Beyond timing, profiling tools provide detailed analysis:
 
 ```bash
 # Linux perf for CPU profiling
@@ -800,43 +769,19 @@ valgrind --tool=cachegrind ./test_jit
 cg_annotate cachegrind.out.<pid>
 ```
 
-Profiling Chapter 10's optimized code (3-layer FFN) shows:
+Profiling reveals where time is spent during execution, identifying bottlenecks that deserve optimization attention. For typical ML operations like matmul, expect compute-intensive work to dominate. For element-wise operations, memory bandwidth becomes the bottleneck.
 
-- **75% time in matmul**: Expected—O(n³) dominates O(n²) activations
-- **15% time in memory operations**: Significantly reduced from 40% in unoptimized code (fusion working)
-- **8% time in activations**: Small but measurable (ReLU, etc.)
-- **2% time in overhead**: JIT compilation, memory management
+**When Optimizations Don't Help**. Not all workloads benefit equally from optimization. Small problem sizes may not justify optimization overhead—vectorization setup costs and remainder loop handling can exceed benefits when data fits easily in registers. Production compilers use **cost models** to estimate whether optimization benefits exceed costs, applying transformations selectively based on problem characteristics.
 
-The reduction in memory operation time (40% → 15%) confirms fusion's effectiveness. Further optimization would target matmul (tiling, better vectorization, multi-threading) rather than element-wise operations (already near-optimal).
+**The Performance Engineering Mindset**. Key principles from this section:
 
-**Understanding Performance Variability**. Multiple trials show variance:
+1. **Measure systematically**: Use proper benchmarking methodology with warmup, multiple trials, and controlled environments
+2. **Understand your bottleneck**: Memory-bound and compute-bound code require different optimization strategies
+3. **Optimization interactions matter**: Small improvements compound when optimizations enable each other
+4. **Context is crucial**: Know your typical workload—optimizations effective for large tensors may hurt small ones
+5. **Inspect transformed IR**: Understanding what optimizations actually do to code guides effective pipeline construction
 
-```
-Unoptimized FFN: 138.4ms ± 3.2ms (std dev)
-Optimized FFN:   31.7ms ± 0.8ms (std dev)
-```
-
-The optimized version has **lower absolute and relative variance** (2.5% vs 2.3% coefficient of variation). Why? Fewer memory operations mean less sensitivity to cache state, DRAM refresh cycles, and system background activity. Optimized code is not just faster but more predictable—important for production systems with latency requirements.
-
-**When Optimizations Don't Help**. Not all workloads benefit equally. Tiny matrices (16×16):
-
-```
-| Operation    | Unoptimized | Optimized | Speedup |
-|--------------|-------------|-----------|---------|
-| Matmul 16×16 | 0.18 ms     | 0.21 ms   | 0.86×   |
-```
-
-The optimized version is **slower**! Why? Optimization overhead (vectorization setup, remainder loops, extra memory for alignment) exceeds benefits for small data. The "optimization tax" matters when computation cost is tiny. Production compilers use **cost models**: estimate benefit before applying optimizations, skip optimizations when cost exceeds benefit. Chapter 10's simple pipeline optimizes always—good for typical ML workloads (large tensors) but suboptimal for edge cases.
-
-**The Performance Mindset**. Key lessons from this section:
-
-1. **Measure, don't assume**: Intuition about performance is often wrong; profile and benchmark
-2. **Understand your bottleneck**: Optimize memory-bound code differently than compute-bound code
-3. **Optimization is multiplicative**: Small improvements compound; holistic pipelines beat single-pass optimizations
-4. **Variability matters**: Report standard deviation, not just mean; understand why variance exists
-5. **Context matters**: Optimizations that help large workloads might hurt small ones; know your typical use case
-
-These principles guide production compiler development. Chapters 11-14 apply them to increasingly complex ML operations (attention, transformers, serving), demonstrating how performance engineering scales from simple matmuls to modern deep learning.
+These principles apply throughout compiler development, from simple operations in Chapter 10 to complex attention mechanisms in Chapters 11-14.
 
 ## 10.8 Topological Traversal: Ordering Computation Graphs
 
@@ -907,11 +852,6 @@ The algorithm works by repeatedly selecting nodes with no remaining dependencies
 **C++ Implementation**. Here's a practical implementation for computation graphs:
 
 ```cpp
-#include <vector>
-#include <queue>
-#include <unordered_map>
-#include <unordered_set>
-
 struct GraphNode {
   int id;
   std::string op_type;
@@ -1083,7 +1023,7 @@ Topological sorting is a fundamental algorithm every compiler engineer must unde
 
 ## 10.9 Summary
 
-This chapter explored MLIR's optimization infrastructure through three core techniques—Linalg fusion (reduces memory traffic), loop-invariant code motion (reduces redundant computation), and vectorization (exploits SIMD hardware)—delivering 3-5× speedups on typical ML workloads. We also examined topological sorting, the fundamental algorithm enabling correct computation graph execution.
+This chapter explored MLIR's optimization infrastructure through three core techniques—Linalg fusion (reduces memory traffic), loop-invariant code motion (reduces redundant computation), and vectorization (exploits SIMD hardware). We also examined topological sorting, the fundamental algorithm enabling correct computation graph execution.
 
 Key insights:
 

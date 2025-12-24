@@ -1163,44 +1163,16 @@ def benchmark_phase2():
 
 ## 16.15 Summary and Looking Ahead
 
-Chapter 16 Part 2 built the **core components** of nano-serving:
+Chapter 16 Part 2 built the core infrastructure components that enable sophisticated LLM serving, demonstrating how production systems separate concerns between high-level orchestration and performance-critical execution.
 
-**Phase 0: Foundation**
-- Request/Batch abstractions for tracking user tasks
-- Prefill vs decode batch construction
-- 9 tests validating data model
+**Foundation Components**. We established the data model with Request and Batch abstractions that track user tasks through their lifecycle, distinguishing between prefill batches (computing initial KV cache from prompts) and decode batches (generating tokens autoregressively). These abstractions hide the complexity of multi-request coordination behind clean interfaces, making the scheduler implementation straightforward.
 
-**Phase 1: Memory Management**
-- C++ KV cache pool with paged allocation
-- Pybind11 bindings exposing C++ to Python
-- 6-10× memory efficiency vs contiguous allocation
-- 8 tests validating memory operations
+**Memory Management**. The C++ KV cache pool implements paged allocation, allowing non-contiguous memory blocks to serve each request's cache needs. This eliminates the fragmentation inherent in contiguous allocation schemes, where memory must be pre-allocated for maximum possible sequence length. Pybind11 bindings expose the C++ memory pool to Python, enabling high-level code to allocate and manage pages without sacrificing performance. The page table indirection adds minimal overhead compared to the memory savings from reduced fragmentation.
 
-**Phase 2: Scheduling**
-- PrefillManager (FCFS with token budget)
-- DecodeManager (batch all running requests)
-- ModelExecutor wrapping MLIR-compiled GPT
-- 11 tests validating scheduling logic
+**Scheduling Infrastructure**. The PrefillManager implements FCFS scheduling with token budget constraints, preventing long prefill operations from monopolizing compute resources. The DecodeManager batches all running requests together for each generation step, maximizing hardware utilization during the decode phase. The ModelExecutor wraps the MLIR-compiled GPT model, providing a unified forward() interface that handles both prefill and decode execution paths. This separation of concerns allows each component to optimize for its specific workload pattern.
 
-**Key Insights**:
+**Architectural Patterns**. The Python-C++ language split reflects a fundamental tradeoff in ML systems engineering. Python provides flexibility for complex scheduling logic, request lifecycle management, and algorithm experimentation. C++ delivers performance for memory-intensive operations and numerical computation. The clean interface boundaries—Batch abstractions, executor APIs, memory pool interfaces—make this split maintainable. Each component can be tested independently before integration, following standard software engineering practices.
 
-1. **Language Split**: Python for high-level logic (scheduling, request management), C++ for performance (memory, computation)
-2. **Clean Interfaces**: Batch abstraction hides complexity, executors provide simple forward() API
-3. **Testability**: Each component independently tested before integration
-4. **Incremental Development**: Build foundational pieces before advanced features
+**Looking to Part 3**. The infrastructure established here enables advanced serving techniques. Chunked prefill will interleave long prefill operations with decode steps, ensuring fairness when requests have vastly different prompt lengths. Radix cache will automatically detect shared prefixes across requests, eliminating redundant computation when multiple users submit prompts with common beginnings (like system prompts in chat applications). Continuous batching will allow dynamic request addition and removal, maintaining high throughput even as workload changes. The NanoServingEngine will integrate all components into a cohesive API suitable for demonstration and teaching.
 
-**Current Capabilities**:
-- Process multiple requests in parallel
-- Efficient memory management (paged KV cache)
-- Separate prefill/decode optimization
-- ~10× speedup vs naive sequential serving
-
-**Still Missing** (Part 3 will add):
-- Chunked prefill (fair scheduling for long contexts)
-- Radix cache (automatic prefix sharing, 2-3× speedup)
-- Continuous batching (dynamic request addition/removal)
-- Complete NanoServingEngine (all features integrated)
-
-Part 2 established the infrastructure. Part 3 adds the algorithmic innovations that enable production-scale serving—radix cache for prefix reuse, chunked prefill for fairness, and continuous batching for maximum throughput. Together, these techniques achieve 100-500× speedup over naive implementations.
-
-The Python-C++ integration pattern demonstrated here generalizes beyond LLM serving. Any ML system with complex scheduling logic (reinforcement learning, large-scale training, multi-task inference) benefits from this architecture: high-level orchestration in Python, performance-critical execution in compiled code. MLIR's JIT compilation and clean C++ interop make this integration seamless—the best of both worlds.
+This progression from basic infrastructure to advanced optimizations mirrors real ML systems development. Build solid foundations—data models, memory management, basic scheduling—before adding sophisticated features. Test components independently before integration. Separate high-level logic from performance-critical code. These patterns apply beyond LLM serving to any ML system requiring complex orchestration: reinforcement learning environments, distributed training coordinators, or multi-task inference servers. MLIR's JIT compilation and clean C++ interoperability enable this architectural approach, providing both Python's expressiveness and C++'s performance where each matters most.
