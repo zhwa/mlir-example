@@ -55,6 +55,10 @@ Before diving into dynamic shapes, we need to understand how MLIR represents mul
 
 The tensor dialect emphasizes immutable values: operations create new tensors rather than modifying existing ones, following the same SSA semantics as integers or floats—once defined, a tensor value never changes. This immutability eliminates aliasing concerns entirely; there's no question about whether two tensor values point to the same memory because they're separate values in the dataflow graph. As a result, tensors are extremely optimization-friendly—the compiler can aggressively reorder, fuse, and eliminate operations without worrying about hidden side effects or memory dependencies.
 
+**Connection to Chapter 1's SSA Semantics**: Remember from Chapter 1 that SSA (Static Single Assignment) means each *value* is assigned exactly once? Tensors embody this principle perfectly—they represent *mathematical values* with no memory location. A tensor like `%t0 : tensor<8x32xf32>` is a value in the SSA graph, just like `%x : i32` is a value. When you "modify" a tensor with `tensor.insert`, you're not mutating memory; you're creating a new value. This is pure SSA.
+
+Contrast this with memrefs, which represent *memory references*. A memref like `%m0 : memref<8x32xf32>` is also an SSA value (the *pointer* is assigned once), but the data it points to is mutable—`memref.store` can write to the same location multiple times. This is exactly the distinction we emphasized in Chapter 1: SSA for pointers, not for the memory contents. Tensors take SSA to its logical conclusion by eliminating memory entirely at the high level.
+
 **Example operations:**
 
 ```mlir
@@ -338,6 +342,8 @@ This is why operations like `memref.subview` or `memref.transpose` can be **zero
 When we write code in high-level languages (Python, C++, MLIR), we think in terms of functions, objects, and data structures. But when that code actually runs, it's compiled to machine instructions, and function calls become very concrete: arguments are placed in specific CPU registers or stack locations, the program counter jumps to a memory address, and results are returned in designated registers. The **ABI** is the specification that defines these low-level details—how to pass arguments, where return values go, which registers the caller vs callee must preserve, how the stack is organized, and so on.
 
 Different languages and platforms have different ABIs. The **C ABI** is particularly important because it's the "lingua franca" of systems programming—most languages can call C functions and be called by C. When we compile MLIR to machine code and want to call it from Python (or any other language), we need to follow the C ABI conventions so the two sides agree on how to pass data.
+
+**Connection to Chapter 1**: Remember the "Python ↔ C++ Boundary" section in Chapter 1? This is the same boundary, but now we understand what crosses it: not just raw pointers, but complex memref descriptor structures. The ABI is the contract that makes this crossing possible.
 
 This matters especially for dynamic shapes because the memref descriptor isn't a simple C type—it's a structure with multiple fields (pointers, sizes, strides). The ABI determines exactly how this structure is "flattened" into function arguments. Does it get passed as a pointer to a struct? As individual arguments? In registers or on the stack? MLIR's lowering passes make these decisions, and understanding the ABI helps us understand what's happening under the hood.
 
@@ -697,7 +703,11 @@ func.func @compute(%x: tensor<?x?xf32>, %y: tensor<?x?xf32>) -> tensor<?x?xf32> 
 }
 ```
 
-Each operation produces a new tensor value. The question bufferization answers: **Where do these tensors actually live in memory?** The bufferization pass:
+Each operation produces a new tensor value. The question bufferization answers: **Where do these tensors actually live in memory?** 
+
+**Connection to Chapter 1's Output Buffer Pattern**: Remember the "output buffer pattern" we introduced in Chapter 1, where functions take pre-allocated output memrefs as parameters? Bufferization is the transformation that converts functional-style tensor operations (which return new values) into imperative-style memref operations (which write to output buffers). This is how `%result = linalg.add(%a, %b)` (tensor version) becomes `linalg.add ins(%a, %b) outs(%result)` (memref version). The bufferization pass determines allocation strategies and inserts the output buffer pattern automatically.
+
+The bufferization pass:
 
 1. **Analyzes tensor dataflow** to determine when values can share storage
 2. **Inserts memory allocations** for tensors that need new buffers

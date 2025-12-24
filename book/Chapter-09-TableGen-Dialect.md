@@ -1710,7 +1710,9 @@ The compilation overhead (C++ compilation time) amortizes across development: co
 
 **Looking Ahead**:
 
-Chapter 10 introduces optimization passes that transform NN dialect operations before lowering. We'll see how TableGen-defined operations integrate with MLIR's pass infrastructure, how to write analysis passes that query IR properties, and how to implement transformations that preserve semantics while improving performance.
+**Chapter 10: Optimization Patterns**. You now have production-quality dialect definitions using TableGen. But as your models grow, you'll notice repeated patterns in your lowering code—the same transformations applied again and again. Chapter 10 introduces **Declarative Rewrite Rules (DRR)**, which extend TableGen's declarative approach to optimizations. Instead of writing C++ pattern matchers, you'll express transformations in TableGen itself: "if you see pattern X, replace it with pattern Y." This makes optimizations composable, readable, and maintainable. The techniques we've learned (TableGen syntax, pattern matching, OpRewritePattern structure) directly transfer to DRR—you already know most of what you need.
+
+**Why This Matters**. Manual pattern writing becomes tedious at scale. Torch-MLIR has hundreds of patterns; writing each in C++ means thousands of lines of boilerplate. DRR reduces 30-line C++ patterns to 3-line TableGen declarations. Chapter 10 shows how to write these patterns, apply them in passes, and debug when they don't match. You'll also learn about **canonicalization** and **operation interfaces**—advanced features deferred from this chapter that enable dialect-independent optimization.
 
 Chapter 11 explores attention mechanisms, demonstrating complex operations with multiple operands, optional inputs, and stateful computations. TableGen's expressiveness shines here: complex operation signatures that would require hundreds of lines of C++ boilerplate reduce to tens of lines of declarative specifications.
 

@@ -100,7 +100,7 @@ x + y
 ```
 
 **SSA Form (Static Single Assignment)**  
-A key property: each variable is assigned exactly once. Instead of reusing variable names, we create new ones:
+A key property: each *value* (virtual register) is assigned exactly once. Instead of reusing variable names, we create new ones:
 
 **Non-SSA (bad):**
 ```
@@ -115,6 +115,8 @@ x1 = 1
 x2 = x1 + 2
 x3 = x2 * 3
 ```
+
+**CRITICAL DISTINCTION**: SSA applies to *values* (virtual registers like `%1`, `%2`), not to *memory*. In MLIR, a memref pointer like `%A` is immutable (SSA), but the data it points to is mutable—you can store different values into the same memory location. Think of SSA as "each pointer is assigned once," not "each memory cell is written once." This distinction becomes crucial in Chapters 2-4 when we work with buffers and understand why operations like `memref.store` can write to the same address multiple times.
 
 This makes optimizations easier because you know exactly where each value originates.
 
@@ -212,7 +214,7 @@ Each level uses appropriate abstractions for its optimization opportunities.
 
 ### The Dialect System
 
-A **dialect** is a collection of operations, types, and attributes forming a cohesive vocabulary—like a namespace for a specific domain or abstraction level. Think of dialects as organizing MLIR's operation vocabulary into logical categories, each serving a specific purpose in the compilation pipeline. MLIR ships with dozens of built-in dialects spanning different abstraction levels.
+A **dialect** collects operations, types, and attributes into a cohesive vocabulary—like a namespace for a specific domain or abstraction level. Dialects organize MLIR's operation vocabulary into logical categories, each serving a specific purpose in the compilation pipeline. MLIR ships with dozens of built-in dialects spanning different abstraction levels.
 
 At the **high level**, dialects like `tensor` provide immutable multi-dimensional arrays with functional semantics, `linalg` offers linear algebra operations (matrix multiply, convolution, transpose), and `tosa` (Tensor Operator Set Architecture) supplies neural network operations. These high-level dialects let you express what computation you want without specifying how to implement it.
 
@@ -262,15 +264,69 @@ With MLIR's composable approach, the landscape changes completely. You can use t
 
 This is why major projects have adopted MLIR. TensorFlow uses it for compilation and optimization. PyTorch 2.0 leverages Torch-MLIR for its compilation backend. JAX uses MLIR (via StableHLO) for its compilation path. Serving frameworks like TensorRT-LLM build on MLIR infrastructure. The ecosystem consolidation means that innovations in one project—a new optimization pass, support for new hardware, or improved analysis techniques—can benefit the entire community rather than remaining siloed in a single framework's codebase.
 
+Now that we understand MLIR's multi-level philosophy and dialect system, we need to answer a crucial question: how do high-level operations like `linalg.matmul` actually become executable machine code? This is where MLIR's transformation system comes in.
+
 ---
 
 ## 1.4 Lowering: The Heart of MLIR Compilation
 
-The central concept in MLIR is **progressive lowering**—transforming operations from high-level abstractions to low-level implementations through a series of **passes**.
+MLIR's central mechanism is **progressive lowering**—transforming operations from high-level abstractions to low-level implementations through a series of **passes**.
 
 ### What is a Pass?
 
 A pass is a transformation that walks the IR and rewrites it. Passes can **lower** operations by replacing high-level operations with lower-level equivalents. They can **optimize** code by eliminating redundancy, fusing operations to reduce memory traffic, or reordering computations for better performance. Passes can also **canonicalize** patterns by simplifying code to standard forms that make subsequent transformations easier.
+
+### The Progressive Lowering Pipeline: MLIR's Abstraction Ladder
+
+MLIR's power comes from maintaining operations at multiple abstraction levels simultaneously. Here's the complete picture of how high-level operations progressively transform into machine code:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    ABSTRACTION LADDER                           │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  HIGH LEVEL: "What to compute"                                 │
+│  ┌───────────────────────────────────────┐                     │
+│  │ Tensor/Linalg Dialect                 │                     │
+│  │  • linalg.matmul                      │                     │
+│  │  • tensor.extract, tensor.insert      │                     │
+│  │  Declarative: describes computation    │                     │
+│  └─────────────┬─────────────────────────┘                     │
+│                │ Linalg-to-Loops                               │
+│                ▼                                                │
+│  MID LEVEL: "How to iterate"                                   │
+│  ┌───────────────────────────────────────┐                     │
+│  │ SCF/Arith Dialect                     │                     │
+│  │  • scf.for (structured loops)         │                     │
+│  │  • arith.addf, arith.mulf             │                     │
+│  │  • memref.load, memref.store          │                     │
+│  │  Imperative: explicit control flow    │                     │
+│  └─────────────┬─────────────────────────┘                     │
+│                │ SCF-to-CF                                      │
+│                ▼                                                │
+│  LOW LEVEL: "Basic blocks & branches"                          │
+│  ┌───────────────────────────────────────┐                     │
+│  │ CF/LLVM Dialect                       │                     │
+│  │  • cf.br, cf.cond_br                  │                     │
+│  │  • llvm.load, llvm.store              │                     │
+│  │  Unstructured: just control flow      │                     │
+│  └─────────────┬─────────────────────────┘                     │
+│                │ LLVM Translation                               │
+│                ▼                                                │
+│  ┌───────────────────────────────────────┐                     │
+│  │ Machine Code (x86, ARM, etc.)         │                     │
+│  │  • mov, add, mul (registers)          │                     │
+│  │  • Memory addressing, jumps           │                     │
+│  └───────────────────────────────────────┘                     │
+│                                                                 │
+│  Each level enables appropriate optimizations:                 │
+│  • High: operation fusion, algebraic simplification            │
+│  • Mid: loop optimization, vectorization                       │
+│  • Low: register allocation, instruction scheduling            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Why Progressive?** Each abstraction level provides different optimization opportunities. High-level operations enable semantic optimizations ("these two matrix multiplies can fuse"). Mid-level loops enable cache optimizations ("tile this loop for L1 cache"). Low-level code enables hardware optimizations ("use SIMD instructions"). By lowering progressively, MLIR applies the right optimizations at the right level.
 
 ### The Lowering Pipeline
 
@@ -426,7 +482,11 @@ Let's break this down operation by operation. The function signature `func.func 
 
 We use memrefs instead of tensors here to keep the example simple. Memrefs directly map to memory buffers and require no additional transformation. Tensors, while more optimization-friendly, need a bufferization pass to convert them to memrefs before execution. Chapter 2 will introduce tensors, and Chapter 4 will dive deep into bufferization. For this introductory example, memrefs suffice.
 
-The function body contains three operations. First, `arith.constant 0.0` creates a constant zero value (from the `arith` dialect, which we'll see more of in Chapter 5). Second, `linalg.fill` initializes the output matrix C to all zeros—matrix multiply accumulates results, so we start with zero. Third, `linalg.matmul` performs the actual multiplication.
+**The Output Buffer Pattern**: Notice that our function takes the output matrix C as an *input parameter* rather than returning a new matrix. This "output buffer pattern" is common in systems programming: the caller allocates memory and passes it in, and the function writes results directly to that buffer. This avoids hidden allocations and gives the caller control over memory management. Python programmers coming from `result = a @ b` semantics might find this unfamiliar, but it's standard in C++ and critical for performance. Chapter 4 will show how this pattern connects to MLIR's bufferization system.
+
+The function body contains three operations. First, `arith.constant 0.0` creates a constant zero value (from the `arith` dialect, which we'll see more of in Chapter 5). Second, `linalg.fill` initializes the output matrix C to all zeros. Third, `linalg.matmul` performs the actual multiplication.
+
+**[CRITICAL - MUST UNDERSTAND]**: The `linalg.fill` operation is NOT optional—it's *mandatory*. Here's why: `linalg.matmul` uses *accumulation semantics*, meaning it performs `C += A @ B`, not `C = A @ B`. If you omit the fill operation, matmul will add results to whatever garbage values happen to be in memory, producing incorrect results. This is similar to how BLAS routines like `cblas_sgemm` require alpha/beta parameters to control accumulation. Always initialize output buffers before accumulation operations. We'll see this pattern repeatedly with linalg operations throughout the book.
 
 The key insight here is that `linalg.matmul` is declarative. It specifies *what* to compute (multiply matrices A and B, accumulate into C) without specifying *how*. There are no explicit loops, no SIMD instructions, no memory layout decisions. MLIR's optimization passes will make those decisions during the lowering phase, choosing the best implementation for the target hardware.
 
@@ -538,7 +598,96 @@ Notice the abstraction level throughout this code: we're building a computation 
 
 ---
 
-## 1.9 The Compilation Pipeline: Progressive Lowering
+## 1.9 Debugging Toolbox: When Things Go Wrong
+
+Before diving into the compilation pipeline, let's cover essential debugging tools. MLIR code will fail—type mismatches, dialect loading errors, pass failures. Knowing how to inspect and debug IR is critical for productive development.
+
+### Saving IR to Files
+
+The most important debugging technique is **inspecting the IR** at each compilation stage. In your C++ code (like `ir.cpp` from Chapter 1), add IR dumps:
+
+```cpp
+// After building your module, before compilation
+module.dump();  // Prints IR to stderr - see it in console
+
+// Or save to file for detailed inspection
+std::string irString;
+llvm::raw_string_ostream os(irString);
+module.print(os);
+std::ofstream file("debug_output.mlir");
+file << os.str();
+file.close();
+std::cout << "IR saved to debug_output.mlir\n";
+```
+
+This creates a `.mlir` file you can examine in a text editor. You'll see exactly what operations were generated, their types, and the structure of the IR.
+
+**Quick Debug**: The simplest approach is `module.dump()` right after IR construction. This prints to your console immediately—no file handling needed.
+
+### Using mlir-opt: The Swiss Army Knife
+
+`mlir-opt` is MLIR's command-line tool for applying passes and inspecting transformations. It's invaluable for debugging:
+
+```bash
+# View your IR (checks syntax)
+mlir-opt debug_output.mlir
+
+# Apply specific passes to see transformations
+mlir-opt debug_output.mlir --convert-linalg-to-loops
+
+# Chain multiple passes
+mlir-opt debug_output.mlir \
+  --convert-linalg-to-loops \
+  --convert-scf-to-cf \
+  --canonicalize
+
+# Get help on available passes
+mlir-opt --help
+```
+
+**Why use mlir-opt?** When your JIT compilation fails mysteriously, `mlir-opt` lets you apply passes one at a time and see which one breaks. If pass 3 fails but passes 1-2 succeed, you know exactly where to investigate.
+
+### Common Errors and Solutions
+
+**Error: "Dialect not loaded"**
+```
+Error: operation 'linalg.matmul' is unknown
+```
+**Solution**: Load the dialect before using its operations:
+```cpp
+context.loadDialect<linalg::LinalgDialect>();
+```
+
+**Error: "Type mismatch"**
+```
+Error: operand type 'memref<8x32xf32>' doesn't match expected 'memref<8x16xf32>'
+```
+**Solution**: Check your dimensions. Matrix multiply requires compatible shapes (M×K @ K×N → M×N).
+
+**Error: "Verification failed"**
+```
+Error: 'linalg.matmul' op requires two input operands
+```
+**Solution**: Operations have requirements (argument count, types, attributes). Check the dialect documentation.
+
+### Debugging Workflow
+
+When something breaks:
+
+1. **Save IR immediately** before the failing pass: `module.dump()` or save to file
+2. **Run mlir-opt** on saved IR with the failing pass only
+3. **Read error message** carefully—MLIR errors pinpoint exact operation and reason
+4. **Check operation definition** in dialect documentation
+5. **Verify types** of all operands match expectations
+6. **Test incrementally**—add operations one at a time, verify after each
+
+**Pro tip**: MLIR's error messages are excellent. They tell you exactly what's wrong ("expected type X, got type Y") and which operation failed. Read them carefully before diving into code.
+
+With these debugging tools, you can diagnose and fix issues quickly. Now let's see the full compilation pipeline that transforms our high-level IR into machine code.
+
+---
+
+## 1.10 The Compilation Pipeline: Progressive Lowering
 
 With the IR generated, we need to transform it from high-level operations into executable machine code. This happens through a series of transformation passes, each lowering the IR one step closer to the machine. The implementation resides in `lowering.cpp`.
 
@@ -601,13 +750,13 @@ This transformation exposes the computation's structure, making it accessible to
 
 **Pass 3: SCF to Control Flow**
 
-The next pass converts structured loops into unstructured control flow—basic blocks and branches. The `scf.for` operation becomes a header block (checks loop condition), a body block (executes loop iteration), and branch operations connecting them. This is a lowering from structured to unstructured control flow.
+The `SCF-to-CF` pass converts structured loops into unstructured control flow—basic blocks and branches. It transforms each `scf.for` operation into a header block (checks loop condition), a body block (executes loop iteration), and branch operations connecting them. This lowers from structured to unstructured control flow.
 
-Structured control flow makes optimization easier because the compiler can reason about loop structure, invariants, and dependencies. But eventually we need unstructured control flow because that's what CPU's execute: conditional and unconditional branches. This pass makes the transition, converting loops into basic blocks connected by branches—the CF (Control Flow) dialect, which we'll see more of in Chapter 5.
+Why this transformation? Structured control flow makes optimization easier because the compiler can reason about loop structure, invariants, and dependencies. But CPUs ultimately execute conditional and unconditional branches, not high-level loop constructs. This pass bridges that gap, converting loops into the basic blocks and branches that the CF (Control Flow) dialect represents. We'll explore these control flow primitives in Chapter 5.
 
 **Pass 4: MemRef to LLVM**
 
-This pass is deceptively complex. It converts memref types to LLVM pointer types and transforms memory operations (`memref.load`, `memref.store`) into LLVM load and store instructions. For our fixed-size memrefs, this is straightforward: a `memref<8x32xf32>` becomes a pointer to float with some address arithmetic for indexing.
+This pass handles a deceptively complex task: converting memref types to LLVM pointer types and transforming memory operations (`memref.load`, `memref.store`) into LLVM load and store instructions. For our fixed-size memrefs, the transformation is straightforward: `memref<8x32xf32>` becomes a pointer to float with some address arithmetic for indexing.
 
 But there's hidden complexity that Chapter 2 will reveal. Memrefs can have dynamic dimensions (unknown until runtime), non-contiguous layouts (strided or transposed), and complex addressing schemes. The lowering pass handles all this by generating code that computes addresses from base pointers, offsets, and strides. For now, our fixed-size example avoids this complexity, but keep in mind that memref lowering can generate significant code for complex cases.
 
@@ -669,7 +818,9 @@ In memory, the arrays are just contiguous sequences of floats in row-major order
 
 ### Python Integration with Pybind11
 
-The final piece is exposing our JIT compiler to Python so we can easily test and use it. Pybind11 provides seamless C++/Python integration. The implementation in `bindings.cpp` wraps our JIT compiler in a Python-friendly interface:
+The final piece is exposing our JIT compiler to Python so we can easily test and use it. Pybind11 provides seamless C++/Python integration. The implementation in `bindings.cpp` wraps our JIT compiler in a Python-friendly interface.
+
+**Understanding the Python ↔ C++ Boundary**: This is where Python's high-level NumPy arrays cross into C++'s low-level memory world. Python code calls `gemm(A, B)` with NumPy arrays. Pybind11 extracts raw memory pointers from these arrays. We pass these pointers to JIT-compiled machine code (which expects raw float pointers). The compiled code writes results directly into memory. Python sees the modified NumPy array. Understanding this boundary is crucial for performance—copying data across this boundary is expensive, so we avoid it by passing pointers.
 
 ```cpp
 py::array_t<float> gemm(py::array_t<float> A, py::array_t<float> B) {

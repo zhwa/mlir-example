@@ -95,6 +95,8 @@ Triton compiler, despite being "JIT" in spirit, follows a similar AOT pattern: i
 
 Think of ExecutionEngine as **scaffolding**—temporary infrastructure that supports development but isn't part of the final product. You wouldn't ship a building with scaffolding still attached, and you shouldn't ship a production service with ExecutionEngine embedded.
 
+**Connection to Chapter 1**: Remember when we first used ExecutionEngine in Chapter 1 to compile our matrix multiplication? We treated it as a simple "compile and run" black box. Now you understand what's really happening: ExecutionEngine wraps LLVM's JIT, translates MLIR dialects to LLVM IR, optimizes the code, compiles to machine code in memory, and gives us a function pointer. That "magic" was LLVM's battle-tested JIT infrastructure working behind the scenes.
+
 For this book, we use ExecutionEngine for three pragmatic reasons. It simplifies learning by letting us focus on IR rather than build systems. It enables rapid experimentation—we can change code and test immediately without rebuild cycles. It makes Python integration trivial, avoiding the complexity of linking and loading compiled libraries.
 
 But as we progress toward production-grade systems—particularly in Chapters 13-14 when we build GPT inference engines—we'll see how real deployments work: compile MLIR to object files, link to create libraries, and deploy statically compiled binaries for predictable latency and minimal memory overhead.
@@ -250,6 +252,8 @@ Why not compile directly from high-level operations to machine code in one pass?
 
 ### The Typical Compilation Pipeline
 
+**Connection to Chapter 1**: In Chapter 1, we saw progressive lowering in action when our `linalg.matmul` operation transformed through multiple passes: Linalg → SCF → CF → LLVM. At the time, we focused on the "what" (which passes to call). Now we understand the "why" (maintaining well-formed IR at each abstraction level) and the "how" (the PassManager orchestrating transformations).
+
 For the matrix multiplication in Chapters 1-2, here's the complete lowering sequence:
 
 **Phase 1: Canonicalization**
@@ -376,7 +380,7 @@ llvm::LLVMContext llvmContext;
 auto llvmModule = translateModuleToLLVMIR(*module, llvmContext);
 ```
 
-This converts MLIR's LLVM dialect operations to actual LLVM IR. After this step, you have a standard LLVM module that any LLVM tool can process.
+This converts MLIR's LLVM dialect operations to actual LLVM IR. After this step, you have a standard LLVM module that any LLVM tool can process. **This is what production systems do instead of ExecutionEngine**—they compile to object files that can be deployed without runtime compilation overhead.
 
 **Step 4: Configure target machine**:
 ```cpp
@@ -622,6 +626,8 @@ gemmFunc(args...);  // Runs at native speed
 There's no interpretation, no bytecode, no overhead—this is compiled x86_64/ARM64 instructions executing on bare metal.
 
 ### The Caching Strategy: Compile Once, Use Many Times
+
+**Connection to Chapter 1**: In Chapter 1, we mentioned that "Chapter 3 will explore caching strategies to avoid recompiling the same code repeatedly." Here's that promise fulfilled. The key insight is that with dynamic shapes, compiled code is shape-agnostic—compile once, reuse for all matrix sizes.
 
 The key insight for practical JIT: **cache the compiled function**. Since we use dynamic shapes (`memref<?x?xf32>`), the compiled code is shape-agnostic—it works for **any** matrix dimensions. Compile once, reuse forever.
 

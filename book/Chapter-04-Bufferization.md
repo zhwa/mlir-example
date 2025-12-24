@@ -1,6 +1,8 @@
 # Chapter 4: Bufferization - Bridging Functional and Imperative Worlds
 
-In Chapters 1-3, we worked directly with memrefs—mutable memory buffers that behave like C pointers. We explored their runtime structure (the memref descriptor with its base pointer, sizes, and strides) in Chapter 2 when discussing dynamic shapes, without delving into why MLIR provides this particular abstraction. This imperative style is intuitive for programmers familiar with C/C++, but it has limitations. Modern MLIR code typically starts with **tensors**—immutable values with functional semantics—and transforms them into memrefs through a process called **bufferization**.
+In Chapters 1-3, we worked directly with memrefs—mutable memory buffers that behave like C pointers. In Chapter 1, we introduced the **output buffer pattern**: functions take pre-allocated buffers as parameters (like `func(A, B, C)` where C is the output) instead of allocating and returning results. This pattern felt somewhat arbitrary at the time. This chapter reveals why it exists: **bufferization automatically transforms functional tensor code (which returns results) into imperative memref code (which uses out-parameters).**
+
+We explored memref runtime structure (the memref descriptor with its base pointer, sizes, and strides) in Chapter 2 when discussing dynamic shapes, without delving into why MLIR provides this particular abstraction. This imperative style is intuitive for programmers familiar with C/C++, but it has limitations. Modern MLIR code typically starts with **tensors**—immutable values with functional semantics—and transforms them into memrefs through a process called **bufferization**.
 
 This chapter answers a fundamental question: **Why does MLIR have two ways to represent multi-dimensional data (tensors and memrefs), and how do you convert between them?** We've seen memrefs from the execution side; now let's understand how they fit into the broader compilation story. Bufferization is the bridge between high-level ML frameworks (which think in terms of immutable tensors) and low-level execution (which requires mutable memory buffers).
 
@@ -193,7 +195,67 @@ This is a **correctness bug**, not just an optimization issue. Naive bufferizati
 
 One-Shot Bufferize performs a whole-program analysis to **prevent read-after-write hazards** while maximizing in-place updates. The algorithm operates in four phases.
 
-During alias analysis and conflict detection, the pass analyzes the entire function to understand tensor data flow. It determines which tensors can share buffers safely through in-place updates, building an alias set that tracks which operations create new values versus reuse existing buffers. Crucially, it detects RAW (read-after-write) conflicts: if a tensor is read after being potentially written, the analysis marks it as requiring a separate buffer.
+```
+┌──────────────────────────────────────────────────────────────┐
+│              BUFFERIZATION TRANSFORMATION FLOW               │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  INPUT: Tensor IR (Functional Semantics)                     │
+│  ┌─────────────────────────────────────┐                     │
+│  │ func @example(%a: tensor<8x16xf32>) │                     │
+│  │   -> tensor<8x16xf32> {             │                     │
+│  │   %result = tensor.op %a            │                     │
+│  │   return %result                    │                     │
+│  │ }                                   │                     │
+│  └──────────────┬──────────────────────┘                     │
+│                 │                                            │
+│                 ▼                                            │
+│  ┌─────────────────────────────────────┐                     │
+│  │ Phase 1: Alias Analysis             │                     │
+│  │  • Build tensor dataflow graph      │                     │
+│  │  • Detect RAW conflicts             │                     │
+│  │  • Identify safe in-place updates   │                     │
+│  └──────────────┬──────────────────────┘                     │
+│                 ▼                                            │
+│  ┌─────────────────────────────────────┐                     │
+│  │ Phase 2: Buffer Allocation          │                     │
+│  │  • Insert memref.alloc for new data │                     │
+│  │  • Add memref.dealloc for cleanup   │                     │
+│  │  • Allocate separate buffers for    │                     │
+│  │    RAW conflicts                    │                     │
+│  └──────────────┬──────────────────────┘                     │
+│                 ▼                                            │
+│  ┌─────────────────────────────────────┐                     │
+│  │ Phase 3: Type Conversion            │                     │
+│  │  • tensor<...> → memref<...>        │                     │
+│  │  • Update function signatures       │                     │
+│  │  • Convert tensor ops to memref ops │                     │
+│  └──────────────┬──────────────────────┘                     │
+│                 ▼                                            │
+│  ┌─────────────────────────────────────┐                     │
+│  │ Phase 4: In-place Optimization      │                     │
+│  │  • Return values → out-parameters   │                     │
+│  │  • Eliminate unnecessary copies     │                     │
+│  │  • Mutate buffers where safe        │                     │
+│  └──────────────┬──────────────────────┘                     │
+│                 │                                            │
+│                 ▼                                            │
+│  OUTPUT: MemRef IR (Imperative Semantics)                    │
+│  ┌─────────────────────────────────────┐                     │
+│  │ func @example(%a: memref<8x16xf32>, │                     │
+│  │              %out: memref<8x16xf32>)│                     │
+│  │ {                                   │                     │
+│  │   memref.op %a, %out                │                     │
+│  │   return                            │                     │
+│  │ }                                   │                     │
+│  └─────────────────────────────────────┘                     │
+│                                                              │
+│  Key Guarantee: No RAW hazards (correctness preserved)       │
+│  Performance: In-place updates where safe (copies minimized) │
+└──────────────────────────────────────────────────────────────┘
+```
+
+During alias analysis and conflict detection, the pass analyzes the entire function to understand tensor data flow. It determines which tensors can share buffers safely through in-place updates, building an alias set that tracks which operations create new values versus reuse existing buffers. Crucially, it detects RAW (read-after-write) conflicts: if a tensor is read after being potentially written, the pass marks it as requiring a separate buffer.
 
 Next comes buffer allocation insertion. The pass inserts `memref.alloc` operations where new buffers are needed, placing allocations as late as possible to minimize live ranges. Deallocations are inserted automatically based on liveness analysis. Whenever RAW analysis detects conflicts, the pass allocates separate buffers to maintain correctness.
 
@@ -281,7 +343,17 @@ Other options exist for specialized layouts (column-major, tiled, padded), but i
 
 ## 4.3 Buffer-Results-To-Out-Params: ABI Transformation
 
-After One-Shot Bufferize converts tensors to memrefs, we still have a problem: functions might return memrefs. This is problematic for calling conventions and memory management. The **Buffer-Results-To-Out-Params** pass solves this.
+After One-Shot Bufferize converts tensors to memrefs, we still have a problem: functions might return memrefs. This is problematic for calling conventions and memory management. The **Buffer-Results-To-Out-Params** pass solves this by transforming return values into out-parameters—exactly the calling convention we used in Chapter 1.
+
+Recall Chapter 1's matrix multiply signature:
+```cpp
+// Output buffer as parameter (Chapter 1 pattern)
+void matmul(float* A, float* B, float* C, int M, int N, int K) {
+  // Write results into caller-provided C
+}
+```
+
+This wasn't an arbitrary choice—it's the standard calling convention that bufferization automatically produces.
 
 ### The Problem: Returning Pointers
 
@@ -753,7 +825,9 @@ Each level trades convenience for control. Most users stay at Level 1; performan
 
 ## 4.6 MemRef Layout Maps and Zero-Cost Transformations
 
-MemRefs are not just pointers—they're **descriptors** that bundle a base pointer with metadata about how to interpret that memory. A critical piece of this metadata is the **layout map**, which controls how multi-dimensional indices map to flat memory offsets. Understanding layout maps is essential because they enable **zero-cost transformations** like transpose and reshape.
+MemRefs are not just pointers—they're **descriptors** that bundle a base pointer with metadata about how to interpret that memory. We introduced the descriptor structure in Chapter 2 (base pointer, aligned pointer, offset, sizes, strides) but didn't explore how the **layout map** enables zero-cost transformations. This section reveals the compiler magic that makes operations like transpose and reshape free.
+
+A critical piece of the descriptor metadata is the **layout map**, which controls how multi-dimensional indices map to flat memory offsets. Understanding layout maps is essential because they enable **zero-cost transformations** like transpose and reshape.
 
 ### The Anatomy of a MemRef: More Than a Pointer
 

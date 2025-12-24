@@ -892,13 +892,28 @@ The complete GPT implementation demonstrates MLIR's scalability: the same compil
 3. **Naive Attention**: Full O(seq_len²) attention without optimizations
 4. **CPU-Only**: No GPU acceleration for parallel matrix operations
 
-**Looking Ahead**. Chapter 14 addresses these limitations with production optimizations:
+**Looking Ahead to Chapter 14: Production Optimizations**
 
-- **KV Caching**: Store computed keys and values, avoiding recomputation (O(n) → O(1) per token)
-- **FlashAttention**: Fused attention kernel reducing memory bandwidth by orders of magnitude
-- **Batched Inference**: Process multiple sequences simultaneously for higher throughput
-- **Operator Fusion**: Merge operations (layer norm + matmul, matmul + bias + activation) eliminating intermediate buffers
-- **Quantization**: Reduce precision (FP32 → INT8) for faster computation and reduced memory
+You now have a **working GPT**—it generates text correctly, implements all architectural components, and demonstrates complete autoregressive generation. But if you profile this code on production-scale models, you'll notice severe performance limitations. Chapter 14 transforms this educational implementation into production-ready code.
+
+**The Performance Gap**. Our nano GPT (d_model=64, 2 layers, 32 tokens) runs fine because everything fits in L1 cache. But production GPT-2 (d_model=768, 12 layers, 1024 tokens) is 100× larger, and generation becomes painfully slow. The culprit isn't MLIR—it's algorithmic inefficiency:
+
+- **Recomputation overhead**: Each new token requires reprocessing all previous tokens (O(n²) cost)
+- **Memory bandwidth**: Separate operations write results to memory, next operation reads them back
+- **Scalar operations**: Loops use scalar arithmetic instead of SIMD vectors
+- **No caching**: Computed attention keys/values get thrown away instead of reused
+
+**Chapter 14's Solutions**:
+
+1. **KV Caching** (algorithmic): Store computed keys/values, reducing O(n²) to O(n)—the single biggest speedup
+2. **Declarative Rewrite Rules (DRR)**: Express optimizations in TableGen instead of manual C++ patterns
+3. **Canonicalization Patterns**: Simplify IR automatically before lowering
+4. **Operation Interfaces**: Enable dialect-independent optimizations
+5. **Transform Dialect**: Modern MLIR optimization framework for composable transformations
+
+**Why This Progression Matters**. Chapter 14 also introduces advanced dialect features deferred from Chapter 9—DRR, interfaces, and canonicalization. These aren't just optimizations; they're essential MLIR patterns used in all production compilers (Torch-MLIR, TensorFlow, JAX). We skipped them earlier because they make more sense with a complete model to optimize. Now you have that model.
+
+**Pedagogical Honesty**. Chapter 14 includes an important disclaimer: our nano GPT is too small to show dramatic speedups. The techniques are correct and production-ready, but they matter at production scale (GPT-2/3 size). Think of Chapter 14 as learning race car driving with a go-kart—the principles are identical, but you won't hit 200 mph. The optimizations demonstrated are exactly what vLLM, TensorRT-LLM, and other production systems use; the scale is educational.
 
 These techniques transform Chapter 13's functional but slow implementation into production-ready serving infrastructure capable of real-time text generation at scale. The architecture remains identical—optimizations happen transparently through MLIR's compilation pipeline.
 

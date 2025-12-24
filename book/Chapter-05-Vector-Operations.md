@@ -1,6 +1,8 @@
-# Chapter 5: Vector Operations and Structured Control Flow
+# Chapter 5: Structured Control Flow and Explicit Loops
 
-In the first four chapters, we relied on high-level operations from the Linalg dialect to express our computations. Operations like `linalg.matmul` and `linalg.fill` are declarative—they specify *what* to compute without detailing *how* the computation should proceed. The compiler decides how to implement these operations, choosing loop orders, vectorization strategies, and memory access patterns. This abstraction is powerful for optimization but sometimes limits control.
+In the first four chapters, we relied on high-level operations from the Linalg dialect to express our computations. Operations like `linalg.matmul` and `linalg.fill` are declarative—they specify *what* to compute without detailing *how* the computation should proceed. In Chapter 3, we introduced progressive lowering and mentioned that Linalg operations eventually lower to explicit loops (the SCF dialect). This chapter reveals how that transformation works and when you might want to work with explicit loops directly.
+
+The compiler decides how to implement these operations, choosing loop orders, vectorization strategies, and memory access patterns. This abstraction is powerful for optimization but sometimes limits control.
 
 This chapter introduces a different approach: **explicit control flow** using MLIR's SCF (Structured Control Flow) dialect. Instead of declaring "compute matrix multiplication," we'll write explicit loops that specify exactly how computation proceeds, element by element, iteration by iteration. This lower-level control becomes essential when implementing operations that don't fit neatly into high-level abstractions or when you need precise control over execution for performance tuning.
 
@@ -330,7 +332,7 @@ MLIR provides a pass called `convert-scf-to-cf` that performs this transformatio
 3. A loop body block containing the original body operations
 4. An exit block for code after the loop
 
-The pass handles all the details: correctly threading the induction variable through block arguments, converting loop bounds to comparisons, and ensuring that iter_args (loop-carried values) flow correctly through block arguments. After this pass, the SCF dialect is completely eliminated from the IR.
+The pass threads the induction variable through block arguments, converts loop bounds to comparisons, and ensures iter_args (loop-carried values) flow correctly through the block structure. After this pass, the SCF dialect is completely eliminated from the IR.
 
 ### Why Lower SCF at All?
 
