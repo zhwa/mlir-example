@@ -26,17 +26,9 @@ However, AOT compilation has important limitations. It cannot adjust to runtime 
 
 **JIT compilation** delays code generation until runtime. The workflow interleaves compilation with execution in a single unified phase. The system starts with a high-level representation—bytecode, IR, or source code. As code is needed, it compiles to machine code on-demand, caches the compiled code for reuse, executes it, and repeats this process for new code paths. Modern JIT systems include Java's HotSpot VM, JavaScript engines (V8, SpiderMonkey), PyPy, LuaJIT, and increasingly, ML frameworks like PyTorch 2.0 with torch.compile and JAX.
 
-**Advantages**:
-- **Runtime adaptability**: Can specialize code based on actual data (input shapes, branch frequencies, type information)
-- **Dynamic optimization**: Profile code during execution and recompile hot paths with aggressive optimizations
-- **Single deployment artifact**: Ship high-level IR that compiles to native code on any platform
-- **Incremental compilation**: Only compile code that actually executes
+JIT compilation offers powerful capabilities for dynamic systems. **Runtime adaptability** allows the compiler to specialize code based on actual data—input shapes in neural networks, branch frequencies discovered during execution, and type information observed at runtime. **Dynamic optimization** enables profiling code during execution and recompiling hot paths with aggressive optimizations informed by real usage patterns. JIT systems can ship a **single deployment artifact**: high-level IR that compiles to native code on whatever platform it runs on, eliminating the need for platform-specific binaries. **Incremental compilation** means only code that actually executes pays compilation cost—unused code paths never get compiled, saving time and memory.
 
-**Disadvantages**:
-- **Compilation overhead**: First execution of code pays compilation cost (10-100ms for small functions, seconds for large modules)
-- **Memory overhead**: Must keep compiler infrastructure in memory
-- **Unpredictable performance**: First run is slow (warming up), subsequent runs are fast
-- **Complex implementation**: JIT compilers are significantly more complex than AOT compilers
+However, JIT compilation imposes significant costs. **Compilation overhead** means the first execution of code pays the compilation cost, which can be 10-100ms for small functions or seconds for large modules—unacceptable for latency-sensitive applications. **Memory overhead** requires keeping the entire compiler infrastructure in memory throughout execution, consuming 50-200 MB or more. **Unpredictable performance** means the first run is slow while warming up, subsequent runs are fast—this variability complicates performance analysis and capacity planning. Finally, **complex implementation** makes JIT compilers significantly more complex than AOT compilers, requiring runtime compilation infrastructure, code cache management, and profile-guided optimization systems.
 
 ### The ML Systems Landscape
 
@@ -63,13 +55,7 @@ auto funcPtr = engine->lookup("gemm");
 (*funcPtr)(args...);  // Call the compiled function
 ```
 
-Under the hood, ExecutionEngine:
-1. **Translates MLIR → LLVM IR**: Converts MLIR's dialects to LLVM IR using registered translations
-2. **Optimizes LLVM IR**: Applies LLVM's optimization passes (inlining, constant folding, vectorization, etc.)
-3. **Generates machine code**: Compiles LLVM IR to native instructions for the current CPU
-4. **Keeps code in memory**: No files written to disk—code lives in process memory
-5. **Provides function lookup**: Maps function names to callable function pointers
-6. **Manages memory**: Handles code cache, data sections, and dynamic linking
+Under the hood, ExecutionEngine performs several critical tasks. It **translates MLIR to LLVM IR** by converting MLIR's dialects to LLVM IR using registered translations. It **optimizes LLVM IR** by applying LLVM's optimization passes including inlining, constant folding, vectorization, and many others. It **generates machine code** by compiling LLVM IR to native instructions for the current CPU. Importantly, it **keeps code in memory** with no files written to disk—compiled code lives entirely in process memory. It **provides function lookup** to map function names to callable function pointers. Finally, it **manages memory** by handling the code cache, data sections, and dynamic linking.
 
 This is enormously convenient for learning and testing—you get a runnable function in milliseconds with just a few lines of code. But convenience comes with trade-offs.
 
@@ -101,16 +87,7 @@ ExecutionEngine is inappropriate for production systems for several reasons:
 
 ### What Production MLIR Systems Actually Do
 
-Real ML serving systems using MLIR follow an AOT workflow:
-
-**TensorFlow's MLIR pipeline**:
-1. Generate MLIR IR from TensorFlow graph
-2. Apply optimization passes
-3. Lower to LLVM IR
-4. Compile to object files (.o)
-5. Link into shared library (.so)
-6. Deploy library to servers
-7. Servers load library and call functions—no compilation
+Real ML serving systems using MLIR follow an AOT workflow. **TensorFlow's MLIR pipeline** demonstrates this approach: it generates MLIR IR from the TensorFlow computation graph, applies optimization passes to improve performance, lowers the optimized IR to LLVM IR, compiles to object files (.o), links those object files into a shared library (.so), deploys the library to production servers, and finally the servers simply load the library and call functions with no compilation overhead.
 
 Triton compiler, despite being "JIT" in spirit, follows a similar AOT pattern: it parses Triton Python code to IR, lowers to LLVM IR, generates PTX (NVIDIA) or AMDGPU code, passes the code to the GPU driver for final compilation, caches the compiled kernels on disk, and reuses those cached kernels across runs. Even systems with "JIT" in their name ultimately do AOT compilation—they just do it lazily on first use, then cache the results.
 
@@ -189,20 +166,11 @@ llvm.br        (LLVM IR)
 
 If you run passes out of order, compilation fails. The SCF-to-CF pass can't convert operations that don't exist yet. The PassManager doesn't automatically infer dependencies—**you must specify the correct order**.
 
-Some passes have subtle dependencies. Canonicalization, for example, should run **after** major transformations to clean up the IR they produce. Lowering passes create verbose IR with redundant operations; canonicalization simplifies it. The pattern is:
-
-```
-1. Major transformation (e.g., loop tiling)
-2. Canonicalization (clean up mess)
-3. Next transformation
-```
+Some passes have subtle dependencies. Canonicalization, for example, should run **after** major transformations to clean up the IR they produce. Lowering passes create verbose IR with redundant operations; canonicalization simplifies it. The typical pattern runs a major transformation (like loop tiling), then canonicalization to clean up the resulting mess, followed by the next transformation. This interleaving of transformations and cleanup passes ensures the IR remains in a simplified, canonical form throughout the compilation pipeline.
 
 ### Pass Verification and Debugging
 
-MLIR's pass infrastructure includes **verification** after each pass. By default, after every pass executes, MLIR verifies the entire IR is well-formed:
-- All operations have valid types
-- SSA dominance properties hold
-- Dialect-specific invariants are maintained
+MLIR's pass infrastructure includes **verification** after each pass. By default, after every pass executes, MLIR verifies the entire IR is well-formed. This verification checks that all operations have valid types, SSA dominance properties hold (definitions dominate uses), and dialect-specific invariants are maintained.
 
 If verification fails, MLIR reports which pass broke the IR. This is invaluable for debugging—without verification, a pass could corrupt the IR, and you'd only discover the problem later when code generation mysteriously fails.
 
@@ -254,10 +222,7 @@ Now that we understand passes, let's examine MLIR's compilation model: **progres
 
 MLIR IR exists at multiple levels simultaneously:
 
-**Level 5 - Domain-specific (highest abstraction)**:
-- Custom dialects for specific domains (Transformer ops, database queries, etc.)
-- Operations like `transformer.attention`, `graph.conv2d`
-- Semantics: "what computation to perform" (mathematical specification)
+**Level 5 - Domain-specific (highest abstraction)** contains custom dialects for specific domains such as Transformer operations and database queries. Operations like `transformer.attention` and `graph.conv2d` exist at this level. The semantics focus purely on "what computation to perform," providing mathematical specifications without implementation details.
 
 At Level 4, structured compute is represented through the Linalg dialect, with operations like `linalg.matmul`, `linalg.conv`, and `linalg.reduce` that express structured linear algebra using iteration spaces, index maps, and declarative operations.
 
@@ -365,10 +330,7 @@ Each phase maintains IR correctness. You can stop at any phase, inspect the IR, 
 
 ### Mixing Abstraction Levels
 
-One unique MLIR feature: **IR can contain multiple abstraction levels simultaneously**. A single function might have:
-- High-level `linalg.matmul` operations
-- Mid-level `scf.for` loops
-- Low-level `llvm.load` instructions
+One unique MLIR feature: **IR can contain multiple abstraction levels simultaneously**. A single function might have high-level `linalg.matmul` operations alongside mid-level `scf.for` loops and low-level `llvm.load` instructions, all coexisting in the same function.
 
 This happens naturally during progressive lowering—you lower some operations but not others. Consider a function with matrix multiplication and a simple addition:
 
@@ -475,11 +437,7 @@ codegen.run(*llvmModule);
 dest.flush();
 ```
 
-This produces a **relocatable object file** (`.o` on Unix, `.obj` on Windows)—the same format that C++ compilers produce. The object file contains:
-- Machine code for all functions
-- Symbol table (function names, global variables)
-- Relocation information (for the linker)
-- Debugging information (if enabled)
+This produces a **relocatable object file** (`.o` on Unix, `.obj` on Windows)—the same format that C++ compilers produce. The object file contains machine code for all functions, a symbol table listing function names and global variables, relocation information for the linker to resolve cross-file references, and debugging information if enabled during compilation.
 
 **Step 7: Link into library or executable**:
 ```bash
@@ -555,23 +513,11 @@ This generates ARM machine code on your x86_64 development machine. Ship the res
 
 ### Comparison: AOT vs ExecutionEngine
 
-Let's make the comparison concrete:
+Let's make the comparison concrete.
 
-**ExecutionEngine (JIT)**:
-- Workflow: IR → ExecutionEngine.create() → function pointer
-- Time: 10-100ms compilation on first call
-- Memory: 50-200 MB for compiler infrastructure
-- Output: Code in process memory (ephemeral)
-- Deployment: Ship source code or IR + compiler
-- Platforms: Only where JIT is allowed
+**ExecutionEngine (JIT)** follows a simple workflow: pass IR to ExecutionEngine.create() and get back a function pointer. The compilation time is 10-100ms on the first call. Memory overhead is substantial at 50-200 MB for the compiler infrastructure. The output is code in process memory that's ephemeral—it disappears when the process exits. Deployment requires shipping either source code or IR along with the compiler. Platform support is limited to environments where JIT compilation is allowed, excluding iOS, many embedded systems, and secure environments.
 
-**AOT (object files)**:
-- Workflow: IR → translate to LLVM → optimize → emit .o → link → .so
-- Time: 0ms at runtime (all compilation upfront)
-- Memory: Only the compiled code (kilobytes)
-- Output: Relocatable object file (.o) or library (.so)
-- Deployment: Ship compiled binaries (no compiler needed)
-- Platforms: Any platform (including iOS, embedded, secure environments)
+**AOT (object files)** has a more complex build-time workflow: translate IR to LLVM, optimize, emit object files (.o), link into libraries (.so), but then runtime is trivial. Compilation time at runtime is 0ms since all compilation happened upfront. Memory overhead is minimal—only the compiled code itself, typically measured in kilobytes. The output is a relocatable object file (.o) or shared library (.so) that persists on disk. Deployment ships only the compiled binaries with no compiler needed. Platform support is universal, including iOS, embedded systems, and secure environments that prohibit runtime code generation.
 
 For production, AOT wins decisively. For experimentation and rapid development, ExecutionEngine is more convenient.
 
@@ -637,13 +583,7 @@ auto engine = ExecutionEngine::create(module, options);
 auto funcPtr = engine->lookup("gemm");
 ```
 
-Internally, ExecutionEngine:
-1. **Registers MLIR dialect translations**: Automatically sets up translators for MLIR's dialects (MemRef, SCF, Arith, etc.) to LLVM IR
-2. **Manages MLIR → LLVM conversion**: Calls `translateModuleToLLVMIR()` with correct context
-3. **Wraps LLVM ORC LLJIT**: Creates and manages an `llvm::orc::LLJIT` instance
-4. **Simplifies optimization pipeline**: Provides `makeOptimizingTransformer()` for standard LLVM passes
-5. **Handles symbol export**: Makes MLIR function names visible to the JIT's symbol table
-6. **Memory lifetime management**: Owns the LLVM context, JIT engine, and compiled code
+Internally, ExecutionEngine performs several critical operations. It **registers MLIR dialect translations**, automatically setting up translators for MLIR's dialects (MemRef, SCF, Arith, etc.) to LLVM IR. It **manages MLIR to LLVM conversion** by calling `translateModuleToLLVMIR()` with the correct context. It **wraps LLVM ORC LLJIT**, creating and managing an `llvm::orc::LLJIT` instance. It **simplifies the optimization pipeline** by providing `makeOptimizingTransformer()` for standard LLVM passes. It **handles symbol export**, making MLIR function names visible to the JIT's symbol table. Finally, it provides **memory lifetime management**, owning the LLVM context, JIT engine, and compiled code.
 
 **Under the hood—what LLVM ORC does**:
 When ExecutionEngine calls into LLVM's ORC (On-Request Compilation) framework:
@@ -656,24 +596,11 @@ jit->addIRModule(llvm::orc::ThreadSafeModule(
 ));
 ```
 
-LLVM's **LLJIT** (Lazy LLVM JIT) then:
-- Compiles the LLVM IR to machine code **in memory**
-- Allocates executable memory pages (with OS permissions: read+execute)
-- Generates position-independent code suitable for dynamic loading
-- Builds a symbol table mapping function names to addresses
-- Manages code cache and memory layout
+LLVM's **LLJIT** (Lazy LLVM JIT) then performs several operations: it compiles the LLVM IR to machine code **in memory**, allocates executable memory pages with OS permissions set to read+execute, generates position-independent code suitable for dynamic loading, builds a symbol table mapping function names to memory addresses, and manages the code cache and memory layout.
 
 No files are written to disk. The generated code lives in the process's address space, in executable memory pages. This is fundamentally different from AOT compilation, where code lives in `.o` or `.so` files.
 
-**Why MLIR provides ExecutionEngine**:
-You could directly use LLVM's ORC JIT, but you'd need to:
-1. Manually translate MLIR dialects to LLVM IR
-2. Register all dialect translations
-3. Handle MLIR-specific ABI conventions (memref descriptors, etc.)
-4. Set up optimization transformers correctly
-5. Manage multiple LLVM contexts
-
-ExecutionEngine encapsulates all this boilerplate, letting you focus on generating and executing MLIR IR. For learning and prototyping, this convenience is invaluable.
+**Why MLIR provides ExecutionEngine**: You could directly use LLVM's ORC JIT, but you'd need to manually translate MLIR dialects to LLVM IR, register all dialect translations, handle MLIR-specific ABI conventions like memref descriptors, set up optimization transformers correctly, and manage multiple LLVM contexts. ExecutionEngine encapsulates all this boilerplate, letting you focus on generating and executing MLIR IR. For learning and prototyping, this convenience is invaluable.
 
 **The practical implication**:
 When you see `ExecutionEngine` in our code, remember: it's a convenience wrapper around LLVM ORC. The actual JIT compilation is done by LLVM's battle-tested ORC infrastructure—the same infrastructure used by Clang's JIT, Julia's compiler, and other production systems. MLIR just makes it easier to use from MLIR IR.
@@ -747,20 +674,11 @@ Caching assumes the compiled code remains valid. When does it need to recompile?
 
 Let's quantify JIT overhead with realistic numbers:
 
-**Compilation time** (measured on x86_64, 3.5 GHz CPU):
-- Simple function (matrix add): 10-20ms
-- Matrix multiplication (our example): 30-50ms
-- Complex graph (10+ operations): 100-500ms
-- Large model (transformer layer): 1-5 seconds
+**Compilation time** measurements on x86_64 with a 3.5 GHz CPU show predictable patterns. A simple function like matrix addition takes 10-20ms to compile. Our matrix multiplication example requires 30-50ms. A complex graph with 10+ operations needs 100-500ms. A large model like a transformer layer can take 1-5 seconds.
 
-**Execution time** (for matrix multiplication 1024×1024):
-- First call (with compilation): 35ms + 5ms = 40ms total
-- Subsequent calls: 5ms each
+**Execution time** for a 1024×1024 matrix multiplication shows where JIT overhead matters. The first call, including compilation, takes 40ms total (35ms compilation + 5ms execution). Subsequent calls take only 5ms each since they reuse the cached compiled code.
 
-**Amortization**:
-- After 8 calls: 40ms + 7×5ms = 75ms total → 9.4ms per call (average)
-- After 100 calls: 40ms + 99×5ms = 535ms total → 5.35ms per call (average)
-- After 1000 calls: 40ms + 999×5ms = 5035ms total → 5.035ms per call (average)
+**Amortization** reveals when JIT overhead becomes negligible. After 8 calls, the total time is 75ms (40ms + 7×5ms), averaging 9.4ms per call. After 100 calls, the total is 535ms, averaging 5.35ms per call. After 1000 calls, the average drops to 5.035ms per call, barely more than the 5ms execution time.
 
 For a serving system handling 1000 requests per second, the compilation cost becomes negligible after one second of runtime. But that first second—with unpredictable latency—is why production systems avoid JIT.
 
@@ -796,22 +714,11 @@ We've seen two compilation strategies—let's synthesize the trade-offs and perf
 
 The fundamental trade-off: **time spent compiling vs time spent executing**.
 
-**Scenario 1: Run once**
-- Program compiles and executes a function **once**, then exits
-- AOT: Compile ahead (1 second), execute (1ms) → Total: 1001ms
-- JIT: Compile on first call (50ms), execute (1ms) → Total: 51ms
-- **Winner: JIT** (20x faster for single execution)
+Consider **Scenario 1: Run once**. A program compiles and executes a function **once**, then exits. AOT compilation spends 1 second compiling ahead of time, then 1ms executing, totaling 1001ms. JIT compilation spends 50ms compiling on the first call plus 1ms executing, totaling 51ms. **JIT wins** by 20x for single execution, since the upfront AOT compilation overhead dominates.
 
-**Scenario 2: Run 100 times**
-- Function executes **100 times** in a loop
-- AOT: Compile ahead (1 second), execute 100×1ms → Total: 1100ms
-- JIT: Compile on first call (50ms), execute 100×1ms → Total: 150ms
-- **Winner: JIT** (7x faster due to amortization)
+In **Scenario 2: Run 100 times**, the function executes **100 times** in a loop. AOT still spends 1 second compiling ahead, then executes 100 times at 1ms each, totaling 1100ms. JIT compiles once on the first call (50ms) then executes 100 times at 1ms each, totaling 150ms. **JIT still wins** by 7x due to amortization—the compilation cost is amortized over 100 executions, while AOT's higher upfront cost remains fixed.
 
-**Scenario 3: Production serving**
-- Server handles **1 million requests** over days/weeks
-- AOT: Compile ahead (1 second once), execute 1M×1ms → Total: 1001 seconds
-- JIT: Compile on first request (50ms once), execute 1M×1ms → Total: 1000.05 seconds
+**Scenario 3: Production serving** considers a server handling **1 million requests** over days or weeks. AOT compiles ahead once (1 second), then executes 1 million times at 1ms each, totaling 1001 seconds. JIT compiles on the first request (50ms once), then executes 1 million times at 1ms each, totaling 1000.05 seconds.
 - **Winner: Tie** (compilation cost is negligible at this scale)
 
 But scenario 3 has a critical difference: **latency distribution**. With AOT, all requests take 1ms. With JIT, the first request takes 51ms—a 50x outlier. For user-facing services, this outlier is unacceptable. Serving systems care about p99 latency (99th percentile), and JIT's first-request penalty ruins this metric.
@@ -822,13 +729,7 @@ But scenario 3 has a critical difference: **latency distribution**. With AOT, al
 
 ### Code Size and Bloat
 
-JIT compilation generates code for the **current platform only**. AOT compilation for multiple platforms requires multiple binaries. For example, a hypothetical ML library might produce:
-
-- x86_64 Linux: 500 KB
-- ARM64 Linux: 480 KB
-- x86_64 macOS: 510 KB
-- ARM64 macOS: 490 KB
-- Total: ~2 MB
+JIT compilation generates code for the **current platform only**. AOT compilation for multiple platforms requires multiple binaries. For example, a hypothetical ML library might produce binaries of 500 KB for x86_64 Linux, 480 KB for ARM64 Linux, 510 KB for x86_64 macOS, and 490 KB for ARM64 macOS, totaling approximately 2 MB across all platforms.
 
 But you distribute only one binary per platform—users download 500 KB, not 2 MB. And modern app stores handle this automatically (iOS delivers ARM64 to iPhones, x86_64 to M1 Mac emulation).
 

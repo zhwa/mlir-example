@@ -1684,120 +1684,17 @@ The `dyn_cast<ShapeInference>(op)` checks if `op` implements the interface. If y
 
 **Chapter 14's Advanced Interfaces**. This introduction covers interface basics—defining, implementing, using. Chapter 14 explores advanced patterns: multiple interfaces per operation, interface inheritance, type and attribute interfaces (not just operation interfaces), and custom interfaces for optimization passes. For Chapter 9, understanding that interfaces provide polymorphism suffices; production compilers use them extensively for extensible infrastructure.
 
-Let's now compare Chapter 8's string-based approach with Chapter 9's TableGen approach systematically, understanding when each technique is appropriate.
+## 9.9 Conclusion: Declarative Specifications for Production
 
-## 9.9 Chapter Comparison: String-Based vs. TableGen
-
-Having implemented the same `nn` dialect in two ways—Python strings (Chapter 8) and TableGen/C++ (Chapter 9)—let's compare them systematically. Understanding the tradeoffs helps you choose appropriate techniques for different scenarios: research prototyping, production compilers, teaching, or experimentation.
-
-**Development Velocity**:
-
-Chapter 8: Add operation in ~20 lines of Python string formatting. Immediate execution—edit Python, run script, see results. No compilation, no generated code, no build system complexity.
-
-Chapter 9: Add operation requires TableGen definition (~10 lines), generated C++ code (~200 lines, automatic), lowering pattern implementation (~30 lines C++), recompilation (30-60 seconds for small changes). Higher initial overhead, but subsequent operations are faster once patterns are established.
-
-**Winner for Prototyping**: Chapter 8. When exploring dialect designs or testing ideas, string generation's rapid iteration is valuable.
-
-**Error Detection**:
-
-Chapter 8: Errors appear at runtime when parsing generated MLIR text. Typos in format strings ("memref<4xf2>" instead of "memref<4xf32>") cause parse failures with cryptic error messages pointing to generated text, not source Python code.
-
-Chapter 9: Errors appear at C++ compile time. Wrong argument types to `create<AddOp>()` caught by compiler. Wrong operand counts fail template instantiation. Type mismatches rejected before any IR is built.
-
-**Winner for Reliability**: Chapter 9. Compile-time error detection prevents entire classes of bugs.
-
-**Code Maintainability**:
-
-Chapter 8: Each operation requires custom lowering function. Adding a new operation means writing ~20-30 lines of string formatting code. No code reuse between similar operations (add vs. multiply nearly identical except one string).
-
-Chapter 9: TableGen definitions are concise (~10 lines per operation). Similar operations share patterns (element-wise ops use same OpRewritePattern structure). Changing operation signatures updates generated code automatically.
-
-**Winner for Scale**: Chapter 9. For dialects with dozens or hundreds of operations, TableGen's automation and code reuse are essential.
-
-**Learning Curve**:
-
-Chapter 8: Python programmers start immediately. String formatting is familiar. MLIR syntax learned by examining generated text. No new languages (just Python).
-
-Chapter 9: Requires learning TableGen syntax (records, dags, traits), C++ template metaprogramming (CRTP, OpRewritePattern), MLIR's OpBuilder API, and build system (CMake, mlir-tblgen invocation).
-
-**Winner for Teaching**: Chapter 8. New MLIR users understand what's happening without C++ complexity.
-
-**Integration with MLIR Ecosystem**:
-
-Chapter 8: Limited. Can parse and compile generated text, but no mlir-opt integration, no automatic documentation, no IDE support. Operations exist only as text, not as analyzable C++ classes.
-
-Chapter 9: Full integration. Generated operations work with mlir-opt passes, mlir-tblgen documentation, IDE autocomplete, and dialect interfaces. Operations are first-class MLIR citizens with proper registration and verification.
-
-**Winner for Production**: Chapter 9. Professional compilers require ecosystem integration.
-
-**Type Safety**:
-
-Chapter 8: None until runtime. Pass integers where floats expected, construct operations with wrong operand counts, all silently accepted until MLIR parsing fails.
-
-Chapter 9: Compile-time type checking throughout. C++ compiler enforces correct types, OpBuilder verifies operation construction, generated builders reject invalid arguments.
-
-**Winner for Correctness**: Chapter 9. Type safety prevents bugs before testing.
-
-**Flexibility for Experimentation**:
-
-Chapter 8: Highly flexible. Change operation syntax by editing format strings. Try unconventional MLIR patterns without fighting infrastructure. Generate invalid IR to test parser behavior.
-
-Chapter 9: Constrained by TableGen and OpBuilder. Can only express what TableGen supports. Must follow MLIR conventions. Invalid IR construction fails at build time, not runtime (good for production, limiting for experimentation).
-
-**Winner for Research**: Chapter 8. Academic research often explores unconventional ideas that don't fit existing frameworks.
-
-**Debugging Experience**:
-
-Chapter 8: Errors point to generated MLIR text. Debugging requires mapping text back to Python source. Print statements in Python show what's generated, but not why MLIR compilation fails.
-
-Chapter 9: Errors point to C++ source. Debugger shows full call stacks: Python → pybind11 → C++ builder → MLIR operation creation. Can step through IR construction, inspect types, examine verification failures.
-
-**Winner for Problem Solving**: Chapter 9. Better debugging tools compensate for increased complexity.
-
-**When to Use Each Approach**:
-
-Use **Chapter 8's String-Based Approach** when:
-- Learning MLIR concepts without C++ complexity
-- Rapid prototyping of dialect ideas
-- Generating test cases or MLIR examples
-- Building one-off tools or scripts
-- Teaching MLIR to programmers unfamiliar with C++
-- Experimenting with unconventional IR patterns
-
-Use **Chapter 9's TableGen Approach** when:
-- Building production compilers for distribution
-- Creating dialects with many operations (10+)
-- Requiring ecosystem integration (mlir-opt, tools)
-- Needing type safety and compile-time verification
-- Working in teams where maintainability matters
-- Following industry standards and best practices
-
-**Hybrid Approaches**. Some scenarios benefit from combining techniques:
-- Prototype dialects with strings (Chapter 8), formalize successful designs with TableGen (Chapter 9)
-- Use TableGen for core dialect operations, string generation for test utilities
-- Generate TableGen definitions programmatically from higher-level specifications
-
-**Evolution Path**. Most MLIR projects start simple and grow complex:
-1. Initial prototype: string-based IR generation
-2. Growing dialect: move frequently-used operations to TableGen
-3. Production system: full TableGen definitions, C++ optimization passes
-4. Mature framework: interface-based extensibility, generated documentation, tool integration
-
-Chapter 8 and Chapter 9 represent points on this spectrum. Understanding both prepares you for any stage of dialect development.
-
-The chapters teach complementary skills: Chapter 8 teaches **what MLIR dialects are** (operations, lowering, multi-level IR), Chapter 9 teaches **how production systems build them** (TableGen, OpRewritePattern, OpBuilder). Master both, and you'll navigate the full spectrum from research prototypes to industrial compilers.
-
-## 9.10 Conclusion: Declarative Specifications for Production
-
-This chapter transformed the string-based dialect from Chapter 8 into a production-quality implementation using TableGen, OpRewritePattern, and OpBuilder. The transformation illustrates MLIR's philosophy: make common patterns easy to express correctly. TableGen automates boilerplate, C++ type systems prevent errors, and pattern rewriting provides composable transformations.
+This chapter demonstrated production-quality dialect implementation using TableGen, OpRewritePattern, and OpBuilder. These tools illustrate MLIR's philosophy: make common patterns easy to express correctly. TableGen automates boilerplate, C++ type systems prevent errors, and pattern rewriting provides composable transformations.
 
 **Core Concepts Mastered**:
 
 TableGen's declarative operation specifications replace hundreds of lines of handwritten C++ with concise, readable definitions. The ~10 lines defining AddOp generate ~200 lines of correct, idiomatic C++ code—builders, accessors, parsers, printers, and verifiers. This automation eliminates maintenance burden: change the TableGen spec, and generated code updates automatically. Bugs in generated code (rare, as TableGen is well-tested) affect all MLIR dialects identically, not just yours.
 
-OpRewritePattern provides type-safe lowering through C++ template matching. Each pattern matches specific operation types, receives typed operation references (not generic `Operation*`), and uses PatternRewriter to construct replacement IR. The framework handles pattern application order, value remapping when operations change, and rollback on verification failures. This infrastructure transforms lowering from ad-hoc string manipulation to systematic compiler passes with well-defined semantics.
+OpRewritePattern provides type-safe lowering through C++ template matching. Each pattern matches specific operation types, receives typed operation references (not generic `Operation*`), and uses PatternRewriter to construct replacement IR. The framework handles pattern application order, value remapping when operations change, and rollback on verification failures.
 
-OpBuilder replaces string concatenation with direct IR construction. Instead of formatting text and parsing it, you call C++ methods that build operations directly: `builder.create<AddOp>(loc, lhs, rhs, output)`. This approach catches type errors at compile time, provides IDE autocomplete for operation names and argument types, and integrates seamlessly with MLIR's operation verification. The builder tracks insertion points, handles operation placement, and enforces block/region invariants automatically.
+OpBuilder enables direct IR construction through C++ methods: `builder.create<AddOp>(loc, lhs, rhs, output)`. This approach catches type errors at compile time, provides IDE autocomplete for operation names and argument types, and integrates seamlessly with MLIR's operation verification. The builder tracks insertion points, handles operation placement, and enforces block/region invariants automatically.
 
 **Production Patterns**:
 
@@ -1809,7 +1706,7 @@ The pattern is consistent: declarative specifications for operations, generated 
 
 Generated C++ code compiles to efficient machine code. Operation creation is a handful of pointer operations—allocate storage, initialize fields, insert into parent block. Type checking happens once at C++ compile time, not repeatedly at runtime. Pattern matching uses hash tables on operation names, making lookup efficient even with hundreds of patterns.
 
-The compilation overhead (C++ compilation time) amortizes across development: compile once, run many times. For deployment, only the final executable matters—no Python interpreter, no runtime parsing. This differs from Chapter 8, where Python interpretation overhead and text parsing occur every execution.
+The compilation overhead (C++ compilation time) amortizes across development: compile once, run many times. For deployment, only the final executable matters—no Python interpreter, no runtime parsing.
 
 **Looking Ahead**:
 
@@ -1821,13 +1718,11 @@ Chapter 12 builds complete transformer models, combining attention, feed-forward
 
 **Practical Advice**:
 
-Start new dialects with TableGen, even for prototyping. The initial learning curve pays off quickly—after defining two or three operations, the pattern becomes clear. Use Chapter 8's string approach for one-off test case generation or when teaching MLIR to beginners unfamiliar with C++, but recognize its limitations for serious compiler development.
+Start new dialects with TableGen. The initial learning curve pays off quickly—after defining two or three operations, the pattern becomes clear. Organize TableGen definitions by functionality: core operations in one file, advanced operations in another, experimental operations in a third. This modularity simplifies maintenance as dialects grow.
 
-Organize TableGen definitions by functionality: core operations in one file, advanced operations in another, experimental operations in a third. This modularity simplifies maintenance as dialects grow. Use inheritance in TableGen (base classes for common traits) to reduce duplication across similar operations.
+Write tests early using mlir-opt to verify generated operations parse and print correctly. Custom assemblyFormat specifications can have subtle bugs, so testing immediately after definition catches issues before lowering patterns depend on operations.
 
-Write tests early, using mlir-opt to verify generated operations parse and print correctly. TableGen generates parsers/printers, but custom assemblyFormat specifications can have subtle bugs. Testing immediately after definition catches issues before lowering patterns depend on operations.
-
-Invest time learning MLIR's trait system—traits like Commutative, Idempotent, SameOperandsAndResultType encode operation properties that optimizations exploit. Properly-specified traits enable automatic optimization without custom pattern code.
+Invest time learning MLIR's trait system—traits like Commutative, Idempotent, and SameOperandsAndResultType encode operation properties that optimizations exploit. Properly-specified traits enable automatic optimization without custom pattern code.
 
 **Resources for Deeper Learning**:
 
@@ -1845,12 +1740,6 @@ For pattern rewriting:
 - **PatternRewrite.md**: OpRewritePattern documentation with best practices
 - **mlir/lib/Dialect/Linalg/Transforms**: Real-world lowering patterns in production code
 
-**Final Thoughts**:
-
-You now possess both pedagogical tools (Chapter 8's strings) and production techniques (Chapter 9's TableGen). The former teaches concepts, the latter scales to industrial systems. As you build MLIR dialects, lean on TableGen for correctness, use OpRewritePattern for composability, and trust OpBuilder for IR construction. These tools—designed by compiler experts, refined over years, adopted by major frameworks—provide the foundation for building correct, performant, maintainable compilers.
-
-The journey from Python strings to TableGen declarations mirrors MLIR's own evolution. Early MLIR development used ad-hoc operation definitions; experience led to TableGen and ODS. By learning both approaches, you've traced compiler infrastructure's maturation from prototype to production. Apply these lessons as you design your own dialects: start simple, but structure for growth. Declarative specifications, type-safe transformations, and automated code generation aren't luxuries—they're necessities for serious compiler development.
-
-Part II concludes with a toolkit for building custom MLIR dialects: fixed-size tensors (Chapter 5), dynamic shapes (Chapter 6), sophisticated operations (Chapter 7), string-based prototyping (Chapter 8), and production TableGen definitions (Chapter 9). Part III builds on this foundation, exploring optimizations that transform high-level operations into efficient low-level code. The neural network dialect we've built becomes a vehicle for understanding how modern ML compilers achieve performance through systematic transformation.
+Part II concludes with a toolkit for building custom MLIR dialects: fixed-size tensors (Chapter 5), dynamic shapes (Chapter 6), sophisticated operations (Chapter 7), custom dialects (Chapter 8), and production TableGen definitions (Chapter 9). Part III builds on this foundation, exploring optimizations that transform high-level operations into efficient low-level code.
 
 Continue to Chapter 10, where we optimize this dialect's operations, unlocking performance through algebraic simplifications, loop transformations, and memory optimizations—the techniques that distinguish research toys from production compilers.

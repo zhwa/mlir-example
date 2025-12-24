@@ -542,17 +542,79 @@ Naive approach computes KV cache for `[1..10]` three times—identical computati
   └─ [1, 2, 3, 10, 11]
 ```
 
-**Radix Tree Solution**. A **radix tree** (prefix tree / trie) stores KV cache nodes indexed by token sequences:
+**Radix Tree Solution**. Before diving into implementation, let's understand what radix trees are and why they're perfect for prefix caching.
+
+**What is a Radix Tree?** A radix tree (also called radix trie or compressed trie) is a space-optimized tree data structure where nodes can represent sequences of elements, not just single elements. Unlike a standard trie where each node represents one character/token, radix tree nodes can store multiple tokens, reducing tree depth and memory overhead.
+
+**Key Properties**:
+1. **Path Compression**: Chains of nodes with single children are compressed into one node storing the entire sequence
+2. **Prefix Matching**: Any path from root to node represents a shared prefix among requests
+3. **Efficient Lookup**: Finding longest matching prefix is O(m) where m is the length of the query sequence
+4. **Space Efficient**: Fewer nodes than standard tries, especially when sequences share long prefixes
+
+**Comparison: Standard Trie vs Radix Tree**:
 
 ```
-Root
- ├─ [1, 2, 3] (cached)
- │   ├─ [4, 5] (cached)
- │   │   ├─ [6, 7] (cached) ← Request 1
- │   │   └─ [8, 9] (cached) ← Request 2
- │   └─ [10, 11] (cached) ← Request 3
- └─ [50, 51] (cached) ← Different prefix
+Standard Trie (one token per node):
+         root
+          |
+          1
+          |
+          2
+          |
+          3
+        /   \
+       4     10
+       |      |
+       5     11
+      / \
+     6   8
+     |   |
+     7   9
+
+Radix Tree (compressed paths):
+       root
+         |
+    [1,2,3]
+      /   \
+  [4,5]  [10,11]
+   / \
+[6,7] [8,9]
+
+Nodes: 14 → 6 (57% reduction!)
+Height: 7 → 3 (57% reduction!)
 ```
+
+**Why Radix Trees for KV Cache?** Three reasons make radix trees ideal for LLM serving:
+
+1. **Natural Prefix Structure**: Real workloads have common prefixes (system prompts, few-shot examples, document context). A radix tree naturally exploits this structure.
+
+2. **Storage Efficiency**: Each node can reference physical KV cache pages directly. Shared prefixes share pages—automatic deduplication.
+
+3. **LRU Eviction**: Tree structure makes it easy to find least-recently-used leaf nodes for eviction when memory is full.
+
+**Radix Tree for Token Sequences**. In our case, each node stores:
+- Token sequence it represents (e.g., `[1, 2, 3]`)
+- KV cache pages allocated for these tokens
+- Children (next possible tokens)
+- Metadata (reference count, last access time)
+
+```
+Root (empty)
+ ├─ Node([1, 2, 3]) → pages [0, 1, 2]
+ │   ├─ Node([4, 5]) → pages [3, 4]
+ │   │   ├─ Node([6, 7]) → pages [5, 6] ← Request 1 path
+ │   │   └─ Node([8, 9]) → pages [7, 8] ← Request 2 path
+ │   └─ Node([10, 11]) → pages [9, 10] ← Request 3 path
+ └─ Node([50, 51]) → pages [11, 12] ← Different prefix
+```
+
+When Request 2 arrives with tokens `[1, 2, 3, 4, 5, 8, 9]`, we traverse:
+1. Match `[1, 2, 3]` → reuse pages [0, 1, 2]
+2. Match `[4, 5]` → reuse pages [3, 4]
+3. Create new branch for `[8, 9]` → allocate pages [7, 8]
+
+**Result**: Only 2 new pages allocated instead of 7! This is the power of prefix sharing.
 
 **Radix Node Structure**:
 
@@ -874,11 +936,93 @@ Decode Phase:
   - Batch size: Large (32-256 requests) × 1 token each
 ```
 
-**Separate Schedulers**:
+**Scheduling Fundamentals**. Before implementing schedulers, let's understand the core scheduling concepts and why separate schedulers for prefill and decode are necessary.
+
+**What is a Scheduler?** In LLM serving, a scheduler decides **which requests to execute** and **in what order** at each iteration. Unlike traditional OS schedulers that assign CPU time to processes, LLM schedulers manage GPU compute and memory resources across concurrent generation requests.
+
+**Key Scheduling Decisions**:
+1. **Request Selection**: Which waiting requests should start prefill?
+2. **Batch Formation**: How to group requests for parallel execution?
+3. **Resource Allocation**: How much memory (KV cache) and compute (tokens) per batch?
+4. **Fairness**: How to balance throughput (serve many requests) with latency (serve each request quickly)?
+
+**Classic Scheduling Algorithms** (adapted for LLM serving):
+
+1. **First-Come-First-Served (FCFS)**: Process requests in arrival order
+   - **Pros**: Simple, fair in terms of waiting time
+   - **Cons**: Long requests block short ones (convoy effect)
+   - **Use Case**: Prefill scheduling with token budget
+
+2. **Round-Robin**: Rotate through requests, giving each a time slice
+   - **Pros**: Fair, prevents starvation
+   - **Cons**: Context switching overhead (in LLMs, chunking overhead)
+   - **Use Case**: Chunked prefill (Chapter 16 Part 3)
+
+3. **Shortest Job First (SJF)**: Process shortest requests first
+   - **Pros**: Minimizes average latency
+   - **Cons**: Long requests can starve (unfair)
+   - **Use Case**: Not commonly used in LLM serving (starvation risk)
+
+4. **All-at-Once**: Batch all ready requests together
+   - **Pros**: Maximum GPU utilization
+   - **Cons**: Variable batch size, potential unfairness
+   - **Use Case**: Decode scheduling (batch all running requests)
+
+**Why Separate Prefill and Decode Schedulers?** The two phases have fundamentally different characteristics requiring different scheduling strategies:
+
+**Prefill Phase Challenges**:
+- **Variable compute**: 50-token prompt takes 5ms, 2000-token prompt takes 200ms
+- **Memory-bound admission**: Can't start request if insufficient KV cache memory
+- **Convoy effect**: Long prompts block short ones in FCFS
+- **Solution**: FCFS with token budget + chunked prefill (optional)
+
+**Decode Phase Challenges**:
+- **Fixed compute per request**: Each request generates exactly 1 token
+- **High parallelism opportunity**: Batch dimension is natural parallelism axis
+- **Variable completion times**: Some finish after 5 tokens, others after 100+
+- **Solution**: Batch all running requests (all-at-once strategy)
+
+**Token Budget Concept**. A **token budget** limits total tokens processed in a single prefill batch. This provides:
+
+1. **Memory Predictability**: Budget translates to maximum memory footprint (tokens × bytes_per_token)
+2. **Latency Bound**: Maximum prefill time is bounded by budget ÷ throughput
+3. **Fairness**: Prevents single long prompt from monopolizing GPU
+
+Example: Budget = 512 tokens
+- Batch 1: [500 tokens] → 1 request
+- Batch 2: [200, 200, 100] → 3 requests (total 500)
+- Batch 3: [50, 50, 50, 50] → 4 requests (total 200)
+
+**Max Batch Size Concept**. A **max batch size** limits concurrent requests in decode phase. This provides:
+
+1. **Memory Safety**: Each request holds KV cache; too many requests cause OOM
+2. **Latency Control**: Larger batches increase per-iteration latency
+3. **Hardware Limits**: GPU memory and compute have hard limits
+
+Example: Max batch size = 32
+- If 50 requests running: batch first 32, remaining 18 wait for next iteration
+- If 10 requests running: batch all 10
+
+**Scheduling Metrics**:
+- **Throughput**: Tokens generated per second (higher is better)
+- **Latency**: Time from request submission to first token (lower is better)
+- **Time-to-first-token (TTFT)**: Prefill latency (critical for interactive workloads)
+- **Time-per-output-token (TPOT)**: Decode latency (important for streaming)
+- **Fairness**: Variance in latency across requests (lower variance is fairer)
+
+With this foundation, we can now understand how prefill and decode schedulers implement these concepts.
+
+**Separate Schedulers Implementation**:
 
 ```python
 class PrefillManager:
-    """Schedules prefill phase (prompt processing)"""
+    """Schedules prefill phase (prompt processing)
+    
+    Strategy: FCFS with token budget
+    - Prevents convoy effect by limiting batch token count
+    - Ensures bounded prefill latency
+    - Enables fair scheduling when combined with chunked prefill
+    """
     
     def __init__(self, token_budget=512):
         self.queue = []

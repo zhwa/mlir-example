@@ -138,12 +138,7 @@ func.func @compute(%arg: memref<8x16xf32>) -> memref<8x16xf32> {
 }
 ```
 
-The problems:
-
-1. **Memory allocation**: Where do memrefs come from? Who allocates them?
-2. **Ownership**: Who is responsible for freeing allocated memory?
-3. **ABI mismatch**: Returning pointers is problematic (who owns the memory?)
-4. **Mutability**: Tensors are immutable values; memrefs are mutable pointers. Different semantics!
+The problems are multifaceted. First, **memory allocation** raises the question: where do memrefs come from and who allocates them? Second, **ownership** becomes ambiguous: who is responsible for freeing allocated memory? Third, **ABI mismatch** creates problems because returning pointers is problematic—who owns the returned memory? Finally, **mutability** represents a semantic shift: tensors are immutable values while memrefs are mutable pointers, representing fundamentally different semantics.
 
 One-Shot Bufferize solves these problems through a multi-step transformation.
 
@@ -254,12 +249,7 @@ func.func @matmul_add(%A: memref<8x32xf32>,
 }
 ```
 
-Key transformations:
-1. Return type removed, replaced with out-parameter `%out`
-2. `tensor.empty` → `memref.alloc` (explicit allocation)
-3. Operations now mutate buffers in-place (no return values)
-4. Temporary buffer allocated for intermediate result
-5. Deallocation inserted for temporary (memory management)
+Key transformations occur throughout the function. The return type is removed and replaced with an out-parameter `%out`. The `tensor.empty` operation transforms into `memref.alloc`, making allocation explicit. Operations now mutate buffers in-place rather than producing return values. A temporary buffer is allocated for the intermediate result. Finally, deallocation is inserted for the temporary to handle memory management correctly.
 
 ### Configuration: bufferizeFunctionBoundaries
 
@@ -305,11 +295,7 @@ func.func @compute(%A: memref<8x16xf32>) -> memref<8x16xf32> {
 }
 ```
 
-Issues:
-1. **Ownership ambiguity**: Who owns the returned memref? Caller or callee?
-2. **Deallocation responsibility**: Who calls `memref.dealloc`? If caller, they must track ownership. If callee, can't return the buffer!
-3. **ABI complexity**: Returning pointers requires special calling conventions (NRVO, RVO in C++)
-4. **Optimization barriers**: Return values complicate inlining and optimization
+Several critical issues arise from returning pointers. **Ownership ambiguity** means it's unclear who owns the returned memref—is it the caller or the callee? **Deallocation responsibility** is equally unclear: who should call `memref.dealloc`? If the caller is responsible, they must carefully track ownership. If the callee handles it, then the buffer can't be returned. **ABI complexity** emerges because returning pointers requires special calling conventions like NRVO (Named Return Value Optimization) or RVO (Return Value Optimization) found in C++. Finally, **optimization barriers** appear because return values complicate inlining and other optimizations.
 
 ### The Solution: Out-Parameters
 
@@ -495,11 +481,7 @@ func.func @gemm(%A: memref<?x?xf32>,  // tensor → memref
 ```
 
 Key changes:
-- All `tensor<...>` → `memref<...>`
-- `tensor.empty` → `memref.alloc` (explicit allocation)
-- `tensor.dim` → `memref.dim` (same operation, different operand type)
-- Linalg operations no longer return values (mutate outputs in-place)
-- Function still returns memref (problem for next pass!)
+After this pass completes, several key changes are visible in the IR. All `tensor<...>` types have been converted to `memref<...>` types throughout the function. The `tensor.empty` operation transforms into `memref.alloc`, making allocation explicit. Similarly, `tensor.dim` becomes `memref.dim`—the same operation but with different operand types. Linalg operations no longer return values and instead mutate outputs in-place. However, the transformation is incomplete: the function itself still returns a memref, creating a problem that the next pass must address.
 
 ### Pass 3: Buffer-Results-To-Out-Params
 
@@ -775,14 +757,7 @@ MemRefs are not just pointers—they're **descriptors** that bundle a base point
 
 ### The Anatomy of a MemRef: More Than a Pointer
 
-In C, an array is just a pointer. In MLIR, a `memref` is a structured descriptor containing:
-
-1. **Allocated pointer**: Base address returned by `malloc` (for alignment tracking)
-2. **Aligned pointer**: Actual data start (may be offset from allocated for alignment)
-3. **Offset**: Additional offset from aligned pointer to first element
-4. **Sizes**: Dimension sizes (e.g., `[8, 16]` for 8×16 matrix)
-5. **Strides**: Step size in elements between adjacent indices (e.g., `[16, 1]` for row-major)
-6. **Layout map** (optional): Affine transformation from indices to offsets
+In C, an array is just a pointer. In MLIR, a `memref` is a structured descriptor containing six essential components. The **allocated pointer** is the base address returned by `malloc`, maintained for alignment tracking purposes. The **aligned pointer** marks the actual data start, which may be offset from the allocated pointer to meet alignment requirements. The **offset** provides an additional offset from the aligned pointer to the first element. The **sizes** array holds dimension sizes, such as `[8, 16]` for an 8×16 matrix. The **strides** array specifies the step size in elements between adjacent indices, like `[16, 1]` for row-major layout. Finally, the optional **layout map** represents an affine transformation from indices to memory offsets.
 
 The layout map is what makes MemRefs powerful. It determines how `memref.load %M[%i, %j]` computes the physical memory address.
 
@@ -931,10 +906,7 @@ Putting it all together, a MemRef like `memref<8x16xf32, #transpose_map>` contai
 | Strides | `[1, 8]` | Physical strides (transposed!) |
 | Layout map | `(d0,d1)->(d1,d0)` | Index transformation |
 
-When you `load [i, j]`:
-1. Apply layout map: `(i, j)` → `(j, i)`
-2. Compute offset: `j * stride[0] + i * stride[1]` = `j * 1 + i * 8`
-3. Load from: `aligned_ptr + offset`
+When you `load [i, j]`, the hardware performs a three-step process. First, it applies the layout map to transform indices: `(i, j)` becomes `(j, i)`. Second, it computes the offset using the transformed indices and strides: `j * stride[0] + i * stride[1]`, which equals `j * 1 + i * 8`. Finally, it loads from the computed address: `aligned_ptr + offset`.
 
 This architecture enables zero-cost logical transformations while maintaining straightforward physical memory access.
 
@@ -962,16 +934,10 @@ builder.create<linalg::MatmulOp>(loc, TypeRange{}, ValueRange{argA, argB}, Value
 ```
 
 **Advantages**:
-- Simpler: No bufferization passes needed
-- Direct: IR matches execution model (mutable buffers)
-- Fewer passes: Shorter compilation pipeline
-- Easier to debug: What you write is what executes
+The direct memref approach offers several benefits. It's simpler because no bufferization passes are needed. The IR is direct, matching the execution model of mutable buffers exactly. The compilation pipeline has fewer passes, making it shorter overall. Debugging becomes easier since what you write is what executes, without intermediate transformations obscuring the connection.
 
 **Disadvantages**:
-- Less optimization: Aliasing restricts transformations
-- Manual memory: Must think about buffer lifetimes from the start
-- Not idiomatic: Most ML frameworks produce tensor IR
-- Limited fusion: Alias analysis required for safety
+However, this approach comes with significant drawbacks. Optimization suffers because aliasing restricts transformations—the compiler must be conservative. Memory management is manual, requiring you to think about buffer lifetimes from the start. It's not idiomatic since most ML frameworks produce tensor IR, not memref IR. Operation fusion is limited because alias analysis is required for safety, often preventing optimizations that would be valid with tensors.
 
 ### Tensor + Bufferization Approach (Chapter 4)
 
@@ -988,56 +954,28 @@ builder.create<func::ReturnOp>(loc, result);
 ```
 
 **Advantages**:
-- Better optimization: Functional semantics enable aggressive transformations
-- Idiomatic: Matches how ML frameworks represent models
-- Automatic memory: Bufferization inserts allocations intelligently
-- More fusion: No aliasing concerns at tensor level
+The tensor approach provides powerful benefits. Optimization improves dramatically because functional semantics enable aggressive transformations without aliasing concerns. It's idiomatic, matching how ML frameworks like PyTorch, TensorFlow, and JAX represent models. Memory management becomes automatic as bufferization inserts allocations intelligently based on liveness analysis. Operation fusion becomes more effective since there are no aliasing concerns at the tensor level, enabling optimizations that would be unsafe with memrefs.
 
 **Disadvantages**:
-- More complex: Additional passes and concepts to understand
-- Longer compilation: Bufferization adds overhead
-- Debugging harder: Multiple IR transformations to trace
-- Learning curve: Must understand bufferization semantics
+The complexity increases in several ways. The approach is more complex overall, requiring understanding of additional passes and concepts. Compilation takes longer since bufferization adds overhead to the pipeline. Debugging becomes harder because multiple IR transformations must be traced to understand execution. There's a learning curve as developers must understand bufferization semantics and how tensors lower to memrefs.
 
 ### When to Use Each Approach
 
-**Use direct memrefs** when:
-- Building low-level libraries where you need full control over memory layout
-- Interfacing with existing C APIs that use pointers
-- Implementing custom memory management strategies
-- Working on memory-constrained systems (embedded, mobile)
-- Compilation time is critical (development, interactive use)
+**Use direct memrefs** in scenarios requiring low-level control or C integration. This includes building low-level libraries where you need full control over memory layout, interfacing with existing C APIs that use pointers, implementing custom memory management strategies, working on memory-constrained systems like embedded devices or mobile platforms, and situations where compilation time is critical such as development and interactive use.
 
-**Use tensors + bufferization** when:
-- Building high-level ML compilers (framework frontends)
-- Optimization is the top priority (production serving)
-- Interfacing with tensor-based systems (PyTorch, TensorFlow, JAX)
-- Leveraging MLIR's optimization passes (fusion, tiling, vectorization)
-- Following MLIR best practices for new code
+**Use tensors + bufferization** for high-level compiler construction and optimization-focused work. This approach suits building high-level ML compilers that serve as framework frontends, situations where optimization is the top priority such as production serving, interfacing with tensor-based systems like PyTorch, TensorFlow, and JAX, leveraging MLIR's optimization passes for fusion, tiling, and vectorization, and following MLIR best practices for new code.
 
 ### The Practical Reality
 
-In practice, production MLIR systems use a **hybrid approach**:
+In practice, production MLIR systems use a **hybrid approach** that combines the strengths of both representations across different compilation stages.
 
-1. **Frontend** (framework → MLIR): Generates tensor-based IR
-   - Import PyTorch/TensorFlow models as tensor ops
-   - Apply high-level optimizations (fusion, constant folding)
-   - Perform shape inference and specialization
+The **frontend** stage, converting from frameworks to MLIR, generates tensor-based IR. This includes importing PyTorch or TensorFlow models as tensor operations, applying high-level optimizations like fusion and constant folding, and performing shape inference and specialization.
 
-2. **Middle-end** (optimization): Operates on tensors
-   - Aggressive fusion (attention, FFN, etc.)
-   - Tiling for cache locality
-   - Vectorization
+The **middle-end** optimization stage operates entirely on tensors. This is where aggressive fusion happens for operations like attention and feed-forward networks, tiling is applied for cache locality, and vectorization transforms sequential operations into SIMD instructions.
 
-3. **Bufferization** (tensor → memref): One-Shot Bufferize pass
-   - Converts to imperative form
-   - Inserts allocations and deallocations
-   - Adjusts calling conventions (out-parameters)
+The **bufferization** stage serves as the critical bridge from tensors to memrefs. The One-Shot Bufferize pass converts the functional form to imperative form, inserts allocations and deallocations where needed, and adjusts calling conventions to use out-parameters instead of return values.
 
-4. **Backend** (lowering → code gen): Operates on memrefs
-   - Lower to loops
-   - Target-specific optimizations
-   - Code generation
+Finally, the **backend** stage, handling lowering and code generation, operates on memrefs. This includes lowering to explicit loops, applying target-specific optimizations for particular hardware, and generating final machine code.
 
 Each stage uses the representation best suited to its task. Tensors for optimization, memrefs for execution.
 
@@ -1047,54 +985,31 @@ To understand where bufferization fits in real systems, let's examine how produc
 
 ### TensorFlow → XLA → MLIR
 
-TensorFlow's XLA (Accelerated Linear Algebra) compiler uses MLIR internally:
+TensorFlow's XLA (Accelerated Linear Algebra) compiler uses MLIR internally.
 
-**Stage 1: TensorFlow Graph → MLIR HLO** (High-Level Operations)
-- Tensor-based operations (`mhlo.add`, `mhlo.dot`, etc.)
-- Functional semantics throughout
-- Graph-level optimizations (constant folding, algebraic simplification)
+**Stage 1: TensorFlow Graph to MLIR HLO** (High-Level Operations) uses tensor-based operations like `mhlo.add` and `mhlo.dot`, maintaining functional semantics throughout. Graph-level optimizations include constant folding and algebraic simplification.
 
-**Stage 2: HLO Optimizations**
-- Operation fusion (combine multiple ops into fused kernels)
-- Layout assignment (decide NCHW vs NHWC, etc.)
-- All optimizations on tensor IR (no aliasing concerns)
+**Stage 2: HLO Optimizations** apply operation fusion to combine multiple operations into fused kernels, perform layout assignment to decide between formats like NCHW versus NHWC, and execute all optimizations on tensor IR without aliasing concerns.
 
-**Stage 3: Bufferization**
-- One-Shot Bufferize converts tensors → memrefs
-- Insert buffer allocations for intermediate results
-- Convert to imperative calling conventions
+**Stage 3: Bufferization** uses One-Shot Bufferize to convert tensors into memrefs, inserts buffer allocations for intermediate results, and converts to imperative calling conventions.
 
-**Stage 4: Lowering to LLVM/PTX**
-- MemRef-based IR lowers to target code
-- CPU: LLVM IR → x86/ARM assembly
-- GPU: LLVM IR → PTX (NVIDIA) or AMDGPU code
+**Stage 4: Lowering to LLVM/PTX** takes the memref-based IR and lowers it to target code. For CPU, this means generating LLVM IR that becomes x86 or ARM assembly. For GPU, LLVM IR becomes PTX for NVIDIA or AMDGPU code.
 
 Bufferization happens late, after all high-level optimizations complete.
 
 ### PyTorch → torch-mlir → LLVM
 
-PyTorch 2.0's `torch.compile` can use MLIR through torch-mlir:
+PyTorch 2.0's `torch.compile` can use MLIR through torch-mlir.
 
-**Stage 1: PyTorch Model → TorchScript/FX Graph**
-- Trace or script Python model
-- Capture computation graph
+**Stage 1: PyTorch Model to TorchScript/FX Graph** begins by tracing or scripting the Python model to capture the computation graph.
 
-**Stage 2: TorchScript → torch-mlir**
-- Import into `torch` dialect (tensor-based)
-- Operations like `torch.aten.matmul`, `torch.aten.relu`
+**Stage 2: TorchScript to torch-mlir** imports the graph into the `torch` dialect, which is tensor-based and includes operations like `torch.aten.matmul` and `torch.aten.relu`.
 
-**Stage 3: torch dialect → linalg dialect**
-- Lower high-level torch ops to linalg structured ops
-- Still tensor-based
-- Enable generic optimizations (tiling, vectorization)
+**Stage 3: torch dialect to linalg dialect** converts high-level torch operations to linalg structured operations while remaining tensor-based, enabling generic optimizations like tiling and vectorization.
 
-**Stage 4: Bufferization**
-- One-Shot Bufferize (linalg tensors → linalg memrefs)
-- Memory management inserted
+**Stage 4: Bufferization** uses One-Shot Bufferize to transform linalg tensors into linalg memrefs, inserting memory management as needed.
 
-**Stage 5: Lowering to execution**
-- Linalg → Loops → LLVM
-- Generate CPU/GPU code
+**Stage 5: Lowering to execution** proceeds through the sequence Linalg to Loops to LLVM, generating CPU or GPU code as appropriate.
 
 Again, bufferization is the bridge between high-level optimization and low-level execution.
 
@@ -1200,11 +1115,11 @@ For learning and development, defaults work well. For production optimization, t
 
 This chapter covered bufferization—MLIR's transformation from functional tensor IR to imperative memref IR. The key insights:
 
-1. **Two representations, two purposes**: Tensors enable optimization (functional, no aliasing), memrefs enable execution (imperative, matches hardware). Each serves a critical role in the compilation pipeline.
+This chapter covered a broad landscape. We explored **two representations with distinct purposes**: tensors enable optimization through functional semantics and absence of aliasing, while memrefs enable execution through imperative semantics that match hardware reality. Each serves a critical role in the compilation pipeline.
 
-2. **Read-after-write hazards**: Naive bufferization can produce incorrect results when tensors are read after being written. One-Shot Bufferize performs alias analysis and conflict detection to prevent these bugs while maximizing in-place updates.
+We examined **read-after-write hazards**, where naive bufferization can produce incorrect results when tensors are read after being written. One-Shot Bufferize performs alias analysis and conflict detection to prevent these bugs while maximizing in-place updates.
 
-3. **One-Shot Bufferize**: A sophisticated whole-program transformation that converts tensors to memrefs while analyzing aliasing, inserting allocations, and enabling safe in-place updates. Not a simple type substitution.
+**One-Shot Bufferize** emerged as a sophisticated whole-program transformation that converts tensors to memrefs while analyzing aliasing, inserting allocations, and enabling safe in-place updates. It's far more than a simple type substitution, involving complex liveness and aliasing analyses.
 
 4. **Buffer-Results-To-Out-Params**: Converts return values to out-parameters, matching C calling conventions and enabling clean Python bindings. Essential for interoperability.
 

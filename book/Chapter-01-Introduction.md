@@ -77,15 +77,11 @@ The IR is platform-independent but low-level enough to map efficiently to machin
 
 Imagine building a translation service for 10 languages. The naive approach requires 10×9 = 90 different translators (each language to every other). A smarter approach uses one common "pivot language"—now you need only 10×2 = 20 translators.
 
-This is exactly what IR does for compilers:
+This is exactly what IR does for compilers. By introducing an intermediate representation between source languages and target machines, we dramatically reduce complexity while enabling powerful optimizations. When you compile C++ to ARM, the compiler first translates C++ to IR, then IR to ARM instructions. When a Rust developer targets x86, their compiler translates Rust to that same IR, then to x86. This means that optimizations written for the IR automatically benefit every language and every target—you write an optimization once, and it works for all combinations.
 
-**Benefits of IR:**
-1. **Language Independence**: Many source languages (C, C++, Rust, Swift) compile to the same IR
-2. **Target Independence**: One IR generates code for many targets (x86, ARM, RISC-V)
-3. **Optimization**: Write optimizations once, benefit all languages and targets
-4. **Analysis**: Easier to analyze and transform than raw source code
+IR provides **language independence** because many source languages (C, C++, Rust, Swift, and dozens more) compile to the same intermediate form. It offers **target independence** because that same IR can generate efficient code for many hardware targets (x86, ARM, RISC-V, and more). Beyond simplifying the compiler architecture, IR makes **optimization** practical at scale: writing a dead code elimination pass once in the IR benefits every language targeting every platform. IR also makes **analysis** easier—its explicit structure and constraints (like SSA form) make it simpler to reason about program behavior than raw source code with its implicit semantics and complex control flow.
 
-The most famous IR is LLVM IR, which powers compilers for dozens of languages.
+The most famous IR is LLVM IR, which powers compilers for dozens of languages and enables the optimization passes that make modern compilers competitive with hand-tuned assembly.
 
 ### The Structure of IR
 
@@ -130,24 +126,11 @@ One IR is not enough for modern computing.
 
 ### The Rise of Heterogeneous Computing
 
-Consider the journey of a transformer model from high-level Python to silicon:
+Consider the journey of a transformer model from high-level Python to silicon. At the framework level, you write code using PyTorch tensors, attention operations, and layer normalization. These high-level abstractions get compiled into computational graphs where the compiler identifies fusion opportunities. The graph then lowers to kernel-level operations: matrix multiplies with specific memory layouts and optimized data movement. Finally, this generates hardware-level instructions for CPU/GPU execution, including register allocation and cache hierarchy management.
 
-1. **Framework Level**: PyTorch tensors, attention operations, layer normalization
-2. **Graph Level**: Computational graphs with fusion opportunities
-3. **Kernel Level**: Matrix multiplies, memory layouts, data movement
-4. **Hardware Level**: CPU/GPU instructions, registers, cache hierarchies
+When LLVM was created in the early 2000s, computing was simpler. Most code ran on CPUs, which improved performance primarily through clock speed increases. One intermediate representation served most compilation needs, since the variation between hardware targets was limited.
 
-When LLVM was created in the early 2000s, computing was simpler:
-- Most code ran on CPUs
-- CPUs improved through clock speed increases
-- One IR served most needs
-
-Today's world is radically different:
-- **CPUs** with complex instruction sets
-- **GPUs** for parallel computation (CUDA, ROCm)
-- **TPUs** (Tensor Processing Units) for machine learning
-- **FPGAs** for custom hardware acceleration
-- **NPUs** (Neural Processing Units) for AI inference
+Today's world is radically different. Modern systems combine CPUs with complex instruction sets, GPUs for parallel computation (CUDA, ROCm), TPUs (Tensor Processing Units) optimized for machine learning workloads, FPGAs for custom hardware acceleration, and NPUs (Neural Processing Units) specialized for AI inference. Each processor has different programming models, optimization opportunities, and constraints. A compiler that generates optimal code for one target may generate inefficient code for another.
 
 Each processor has different programming models, optimization opportunities, and constraints.
 
@@ -162,11 +145,7 @@ At high level, you want to express:
 C = A @ B  # Matrix multiplication
 ```
 
-This operation could be:
-- Optimized with tiling and cache blocking
-- Parallelized across cores
-- Mapped to GPU tensor cores
-- Compiled to specialized TPU instructions
+This simple operation opens a vast optimization space. It could be optimized with tiling and cache blocking to maximize data reuse in CPU caches. It could be parallelized across cores to leverage multicore CPUs. It could be mapped to GPU tensor cores, which provide specialized hardware for matrix operations. For specialized accelerators, it could be compiled to TPU instructions optimized for dense linear algebra. The "what" (matrix multiplication) remains constant, but the "how" (implementation strategy) varies dramatically by target hardware.
 
 But in LLVM IR, you have only loops and memory operations:
 ```llvm
@@ -180,25 +159,11 @@ for.body:
 
 ### Domain-Specific Needs
 
-Many domains have created specialized languages:
+Many domains have created specialized languages to work at appropriate abstraction levels. Machine learning uses TensorFlow graphs and PyTorch TorchScript to represent neural network operations. Databases rely on SQL query plans with specialized optimization rules. Graphics uses shader languages like GLSL and HLSL for parallel rendering operations. Scientific computing extends Fortran with high-performance constructs for array operations.
 
-- **Machine Learning**: TensorFlow graphs, PyTorch TorchScript
-- **Databases**: SQL query plans and optimization
-- **Graphics**: Shader languages (GLSL, HLSL)
-- **Scientific Computing**: High-performance Fortran constructs
+Each domain shares common goals: represent operations naturally at the right abstraction level, apply domain-specific optimizations that generic compilers cannot perform, and eventually compile to efficient machine code for the target hardware. The challenge is that these goals require compiler infrastructure—type systems, optimization frameworks, code generation—that's expensive to build and maintain.
 
-Each domain wants to:
-1. Represent operations naturally at the right abstraction level
-2. Apply domain-specific optimizations
-3. Eventually compile to efficient machine code
-
-The traditional approach? Each domain builds its complete compiler infrastructure from scratch:
-- Reimplementing basic compiler passes
-- Reinventing optimization techniques
-- Duplicating testing and tooling
-- Limited interoperability between systems
-
-There must be a better way.
+The traditional approach has each domain building its complete compiler infrastructure from scratch. This means reimplementing basic compiler passes that are conceptually identical across domains (like dead code elimination or constant folding), reinventing optimization techniques that have been solved elsewhere, duplicating testing and tooling infrastructure, and ending up with limited interoperability between systems. A machine learning framework can't easily leverage optimizations from a database compiler, even when they're solving similar problems. There must be a better way.
 
 ---
 
@@ -206,48 +171,21 @@ There must be a better way.
 
 ### The Fragmented Landscape Before MLIR
 
-Before MLIR emerged in 2019, the machine learning compiler landscape was particularly fragmented. Each major framework built its own complete compilation stack:
+Before MLIR emerged in 2019, the machine learning compiler landscape was particularly fragmented. Each major framework built its own complete compilation stack.
 
-**TensorFlow** used GraphDef as its internal representation:
-- Custom graph IR with fixed operation vocabulary
-- Limited extensibility for new operations
-- Separate optimization passes reimplemented from scratch
-- Difficult to integrate with other frameworks
+**TensorFlow** used GraphDef as its internal representation. This custom graph IR had a fixed operation vocabulary, which limited extensibility when researchers wanted to add new operations. TensorFlow implemented its own optimization passes from scratch, duplicating work done elsewhere. The system's architecture made it difficult to integrate with other frameworks—TensorFlow operations couldn't easily interoperate with other IRs.
 
-**PyTorch** developed TorchScript:
-- Python-like IR for model serialization
-- Ad-hoc optimization strategies
-- Separate lowering paths for different backends
-- Minimal code sharing with other frameworks
+**PyTorch** developed TorchScript, a Python-like IR for model serialization. While this made PyTorch models portable, the optimization strategies were ad-hoc rather than systematic. Different backends (CPU, CUDA, mobile) required separate lowering paths, each implemented independently. The framework shared minimal code with other projects, meaning optimizations developed for PyTorch couldn't benefit other frameworks.
 
-**XLA** (Accelerated Linear Algebra) had HLO (High-Level Optimizer):
-- Fixed set of high-level operations
-- Good for specific use cases but limited extensibility
-- Another isolated compilation stack
-- Complex integration with frameworks
+**XLA** (Accelerated Linear Algebra) had HLO (High-Level Optimizer), which worked well for specific use cases but offered limited extensibility. Google developed HLO primarily for TPUs, and adapting it to new operations or hardware required deep system modifications. Like TensorFlow and PyTorch, XLA represented another isolated compilation stack with complex integration challenges.
 
-Each system reimplemented similar transformations:
-- Operator fusion (combining operations to reduce memory traffic)
-- Layout optimization (choosing memory layouts for efficiency)
-- Device-specific lowering (generating code for GPU, TPU, etc.)
-- Shape inference and propagation
+Each system reimplemented similar transformations. Operator fusion (combining operations to reduce memory traffic) appeared in all three frameworks but with different implementations. Layout optimization (choosing memory layouts for efficiency) was solved independently multiple times. Device-specific lowering (generating code for GPU, TPU, etc.) required separate implementations in each framework. Shape inference and propagation—determining tensor shapes throughout the graph—was duplicated across all systems.
 
-This fragmentation meant:
-- Thousands of person-hours duplicated across teams
-- Innovations in one framework couldn't easily transfer to others
-- Each new hardware target required custom integration with every framework
-- Compiler optimizations had to be reimplemented for each IR
+This fragmentation imposed significant costs. Thousands of person-hours were duplicated across teams solving identical problems. Innovations in one framework couldn't easily transfer to others—a clever optimization in TensorFlow couldn't be ported to PyTorch without substantial reengineering. Each new hardware target required custom integration with every framework, multiplying the integration burden. Compiler optimizations had to be reimplemented for each IR, wasting engineering effort that could have been spent on novel research.
 
-Google created MLIR to unify this ecosystem. By providing:
-1. **Extensible dialects** - each framework can define its own operations
-2. **Shared infrastructure** - reusable passes, type system, optimization framework
-3. **Interoperability** - different dialects can coexist and transform between each other
-4. **Progressive lowering** - systematic path from high-level to hardware-specific code
+Google created MLIR to unify this ecosystem. MLIR provides **extensible dialects**, allowing each framework to define its own operations while sharing infrastructure. It offers **shared infrastructure** including reusable passes, a type system, and an optimization framework that all dialects can leverage. Different dialects can **interoperate**, coexisting in the same program and transforming between each other. Finally, MLIR enables **progressive lowering** through a systematic path from high-level to hardware-specific code, where each transformation is explicit and composable.
 
-Today, the ecosystem has consolidated around MLIR:
-- **TensorFlow** uses MLIR for compilation and optimization
-- **PyTorch 2.0** leverages Torch-MLIR for its compilation backend
-- **JAX** uses MLIR (via StableHLO) for its compilation path
+Today, the ecosystem has consolidated around MLIR. TensorFlow uses MLIR for compilation and optimization. PyTorch 2.0 leverages Torch-MLIR for its compilation backend. JAX uses MLIR (via StableHLO) for its compilation path. Serving frameworks like TensorRT-LLM build on MLIR infrastructure.
 - **Serving frameworks** like TensorRT-LLM build on MLIR infrastructure
 
 This unification means optimizations and hardware support developed once benefit the entire ecosystem.
@@ -274,29 +212,17 @@ Each level uses appropriate abstractions for its optimization opportunities.
 
 ### The Dialect System
 
-A **dialect** is a collection of operations, types, and attributes forming a cohesive vocabulary—like a namespace for a specific domain or abstraction level. MLIR ships with dozens of built-in dialects:
+A **dialect** is a collection of operations, types, and attributes forming a cohesive vocabulary—like a namespace for a specific domain or abstraction level. Think of dialects as organizing MLIR's operation vocabulary into logical categories, each serving a specific purpose in the compilation pipeline. MLIR ships with dozens of built-in dialects spanning different abstraction levels.
 
-**High-Level Dialects**:
-- `tensor`: Immutable multi-dimensional arrays (functional style)
-- `linalg`: Linear algebra operations (matmul, conv, transpose)
-- `tosa`: Tensor Operator Set Architecture (NN operations)
+At the **high level**, dialects like `tensor` provide immutable multi-dimensional arrays with functional semantics, `linalg` offers linear algebra operations (matrix multiply, convolution, transpose), and `tosa` (Tensor Operator Set Architecture) supplies neural network operations. These high-level dialects let you express what computation you want without specifying how to implement it.
 
-**Mid-Level Dialects**:
-- `affine`: Polyhedral loop optimization abstractions
-- `scf`: Structured Control Flow (for, while, if)
-- `vector`: Explicit SIMD vector operations
+The **middle level** contains dialects that add structure to computation. The `affine` dialect provides polyhedral loop optimization abstractions that capture loop bounds and memory access patterns. The `scf` (Structured Control Flow) dialect offers familiar programming constructs like for-loops, while-loops, and if-statements. The `vector` dialect makes SIMD vectorization explicit, letting you operate on vector data types directly.
 
-**Low-Level Dialects**:
-- `memref`: Memory references (pointers with shape metadata)
-- `arith`: Arithmetic operations (add, mul, cmp)
-- `cf`: Control Flow (branches, basic blocks)
-- `llvm`: MLIR's representation of LLVM IR
+At the **low level**, dialects get closer to machine semantics. The `memref` dialect represents memory references—essentially pointers with shape metadata—and provides operations for allocation, loading, and storing. The `arith` dialect supplies basic arithmetic operations like addition, multiplication, and comparison. The `cf` (Control Flow) dialect provides unstructured control flow through branches and basic blocks. Finally, the `llvm` dialect represents LLVM IR constructs within MLIR's infrastructure, serving as the bridge to LLVM's code generation.
 
-**Utility Dialects**:
-- `func`: Function definitions and calls
-- `math`: Mathematical functions (exp, log, sqrt)
+MLIR also provides **utility dialects** used across abstraction levels. The `func` dialect handles function definitions and calls, appearing in virtually every MLIR program. The `math` dialect provides mathematical functions like exponential, logarithm, and square root.
 
-This hierarchy enables **progressive lowering**: high-level operations transform into mid-level, then low-level, finally reaching LLVM IR or machine code.
+This hierarchy enables **progressive lowering**: high-level operations transform into mid-level representations, then into low-level operations, finally reaching LLVM IR or machine code. Each level provides appropriate abstractions for its optimization opportunities.
 
 Throughout this book, we'll work with several key dialects. The `func` dialect handles function definitions and calls (used in all chapters). The `linalg` dialect provides linear algebra operations like matrix multiply and convolutions (Chapters 1-11). The `memref` dialect manages memory with operations for allocation, loading, and storing (Chapters 1-8). The `tensor` dialect represents immutable arrays (Chapters 2 and 4). The `arith` dialect supplies arithmetic operations like addition and multiplication (used throughout). The `scf` dialect offers structured control flow with loops and conditionals (Chapters 5-7). Additional dialects like `math` (mathematical functions), `affine` (polyhedral optimization), and `vector` (SIMD operations) appear in later chapters. In Chapters 8-14, we'll even create our own custom dialects.
 
@@ -316,49 +242,25 @@ These custom operations can carry domain-specific semantics, enabling optimizati
 
 ### Reusability Through Infrastructure
 
-MLIR provides infrastructure that all dialects share:
+Beyond the dialect system, MLIR provides shared infrastructure that all dialects can leverage, eliminating the need to rebuild common compiler functionality from scratch. This infrastructure forms the foundation that makes MLIR's composability practical.
 
-**1. Pass Infrastructure**  
-Write transformations once, apply to any dialect:
-- Canonicalization (simplification)
-- Dead code elimination
-- Inlining
-- Loop optimizations
+The **pass infrastructure** lets you write transformations once and apply them to any dialect that exposes the appropriate interfaces. Standard passes like canonicalization (simplification), dead code elimination, inlining, and loop optimizations work across dialects, saving you from reimplementing these fundamental compiler techniques for each new dialect you create or use.
 
-**2. Type System**  
-Dialects define custom types but share common infrastructure:
-- Integer types: `i32`, `i64`
-- Floating point: `f32`, `f64`
-- Tensors: `tensor<2x3xf64>`
-- Custom types: `!mydialect.mytype`
+The **type system** provides common infrastructure that all dialects share while allowing each dialect to define its own custom types. Built-in types include integers (`i32`, `i64`), floating-point numbers (`f32`, `f64`), and tensors (`tensor<2x3xf64>`). Dialects can also introduce custom types using the syntax `!mydialect.mytype`, benefiting from MLIR's type checking and printing infrastructure without reimplementing these features.
 
-**3. Attribute System**  
-Attach compile-time constants and metadata to operations.
+The **attribute system** lets you attach compile-time constants and metadata to operations. Whether storing the value `0.0` for a constant operation, specifying loop unrolling factors, or annotating operations with optimization hints, attributes provide a uniform mechanism for associating data with IR constructs.
 
-**4. Region System**  
-Operations can contain nested regions of code (like function bodies).
+The **region system** allows operations to contain nested blocks of code, enabling representation of structured constructs like function bodies, loop bodies, and conditional branches. This hierarchical structure makes MLIR more powerful than flat instruction lists, capturing program structure explicitly.
 
-**5. Interfaces**  
-Define common behavior across dialects, enabling generic algorithms. For example, a `ShapeInferenceInterface` can work with any operation that implements it.
+Finally, the **interface system** defines common behavior across dialects, enabling generic algorithms that work with any dialect implementing the required interface. For example, a `ShapeInferenceInterface` can work with any operation that implements shape inference methods, regardless of which dialect defines that operation. This polymorphic capability is crucial for building reusable compiler passes.
 
 ### Why This Matters
 
-Consider building a machine learning framework:
+The composability of MLIR's infrastructure dramatically reduces the effort required to build compilers for new domains. Consider the traditional approach to building a machine learning framework: you'd need to build a custom IR for ML operations from scratch, implement custom optimization passes from basic principles, write custom code generation for each target hardware platform, and invest thousands of person-hours in duplicated work that other frameworks have already done.
 
-**Without MLIR** (traditional approach):
-- Build custom IR for ML operations from scratch
-- Implement custom optimization passes
-- Write custom code generation for each target
-- Thousands of person-hours of duplicated work
+With MLIR's composable approach, the landscape changes completely. You can use the existing `tensor` and `linalg` dialects for ML operations instead of defining your own from scratch. You leverage the built-in optimization infrastructure rather than reimplementing fundamental compiler transformations. For code generation, you lower to the `gpu` dialect for GPUs and the `llvm` dialect for CPUs, then reuse LLVM's mature code generation machinery that has been refined over decades. This lets you focus on your unique value-add—whether that's a novel operation scheduler, a new fusion strategy, or domain-specific optimizations—rather than rebuilding the entire compiler stack.
 
-**With MLIR** (composable approach):
-- Use `tensor` and `linalg` dialects for ML operations (already exist)
-- Leverage built-in optimization infrastructure
-- Lower to `gpu` dialect for GPUs, `llvm` dialect for CPUs
-- Reuse LLVM's mature code generation
-- Focus on unique value-add, not infrastructure
-
-This is why major projects have adopted MLIR: TensorFlow, PyTorch 2.0, JAX, and serving frameworks like TensorRT-LLM.
+This is why major projects have adopted MLIR. TensorFlow uses it for compilation and optimization. PyTorch 2.0 leverages Torch-MLIR for its compilation backend. JAX uses MLIR (via StableHLO) for its compilation path. Serving frameworks like TensorRT-LLM build on MLIR infrastructure. The ecosystem consolidation means that innovations in one project—a new optimization pass, support for new hardware, or improved analysis techniques—can benefit the entire community rather than remaining siloed in a single framework's codebase.
 
 ---
 
@@ -368,10 +270,7 @@ The central concept in MLIR is **progressive lowering**—transforming operation
 
 ### What is a Pass?
 
-A pass is a transformation that walks the IR and rewrites it. Passes can:
-- **Lower** operations (replace high-level ops with low-level ones)
-- **Optimize** code (eliminate redundancy, fuse operations)
-- **Canonicalize** patterns (simplify to standard forms)
+A pass is a transformation that walks the IR and rewrites it. Passes can **lower** operations by replacing high-level operations with lower-level equivalents. They can **optimize** code by eliminating redundancy, fusing operations to reduce memory traffic, or reordering computations for better performance. Passes can also **canonicalize** patterns by simplifying code to standard forms that make subsequent transformations easier.
 
 ### The Lowering Pipeline
 
@@ -437,52 +336,15 @@ The transformation is mechanical but powerful: it exposes the loop structure for
 
 ---
 
-## 1.5 Backends: AOT vs JIT Compilation
+## 1.5 Compilation Strategy: JIT for This Book
 
-Once we've lowered to LLVM dialect, we have two execution strategies:
+Once we've lowered MLIR to LLVM dialect, we face a choice: compile ahead-of-time (AOT) to produce executables or libraries, or compile just-in-time (JIT) at runtime. Each approach has tradeoffs involving development speed, runtime performance, and deployment complexity.
 
-### Ahead-of-Time (AOT) Compilation
+This book uses **JIT compilation exclusively**. When you call a function for the first time, MLIR generates the IR, applies optimization passes, compiles to machine code, and executes—all at runtime. This provides immediate feedback during development: you can modify code, re-run your Python script, and see results in seconds rather than waiting for separate compilation and linking steps. For learning MLIR, this rapid iteration is invaluable.
 
-**Process**:
-1. Compile MLIR → LLVM IR → object files
-2. Link object files into shared library or executable
-3. Load and execute at runtime
+JIT compilation does introduce overhead: each function must be compiled before its first execution, taking milliseconds to seconds depending on complexity. For production deployments, AOT compilation often makes more sense since you compile once during build time and execute many times without recompilation overhead. However, Chapter 3 will show how to cache compiled functions, making JIT viable even for production by compiling once and reusing the cached machine code across multiple executions.
 
-**Advantages**:
-- No compilation overhead at runtime
-- Can perform expensive optimizations
-- Suitable for production deployment
-
-**Disadvantages**:
-- Requires separate compilation step
-- Cannot specialize for runtime values
-- Longer development iteration cycle
-
-**Use cases**: Deploying fixed models in production servers, embedded systems, mobile apps.
-
-### Just-in-Time (JIT) Compilation
-
-**Process**:
-1. Generate MLIR at runtime
-2. Apply passes and lower to LLVM
-3. JIT compile to machine code
-4. Execute immediately
-
-**Advantages**:
-- Immediate feedback during development
-- Can specialize for runtime values (shape, batch size)
-- Dynamic optimization opportunities
-
-**Disadvantages**:
-- Compilation overhead (milliseconds per function)
-- Requires compiler toolchain at runtime
-- Memory overhead for IR and compiled code
-
-**Use cases**: Research, experimentation, dynamic models, interactive development. This is the model used by PyTorch's `torch.compile()` and JAX's `jit()`.
-
-### Our Approach: JIT Throughout
-
-This book uses JIT compilation exclusively for three reasons: immediate feedback (compile and test in seconds, not minutes), pedagogical clarity (see IR transformations interactively), and Python integration (natural fit for Python-first ML workflows). Chapter 3 will address JIT's compilation overhead through caching—compile once, reuse many times.
+The comprehensive comparison of compilation strategies—AOT vs JIT tradeoffs, use cases, implementation techniques, and caching mechanisms—appears in Chapter 3. For now, understanding that this book uses JIT for its development speed benefits is sufficient.
 
 ---
 
@@ -515,11 +377,9 @@ This distinction between operations (actions in the graph) and attributes (data 
 
 ### Operations, Values, and Types
 
-Every operation in MLIR has:
-- **Operands**: Input values consumed by the operation (like function arguments)
-- **Results**: Output values produced by the operation
-- **Attributes**: Compile-time constant data (numbers, strings, types, etc.)
-- **Regions**: Optional nested blocks of code (like function bodies)
+### Operations, Values, and Types
+
+Every operation in MLIR has four key components. **Operands** are input values consumed by the operation, similar to function arguments. **Results** are output values produced by the operation—the computed results that flow to subsequent operations. **Attributes** store compile-time constant data like numbers, strings, and types that parameterize the operation. Finally, **regions** are optional nested blocks of code, such as function bodies or loop bodies, that allow operations to contain hierarchical structure.
 
 When you build IR programmatically, you use an `OpBuilder` to create operations. The builder maintains an **insertion point**—a location in the graph where new operations will be added. As you create operations, they're inserted at this point and connected to other operations through their inputs and outputs.
 
@@ -735,7 +595,6 @@ scf.for %i = 0 to 8 {
     }
   }
 }
-}
 ```
 
 Now we have explicit loops iterating over matrix dimensions. The outer loops (i, j) iterate over output positions in C, while the inner loop (k) accumulates the dot product. Inside the innermost loop, we see the fundamental operations: load elements from A and B, multiply them, add to the accumulator, and store back to C. The SCF dialect provides structured loops with well-defined semantics—we'll explore it thoroughly in Chapter 5.
@@ -888,30 +747,9 @@ The ones matrix test provides easy manual verification: each element should be 3
 
 This chapter introduced MLIR's foundational concepts and implemented a complete JIT-compiled matrix multiply. Let's reflect on what we've learned.
 
-**Conceptual Foundations**:
-- The multi-level problem in ML compilation
-- LLVM IR as the low-level foundation
-- MLIR's dialect system for extensible operation vocabularies
-- Progressive lowering through composable passes
-- AOT vs JIT compilation strategies
+## 1.11 Summary
 
-**Practical Implementation**:
-- Generating MLIR IR programmatically with the C++ API
-###n integration via pybind11
-- Testing against NumPy for correctness
-
-**Key Insights**:
-- Declarative operations (`linalg.matmul`) separate "what" from "how"
-- Passes progressively lower abstraction levels
-- Fixed-size memrefs simplify the interface (dynamic shapes add complexity)
-- JIT enables immediate feedback but introduces compilation overhead
-
-**Design Choices**:
-- MemRefs instead of tensors (avoids bufferization complexity for now)
-- Fixed dimensions (8×32×16) for pedagogical clarity
-- JIT compilation for rapid iteration
-
-This chapter introduced MLIR's foundational concepts and implemented a complete JIT-compiled matrix multiply. Let's reflect on what we've learned.
+This chapter introduced MLIR's foundational concepts and implemented a complete JIT-compiled matrix multiply. We explored how the multi-level problem emerged from heterogeneous computing, why LLVM IR alone proved insufficient, and how MLIR's dialect system provides extensible operation vocabularies at different abstraction levels. Through progressive lowering and composable passes, MLIR transforms high-level operations into executable machine code while maintaining optimization opportunities at each stage.
 
 We began by understanding the traditional compiler pipeline and why one intermediate representation isn't sufficient for modern heterogeneous computing. The ML compiler landscape before MLIR was fragmented, with each framework (TensorFlow, PyTorch, XLA) building its own complete compilation stack. MLIR unified this ecosystem by providing extensible dialects—vocabularies of operations at different abstraction levels that can coexist and transform between each other.
 
