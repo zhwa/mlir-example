@@ -188,7 +188,6 @@ This fragmentation imposed significant costs. Thousands of person-hours were dup
 Google created MLIR to unify this ecosystem. MLIR provides **extensible dialects**, allowing each framework to define its own operations while sharing infrastructure. It offers **shared infrastructure** including reusable passes, a type system, and an optimization framework that all dialects can leverage. Different dialects can **interoperate**, coexisting in the same program and transforming between each other. Finally, MLIR enables **progressive lowering** through a systematic path from high-level to hardware-specific code, where each transformation is explicit and composable.
 
 Today, the ecosystem has consolidated around MLIR. TensorFlow uses MLIR for compilation and optimization. PyTorch 2.0 leverages Torch-MLIR for its compilation backend. JAX uses MLIR (via StableHLO) for its compilation path. Serving frameworks like TensorRT-LLM build on MLIR infrastructure.
-- **Serving frameworks** like TensorRT-LLM build on MLIR infrastructure
 
 This unification means optimizations and hardware support developed once benefit the entire ecosystem.
 
