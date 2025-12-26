@@ -1379,7 +1379,278 @@ You write pattern classes; MLIR handles application strategy.
 
 For our pedagogical dialect, explicit pattern classes suffice. But understand that TableGen and interfaces can generate much of this code automatically—just as TableGen generates operation classes from definitions, it can generate pattern classes from declarative specifications.
 
-This C++ pattern rewriting approach—type-safe, composable, integrated with MLIR's infrastructure—is how production compilers implement transformations. It's more complex than Python string manipulation, but the benefits (type safety, verifiability, tooling support) justify the investment. Let's examine how Python code uses these C++ components to provide a clean user API.
+This C++ pattern rewriting approach—type-safe, composable, integrated with MLIR's infrastructure—is how production compilers implement transformations. It's more complex than Python string manipulation, but the benefits (type safety, verifiability, tooling support) justify the investment.
+
+### 9.7.5 TypeConverter: Managing Type Transformations in Dialect Lowering
+
+The pattern rewriters we've implemented (Add, MatMul, ReLU) share a subtle assumption: **input and output types remain unchanged during lowering**. An `nn.add` operating on `memref<128x128xf32>` lowers to `linalg.generic` operating on the same memref type. But many real-world dialect lowerings require **type conversions**—transforming not just operations but the types they work with. This section explores MLIR's `TypeConverter` mechanism, explaining how to handle type changes systematically during dialect lowering.
+
+**When Type Conversion Matters**. Consider lowering from high-level tensor types to low-level memref types (a common pattern):
+
+```mlir
+// High-level: tensor dialect (immutable, value semantics)
+%result = tensor.add %lhs, %rhs : tensor<128x128xf32>
+
+// Low-level: memref dialect (mutable, buffer semantics)
+%buffer = memref.alloc() : memref<128x128xf32>
+%result_memref = memref.add %lhs_memref, %rhs_memref, %buffer : memref<128x128xf32>
+```
+
+The operation changed (`tensor.add` → `memref.add`), but crucially the **type** changed too (`tensor<...>` → `memref<...>`). This creates cascading consequences:
+
+- All operations consuming `%result` must expect memrefs, not tensors
+- Function signatures using tensors must be updated to memrefs
+- Block arguments passing tensors need type conversions
+- Constants may require different representations
+
+Manually tracking these type changes across large IR modules is error-prone. MLIR's `TypeConverter` automates this bookkeeping.
+
+**TypeConverter Basics**. A TypeConverter defines rules for transforming types:
+
+```cpp
+class TensorToMemrefConverter : public TypeConverter {
+public:
+  TensorToMemrefConverter() {
+    // Rule: Convert tensor types to memref types
+    addConversion([](RankedTensorType tensorType) -> Type {
+      return MemRefType::get(
+          tensorType.getShape(),
+          tensorType.getElementType(),
+          MemRefLayoutAttrInterface{},  // Default layout
+          nullptr  // No memory space
+      );
+    });
+    
+    // Rule: Keep memref types unchanged
+    addConversion([](MemRefType type) { return type; });
+    
+    // Rule: Keep scalar types (i32, f32, etc.) unchanged
+    addConversion([](Type type) {
+      if (type.isa<IntegerType, FloatType, IndexType>())
+        return type;
+      return Type();  // nullptr means "can't convert"
+    });
+  }
+};
+```
+
+Each `addConversion()` call registers a lambda taking an input type and returning an output type (or `Type()` for "no conversion possible"). The converter applies these rules during dialect lowering, transforming types systematically.
+
+**Using TypeConverter in Patterns**. Instead of `OpRewritePattern`, use `OpConversionPattern` when types change:
+
+```cpp
+struct TensorAddOpLowering : public OpConversionPattern<tensor::AddOp> {
+  using OpConversionPattern<tensor::AddOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      tensor::AddOp op,
+      OpAdaptor adaptor,  // Contains converted operands
+      ConversionPatternRewriter &rewriter) const override {
+    
+    auto loc = op.getLoc();
+    
+    // Allocate memref for result (tensors are values, memrefs are buffers)
+    auto resultType = getTypeConverter()->convertType(op.getType())
+                          .cast<MemRefType>();
+    Value resultBuffer = rewriter.create<memref::AllocOp>(loc, resultType);
+    
+    // Create memref operation (operands already converted via adaptor)
+    rewriter.create<memref::AddOp>(
+        loc,
+        adaptor.getLhs(),  // Converted to memref
+        adaptor.getRhs(),  // Converted to memref
+        resultBuffer
+    );
+    
+    rewriter.replaceOp(op, resultBuffer);
+    return success();
+  }
+};
+```
+
+**Key Differences from OpRewritePattern**:
+
+1. **OpAdaptor**: The `adaptor` parameter provides **converted operands**. If the original `tensor::AddOp` took `tensor<128xf32>` operands, `adaptor.getLhs()` returns the memref-converted equivalent. You don't manually convert operands—the framework does it.
+
+2. **getTypeConverter()**: Access the registered TypeConverter to explicitly convert types (like the result type in the example).
+
+3. **ConversionPatternRewriter**: A specialized rewriter tracking type mappings. When you `replaceOp(old, new)`, it records that operations using `old`'s results should now use `new`.
+
+**Materialization: Handling Type Boundaries**. Sometimes types can't convert directly—you need **materialization operations** to bridge representations. Example: keeping some operations in tensor dialect while others use memref:
+
+```mlir
+%tensor_result = tensor.add %a, %b : tensor<128xf32>
+%memref_consumer = memref.load %buffer[...]  // Needs memref, not tensor
+```
+
+If lowering is partial (some operations lowered, some not), we need a `tensor.to_memref` operation bridging the gap. TypeConverter supports this via **target materialization**:
+
+```cpp
+class TensorToMemrefConverter : public TypeConverter {
+public:
+  TensorToMemrefConverter() {
+    addConversion(/* ... type conversion rules ... */);
+    
+    // Materialization: Insert bufferization when tensor→memref boundary appears
+    addTargetMaterialization([](OpBuilder &builder,
+                                 MemRefType resultType,
+                                 ValueRange inputs,
+                                 Location loc) -> Value {
+      assert(inputs.size() == 1 && "expected single tensor input");
+      // Insert explicit tensor→memref conversion
+      return builder.create<bufferization::ToMemrefOp>(
+          loc, resultType, inputs[0]
+      );
+    });
+    
+    // Source materialization: memref→tensor (opposite direction)
+    addSourceMaterialization([](OpBuilder &builder,
+                                 TensorType resultType,
+                                 ValueRange inputs,
+                                 Location loc) -> Value {
+      assert(inputs.size() == 1);
+      return builder.create<bufferization::ToTensorOp>(
+          loc, resultType, inputs[0]
+      );
+    });
+  }
+};
+```
+
+**Materialization Types**:
+
+- **Target Materialization**: Converts **to** target types (e.g., tensor → memref when lowering to memref dialect)
+- **Source Materialization**: Converts **from** target types (e.g., memref → tensor when not all operations lowered yet)
+- **Argument Materialization**: Converts block arguments (function parameters, loop induction variables)
+
+The framework inserts these materialization operations automatically at type boundaries. You define the conversion logic; MLIR determines where to insert.
+
+**Full vs Partial Conversion**. MLIR supports two conversion modes:
+
+```cpp
+// Full conversion: All illegal operations MUST be converted
+if (failed(applyFullConversion(module, target, std::move(patterns)))) {
+  signalPassFailure();
+}
+
+// Partial conversion: Some illegal operations can remain (insert materializations)
+if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
+  signalPassFailure();
+}
+```
+
+**Full conversion** fails if any illegal operation remains after pattern application. Use this when lowering must be complete (e.g., final code generation—no high-level ops can remain).
+
+**Partial conversion** allows illegal operations to coexist with legal ones, inserting materializations at boundaries. Use this for gradual lowering (e.g., lower some tensor ops to memref while keeping others in tensor form temporarily).
+
+Chapter 9's `ConvertNNToStandardPass` uses partial conversion—it allows tensor/memref operations to coexist because we're lowering custom dialect (`nn`) to standard dialects, not all the way to LLVM.
+
+**Signature Conversion**. When function signatures involve converted types, use `ConversionPatternRewriter::convertRegionTypes()`:
+
+```cpp
+struct FuncOpTypeConversion : public OpConversionPattern<func::FuncOp> {
+  using OpConversionPattern<func::FuncOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      func::FuncOp funcOp,
+      OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+    
+    // Convert function signature
+    auto funcType = funcOp.getFunctionType();
+    TypeConverter::SignatureConversion signatureConversion(
+        funcType.getNumInputs()
+    );
+    
+    // Convert each input type
+    for (unsigned i = 0; i < funcType.getNumInputs(); ++i) {
+      Type convertedType = getTypeConverter()->convertType(
+          funcType.getInput(i)
+      );
+      signatureConversion.addInputs(i, convertedType);
+    }
+    
+    // Convert result types
+    SmallVector<Type> convertedResults;
+    if (failed(getTypeConverter()->convertTypes(
+            funcType.getResults(), convertedResults))) {
+      return failure();
+    }
+    
+    // Update function signature
+    rewriter.modifyOpInPlace(funcOp, [&] {
+      funcOp.setType(rewriter.getFunctionType(
+          signatureConversion.getConvertedTypes(),
+          convertedResults
+      ));
+    });
+    
+    // Convert region (body) types
+    if (failed(rewriter.convertRegionTypes(
+            &funcOp.getBody(),
+            *getTypeConverter(),
+            &signatureConversion))) {
+      return failure();
+    }
+    
+    return success();
+  }
+};
+```
+
+This pattern updates function signatures **and** the function body's block arguments to match converted types. The framework ensures all uses of arguments receive correctly-typed values.
+
+**Why TypeConverter Matters**. As your dialects grow complex, type conversions become pervasive:
+
+- **Quantization**: f32 → i8 (lowering floating-point ML models to quantized inference)
+- **Bufferization**: tensor → memref (Chapter 4's bufferization is systematic type conversion)
+- **Target-specific types**: Converting generic `vector<4xf32>` to target-specific SIMD types (AVX, NEON)
+- **ABI compliance**: Ensuring function signatures match calling conventions (struct passing, vector registers)
+
+TypeConverter centralizes this complexity. Without it, every pattern must manually track type conversions—error-prone and unmaintainable. With it, declare conversion rules once, and patterns automatically get converted operands.
+
+**Practical Example: Chapter 4 Revisited**. Chapter 4's bufferization (tensor → memref lowering) is essentially TypeConverter in action. If you revisit that chapter with TypeConverter knowledge, the "one-shot bufferization" pass is:
+
+1. Define TensorToMemrefConverter (tensor → memref rules)
+2. Register ConversionPatterns for tensor operations (tensor.add → memref.add, etc.)
+3. Apply partial conversion (some operations stay in tensor form until later passes)
+4. Insert materializations (bufferization.to_memref, bufferization.to_tensor) at boundaries
+
+The complexity you saw in Chapter 4—tracking which operations bufferized, managing intermediate buffers—is TypeConverter handling type changes systematically.
+
+**Debugging Type Conversions**. When type conversion goes wrong (common!), use these techniques:
+
+```cpp
+// Print type conversions during pattern application
+auto convertedType = getTypeConverter()->convertType(originalType);
+llvm::errs() << "Converted " << originalType << " to " << convertedType << "\n";
+
+// Check if type is legal
+if (!getTypeConverter()->isLegal(type)) {
+  llvm::errs() << "Type " << type << " is not legal in target dialect\n";
+}
+
+// Dump IR after type conversion pass
+module.dump();  // See where materializations were inserted
+```
+
+Common errors:
+- **Missing conversion rule**: TypeConverter returns `Type()` (nullptr), causing conversion failure
+- **Unconverted operand**: Pattern uses original operands instead of `adaptor.getOperands()`
+- **Mismatched materialization**: Target materialization doesn't match source materialization (type system inconsistency)
+
+**Summary**. TypeConverter is MLIR's systematic answer to type transformations:
+
+- **Declare conversion rules** via `addConversion()` lambdas
+- **Use OpConversionPattern** instead of OpRewritePattern when types change
+- **Access converted operands** via `OpAdaptor` (framework-provided)
+- **Define materializations** for type boundaries (tensor↔memref bridges)
+- **Choose full vs partial conversion** based on whether illegal ops can coexist
+- **Convert function signatures** using `SignatureConversion` and `convertRegionTypes()`
+
+For simple dialect lowering (like Chapter 9's `nn` to Linalg), TypeConverter isn't needed—types stay consistent. But for production compilers with multiple lowering stages (HLO → Linalg → Affine → SCF → CF → LLVM), each stage involves type conversions. TypeConverter makes these conversions composable and maintainable. Understanding it now prepares you for advanced MLIR usage in Chapters 14-16 and real-world compiler development.
+
+Let's examine how Python code uses these C++ components to provide a clean user API.
 
 ## 9.8 OpBuilder and Python Integration
 
@@ -1683,6 +1954,288 @@ The `dyn_cast<ShapeInference>(op)` checks if `op` implements the interface. If y
 4. **Loose Coupling**: Passes depend on contracts (interfaces), not implementations (specific operations)
 
 **Chapter 14's Advanced Interfaces**. This introduction covers interface basics—defining, implementing, using. Chapter 14 explores advanced patterns: multiple interfaces per operation, interface inheritance, type and attribute interfaces (not just operation interfaces), and custom interfaces for optimization passes. For Chapter 9, understanding that interfaces provide polymorphism suffices; production compilers use them extensively for extensible infrastructure.
+
+### 9.8.6 Advanced TableGen Features for Production Dialects
+
+The TableGen specifications we've covered—operation definitions (section 9.4), generated code (section 9.6), and interfaces (section 9.8.5)—form the foundation for custom dialects. But production MLIR projects use additional TableGen features that dramatically improve productivity and code quality. This section surveys advanced techniques you'll encounter in real codebases: trait composition, constraints, and custom assembly formats. We'll also preview **Declarative Rewrite Rules (DRR)**, deferring detailed coverage to Chapter 14 where we explore production optimization patterns.
+
+#### Declarative Rewrite Rules (DRR): Preview of Chapter 14
+
+Section 9.7 showed C++ pattern rewriters—classes matching operations and replacing them with lower-level equivalents. For dialect lowering (like our `nn.add` → `linalg.generic` transformations), C++ patterns provide necessary flexibility. But for simple optimizations like constant folding or algebraic simplification, writing full C++ pattern classes becomes verbose.
+
+**Chapter 14's DRR**. Declarative Rewrite Rules express optimizations in TableGen instead of C++:
+
+```tablegen
+// Chapter 14 preview: Optimization patterns in TableGen
+def FoldDoubleTranspose : Pat<
+  (TransposeOp (TransposeOp $x)),  // Match: transpose(transpose($x))
+  (replaceWithValue $x)             // Replace: just $x
+>;
+
+def FoldAddZero : Pat<
+  (AddOp $x, (ConstantOp $zero)),  // Match: add(x, 0.0)
+  (replaceWithValue $x),            // Replace: x
+  [(IsZeroFloat $zero)]             // Constraint: verify zero
+>;
+```
+
+These TableGen patterns generate C++ code automatically—the same `OpRewritePattern` classes we wrote manually in section 9.7, but generated from concise declarative specifications.
+
+**Why Defer to Chapter 14?** DRR is primarily an **optimization tool**, not a lowering tool:
+
+- **Chapter 9 focus**: Dialect definition, lowering patterns (high-level → low-level transformations)
+- **Chapter 14 focus**: Production optimizations, canonicalization, algebraic simplification (same-level transformations)
+
+DRR shines for patterns like "remove redundant operations," "fold constants," "simplify expressions"—optimizations that don't change abstraction levels. Chapter 9's lowering patterns (transforming `nn.add` to `linalg.generic`) require C++ flexibility for constructing complex target IR.
+
+**What You Need Now**. Understanding that DRR exists and complements C++ patterns suffices for Chapter 9. When you reach Chapter 14, you'll learn:
+- DRR pattern syntax (matchers, rewriters, constraints)
+- Constraint predicates (type checks, attribute validation)
+- Multi-result patterns (one operation → several operations)
+- Benefit-based pattern selection
+- Integration with canonicalization passes
+
+For now, focus on C++ `OpRewritePattern`—it's the workhorse for dialect lowering and gives you complete control over IR transformation.
+
+#### Trait Composition: Declaring Operation Properties
+
+Section 9.4 briefly mentioned traits—properties like "this operation has no side effects." TableGen provides rich trait vocabulary:
+
+```tablegen
+def AddOp : MyDialect_Op<"add", [
+  Pure,                // No side effects (enables dead code elimination)
+  Commutative,         // add(a, b) == add(b, a) (enables reordering)
+  SameOperandsAndResultType,  // All operands and results have same type
+  Elementwise          // Operates element-wise (enables fusion)
+]> {
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs);
+  let results = (outs AnyType:$result);
+}
+```
+
+Each trait affects how MLIR treats the operation:
+
+**Pure** (formerly `NoSideEffect`): Operation doesn't modify memory or state. Enables:
+- Dead code elimination (remove unused pure ops)
+- Common subexpression elimination (reuse identical pure op results)
+- Reordering (pure ops can move across other pure ops)
+
+**Commutative**: Operand order doesn't matter. Enables:
+- Canonicalization (sort operands for pattern matching)
+- CSE across operand permutations (recognize `add(a, b)` == `add(b, a)`)
+
+**SameOperandsAndResultType**: Type constraint enforcement. Catches bugs at verification time:
+```mlir
+%result = myop.add %a, %b : f32, i32 → f32  // ERROR: operand types differ
+```
+
+**Elementwise**: Operation applies independently to each element (like map). Enables:
+- Fusion (elementwise ops chain without intermediate buffers)
+- Vectorization (scalar elementwise → vector elementwise)
+
+**Custom Traits**. Define domain-specific traits:
+
+```tablegen
+// Trait: Operation is safe to speculate (run before branches resolve)
+def Speculatable : OpTrait<"Speculatable"> {
+  let cppNamespace = "::mlir::OpTrait";
+}
+
+def MyExpensiveOp : MyDialect_Op<"expensive", [Speculatable]> {
+  // Can be speculatively executed (if cheap enough)
+}
+```
+
+Optimization passes query traits:
+```cpp
+if (op->hasTrait<OpTrait::Speculatable>()) {
+  // Safe to move this op before branch
+  hoistOutOfConditional(op);
+}
+```
+
+Traits provide **declarative metadata** enabling generic optimizations.
+
+#### Advanced Constraints: Type and Attribute Validation
+
+Section 9.4 used `AnyType` and `F32MemRef`—basic type constraints. Production dialects need precise constraints:
+
+```tablegen
+// Ranked tensor of floating-point type
+def FloatTensor : TensorOf<[AnyFloat]>;
+
+// 2D memref with specific element type
+def Matrix2D : MemRefOf<[F32, F64], [2]>;
+
+// Memref with at least 2 dimensions
+def MemRefRank2Plus : MemRefOf<[AnyType], [2, -1]>;
+
+// Integer attribute in range [0, 7]
+def SmallInt : Confined<I32Attr, [IntMinValue<0>, IntMaxValue<7>]>;
+
+// Array attribute with exactly 4 elements
+def Vec4Attr : Confined<ArrayAttr, [ArrayCount<4>]>;
+```
+
+These constraints generate verification code:
+```cpp
+// Generated verifier for Matrix2D operand
+if (!operandType.isa<MemRefType>())
+  return emitError("expected memref type");
+auto memref = operandType.cast<MemRefType>();
+if (memref.getRank() != 2)
+  return emitError("expected 2D memref");
+if (!memref.getElementType().isa<Float32Type, Float64Type>())
+  return emitError("expected f32 or f64 element type");
+```
+
+Detailed constraints catch errors early (at IR construction time), not late (during lowering or execution).
+
+**Custom Constraints**. Define domain-specific checks:
+
+```tablegen
+def DivisibleBy4 : AttrConstraint<
+  CPred<"$_self.cast<IntegerAttr>().getInt() % 4 == 0">,
+  "integer divisible by 4"
+>;
+
+def TiledMatMulOp : MyDialect_Op<"tiled_matmul"> {
+  let arguments = (ins
+    AnyMemRef:$A,
+    AnyMemRef:$B,
+    AnyMemRef:$C,
+    DivisibleBy4:$tileSize  // Must be multiple of 4
+  );
+}
+```
+
+The generated verifier enforces `tileSize` divisibility, preventing runtime errors from misaligned tiles.
+
+#### Custom Assembly Format: Pretty IR Printing
+
+By default, TableGen generates verbose IR syntax:
+```mlir
+%result = nn.add(%lhs, %rhs, %output) : (memref<128xf32>, memref<128xf32>, memref<128xf32>) -> ()
+```
+
+Custom assembly formats make IR readable:
+
+```tablegen
+def AddOp : MyDialect_Op<"add"> {
+  let arguments = (ins AnyMemRef:$lhs, AnyMemRef:$rhs, AnyMemRef:$output);
+  
+  let assemblyFormat = [{
+    $lhs `,` $rhs `->` $output attr-dict `:` type($lhs)
+  }];
+}
+```
+
+Generated IR:
+```mlir
+%result = nn.add %lhs, %rhs -> %output : memref<128xf32>
+```
+
+Much cleaner! The format string specifies:
+- Operand order: `$lhs`,` $rhs`
+- Custom syntax: `->` between inputs and output
+- Type printing: `:` type($lhs)` (print lhs type once, inferring others)
+
+**Format Directives**:
+- `$operand`: Print operand
+- `attr-dict`: Print attributes (if any)
+- `type($operand)`: Print operand type
+- Literal strings: `,`, `->`, `to`, etc.
+- `custom<Name>($operand)`: Invoke custom parsing/printing (defined in C++)
+
+**Complex Example**:
+```tablegen
+let assemblyFormat = [{
+  `<` $transposeA `,` $transposeB `>` 
+  `(` $A `,` $B `)` `->` $C 
+  attr-dict `:` type($A) `,` type($B) `->` type($C)
+}];
+```
+
+Generates:
+```mlir
+nn.matmul <false, true> (%A, %B) -> %C : memref<128x256xf32>, memref<256x512xf32> -> memref<128x512xf32>
+```
+
+Boolean attributes (`transposeA`) appear inline, types are explicit, syntax resembles mathematical notation.
+
+**Why Custom Formats Matter**:
+1. **Debugging**: Readable IR accelerates understanding
+2. **Familiarity**: Match user expectations (mathematical notation for ML ops)
+3. **Compactness**: Reduce visual clutter in IR dumps
+4. **Consistency**: Enforce project-wide IR style
+
+Without custom formats, complex operations become unreadable multi-line messes. With them, IR reads almost like source code.
+
+#### Putting It Together: Production Dialect Checklist
+
+When building real dialects, apply these advanced features:
+
+1. **Operations**: Use TableGen with precise constraints, appropriate traits, and custom assembly formats
+2. **Interfaces**: Implement standard interfaces (`InferTypeOpInterface`, `MemoryEffectOpInterface`) for ecosystem integration
+3. **Lowering**: Use C++ `OpConversionPattern` for complex transformations requiring full IR construction control
+4. **Documentation**: TableGen comments generate HTML docs automatically
+5. **Testing**: Use MLIR's `FileCheck` to verify generated IR matches expectations
+
+Example combining techniques:
+```tablegen
+def MatMulOp : MyDialect_Op<"matmul", [
+  Pure,  // No side effects
+  DeclareOpInterfaceMethods<InferTypeOpInterface>  // Implement type inference
+]> {
+  let summary = "Matrix multiplication operation";
+  let description = [{
+    Performs C = A @ B where A is MxK, B is KxN, C is MxN.
+    Supports optional transposition of inputs.
+  }];
+  
+  let arguments = (ins
+    FloatTensor:$A,
+    FloatTensor:$B,
+    DefaultValuedAttr<BoolAttr, "false">:$transposeA,
+    DefaultValuedAttr<BoolAttr, "false">:$transposeB
+  );
+  
+  let results = (outs FloatTensor:$result);
+  
+  let assemblyFormat = [{
+    `(` $A `,` $B `)`
+    (`transpose_a` $transposeA^)?
+    (`transpose_b` $transposeB^)?
+    attr-dict `:` type($A) `,` type($B) `->` type($result)
+  }];
+}
+```
+
+This 25-line TableGen spec:
+- Defines operation with type constraints
+- Declares trait (Pure) and interface (InferTypeOpInterface)
+- Provides documentation
+- Specifies custom IR syntax
+
+The generated C++ (~500 lines) handles parsing, printing, verification, type inference, and pattern matching—all from declarative specifications.
+
+#### When to Use Advanced Features
+
+- **Starting out (Chapters 8-9)**: Basic TableGen + explicit C++ patterns. Learn fundamentals.
+- **Production dialects (Chapter 14+)**: Add traits for optimization integration, custom formats for readability, DRR for canonicalization.
+- **Research prototypes**: Skip advanced features initially. Add them when complexity justifies automation.
+
+The progression mirrors software engineering: write it manually first (understand the problem), then automate (TableGen, DRR) once patterns emerge.
+
+**Further Learning**:
+- **MLIR ODS Documentation**: [`DefiningDialects/Operations.md`](https://mlir.llvm.org/docs/DefiningDialects/Operations/) - complete TableGen reference
+- **Real Dialects**: Study `mlir/include/mlir/Dialect/*/IR/*.td` files (Linalg, Vector, Tensor) - production examples
+- **Custom Assembly**: [`OpDefinitions.md`](https://mlir.llvm.org/docs/DefiningDialects/Operations/#custom-assembly-format) - assembly format directives
+- **DRR (Chapter 14)**: Declarative rewrite rules for optimization patterns—deferred to Chapter 14 where we explore production optimization infrastructure
+
+**Looking Ahead to Chapter 14**. Just as we forward-referenced advanced interfaces to Chapter 14, we also defer **Declarative Rewrite Rules (DRR)** to that chapter. DRR is TableGen's optimization pattern language—expressing transformations like "fold transpose(transpose(x)) → x" or "remove dead code" declaratively. Chapter 14 shows how DRR integrates with canonicalization passes, trait-based pattern selection, and production optimization pipelines. The C++ `OpRewritePattern` skills from section 9.7 prepare you perfectly—DRR generates the same C++ patterns, but from concise TableGen specifications.
+
+Chapter 10 builds optimization passes using the patterns you've learned here. The trait composition, interface integration, and type constraints from this section directly enable the optimizations there.
 
 ## 9.9 Conclusion: Declarative Specifications for Production
 

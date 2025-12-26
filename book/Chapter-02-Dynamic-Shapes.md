@@ -168,6 +168,146 @@ However, this choice involves trade-offs that readers should understand. By skip
 
 This is an acceptable trade-off for learning. As we build increasingly sophisticated examples (attention mechanisms in Chapter 11, transformers in Chapter 12, serving engines in Chapter 14), working with memrefs keeps the compilation pipeline transparent and the concepts grounded. Readers interested in production-scale tensor-based optimizations can explore MLIR's bufferization documentation and the Linalg-on-tensors workflow after mastering the fundamentals presented here.
 
+### 2.2.5 MLIR's Hierarchical Structure: Operation/Block/Region
+
+Before diving into dynamic shapes, we need to understand MLIR's structural organization. MLIR IR isn't flat—it's a **tree** with three distinct structural levels that nest recursively. This hierarchy appears everywhere in MLIR code, and understanding it is essential for reading IR, navigating code, and implementing transformations.
+
+#### The Three Structural Levels
+
+MLIR organizes IR using three concepts that build on each other:
+
+```
+┌────────────────────────────────────────────┐
+│ OPERATION (Node in computation graph)      │
+│  • Contains: operands, results, attributes │
+│  • May contain: Regions ──────────┐        │
+└───────────────────────────────────│────────┘
+                                    │
+                    ┌───────────────▼────────────┐
+                    │ REGION (Code container)    │
+                    │  • Contains: Blocks        │
+                    │  • Examples: func body,    │
+                    │    loop body, if branches  │
+                    └───────────┬────────────────┘
+                                │
+                ┌───────────────▼────────────────┐
+                │ BLOCK (Straight-line sequence) │
+                │  • Contains: Operations        │
+                │  • Has: Block arguments        │
+                │  • Ends: Terminator op         │
+                └────────────────────────────────┘
+                         (back to Operations)
+```
+
+**Operations** are the fundamental units of computation—nodes in the computation graph. Each operation can contain **Regions**, which are code containers (like function bodies or loop bodies). Each Region contains one or more **Blocks**, which are straight-line sequences of operations. This creates a recursive structure: operations contain regions, regions contain blocks, blocks contain operations.
+
+#### Example: Function Operation Breakdown
+
+Let's examine a simple function to see this structure:
+
+```mlir
+func.func @example(%arg0: i32, %arg1: i32) -> i32 {
+  %sum = arith.addi %arg0, %arg1 : i32
+  %doubled = arith.muli %sum, %c2 : i32
+  func.return %doubled : i32
+}
+```
+
+**Structural Analysis**:
+
+1. **Operation**: `func.func` is an operation (specifically, a `FuncOp`)
+   - Operands: none (functions don't take operand *values*, they define parameters)
+   - Results: none (the return type is in the signature, not an SSA result)
+   - Attributes: function name (`@example`), type signature
+   - **Contains a Region**: The function body
+
+2. **Region**: The function body (everything between `{` and `}`)
+   - Contains one Block (unlabeled blocks don't need `^label` syntax)
+   - Purpose: holds the function's implementation
+
+3. **Block**: The entry block
+   - **Block arguments**: `%arg0` and `%arg1` (function parameters are block arguments!)
+   - **Contains operations**: `arith.addi`, `arith.muli`, `func.return`
+   - **Terminator**: `func.return` (every block must end with a terminator)
+
+4. **Operations in the block**:
+   - `arith.addi`: add operation (operands: `%arg0`, `%arg1`; result: `%sum`)
+   - `arith.muli`: multiply operation (operands: `%sum`, `%c2`; result: `%doubled`)
+   - `func.return`: return operation (operand: `%doubled`; no results—it terminates the block)
+
+#### Why This Structure Matters
+
+**Regions enable nested scoping**. A loop operation contains a region for its body. An if-then-else contains two regions (then-branch and else-branch). This hierarchical structure makes control flow explicit in the IR.
+
+**Blocks enable control flow**. Within a region, control can flow between blocks via branch operations. Each block is a landing site for control flow—branches target blocks, not arbitrary instructions.
+
+**Operations are uniform**. Everything is an operation: arithmetic (`arith.addi`), control flow (`cf.br`), function definitions (`func.func`), even module declarations (`builtin.module`). This uniformity simplifies IR manipulation.
+
+#### Navigation APIs
+
+When writing MLIR transformations (which we'll do starting in Chapter 8), you'll use these APIs to navigate the structure:
+
+```cpp
+// Navigate up the tree
+Operation *parentOp = op.getParentOp();              // Get containing operation
+Block *parentBlock = op->getBlock();                 // Get containing block  
+Region *parentRegion = block->getParent();           // Get containing region
+Operation *regionOwner = region->getParentOp();      // Get operation owning this region
+
+// Navigate down the tree
+Region &body = funcOp.getBody();                     // Get operation's region
+Block &entryBlock = body.front();                    // Get first block in region
+for (Operation &op : entryBlock) {                   // Iterate operations in block
+  // Process each operation
+}
+
+// Access block arguments
+BlockArgument arg0 = entryBlock.getArgument(0);      // Get first block argument
+```
+
+**Practical Example**: Walking all operations in a function:
+
+```cpp
+void processFunction(func::FuncOp funcOp) {
+  // Get the function's body region
+  Region &body = funcOp.getBody();
+  
+  // Iterate over all blocks in the region
+  for (Block &block : body) {
+    // Process block arguments (function parameters in entry block)
+    for (BlockArgument arg : block.getArguments()) {
+      llvm::outs() << "Block argument: " << arg << "\n";
+    }
+    
+    // Process all operations in the block
+    for (Operation &op : block) {
+      llvm::outs() << "Operation: " << op.getName() << "\n";
+    }
+  }
+}
+```
+
+#### Connection to SSA Form
+
+Remember from Chapter 1 that MLIR uses SSA (Static Single Assignment)? The structural hierarchy clarifies what "assignment" means:
+
+- **Values** (SSA values) are defined by operations and block arguments
+- **Operations** produce results (new SSA values)
+- **Block arguments** introduce values at block entry (we'll see why in section 2.6.5)
+- **Values** are visible within their defining region and nested regions (lexical scoping)
+
+This structure makes MLIR's IR both human-readable (the hierarchy mirrors code structure) and machine-analyzable (tree traversal is straightforward).
+
+#### Looking Ahead
+
+Understanding this structure is crucial for:
+- **Reading IR** (Chapter 2 onwards): You'll see regions and blocks everywhere
+- **Building IR** (Chapter 8-9): Creating operations with regions and blocks
+- **Transforming IR** (Chapter 9-10): Navigating and modifying the tree structure
+- **Pattern matching** (Chapter 9): Patterns match operations, rewrite blocks
+
+Now that we understand MLIR's structural foundation, let's explore how dynamic dimensions work.
+
 ## 2.3 Dynamic Dimensions: The Question Mark Notation
 
 With the tensor-vs-memref distinction clarified, we can now address dynamic shapes. In MLIR, dynamic dimensions are indicated by a **question mark** (`?`) in type signatures. Compare these type declarations:
@@ -510,6 +650,287 @@ This phase transforms structured control flow (loops, if-then-else) into low-lev
 **Why Both?** This is a manifestation of MLIR's **progressive lowering** philosophy. We want to keep operations at the highest useful abstraction level for as long as possible. Early optimization passes work with `scf.for` loops because structured loops are easier to analyze and transform. Only when we're ready to generate LLVM IR do we lower to basic blocks and branches.
 
 Think of it like compiling a high-level language: You wouldn't want to optimize Python directly at the assembly level (too hard to recognize patterns), and you wouldn't want to generate machine code directly from Python syntax (too many semantic details). The SCF → CF lowering is analogous—we progressively simplify the representation while preserving correctness.
+
+### Block Arguments: MLIR's SSA Innovation
+
+Before proceeding with control flow lowering, we need to understand a fundamental design choice in MLIR's SSA representation: **block arguments** vs traditional **phi functions**. This distinction affects how control flow merges values from different paths.
+
+#### Traditional SSA: Phi Functions
+
+In traditional SSA representations (like LLVM IR), control flow merge points use **phi functions** to select values based on which predecessor block was executed:
+
+```llvm
+; LLVM IR example: conditional selection
+entry:
+  %cond = icmp sgt i32 %x, %threshold
+  br i1 %cond, label %then, label %else
+
+then:
+  %a = mul i32 %x, 2          ; If x > threshold, double it
+  br label %merge
+
+else:
+  %b = mul i32 %x, 3          ; If x ≤ threshold, triple it
+  br label %merge
+
+merge:
+  %result = phi i32 [ %a, %then ], [ %b, %else ]  ; Phi function
+  ret i32 %result
+```
+
+The phi function `%result = phi i32 [ %a, %then ], [ %b, %else ]` means: "If control came from `%then`, use `%a`; if it came from `%else`, use `%b`."
+
+**Problems with Phi Functions**:
+1. **Position ambiguity**: Phi functions must appear at the start of a block, but their semantics reference predecessors
+2. **Transformation complexity**: Adding/removing predecessors requires updating all phi functions
+3. **Redundancy**: Every merged value needs a separate phi function
+
+#### MLIR's Approach: Block Parameters
+
+MLIR eliminates phi functions by treating blocks like functions with parameters. When branching to a block, you pass values as arguments:
+
+```mlir
+// MLIR equivalent: block parameters instead of phi
+^entry(%x: i32, %threshold: i32):
+  %cond = arith.cmpi sgt, %x, %threshold : i32
+  cf.cond_br %cond, ^then(%x : i32), ^else(%x : i32)
+
+^then(%x_then: i32):         // Block parameter (like function parameter)
+  %a = arith.muli %x_then, %c2 : i32
+  cf.br ^merge(%a : i32)     // Pass %a to ^merge
+
+^else(%x_else: i32):         // Separate block parameter
+  %b = arith.muli %x_else, %c3 : i32
+  cf.br ^merge(%b : i32)     // Pass %b to ^merge
+
+^merge(%result: i32):        // Block parameter receives merged value
+  func.return %result : i32
+```
+
+**Key Observations**:
+
+1. **Block signatures**: `^merge(%result: i32)` declares the block takes one i32 parameter
+2. **Passing arguments**: `cf.br ^merge(%a : i32)` branches to `^merge` and passes `%a` as argument
+3. **No phi needed**: The `%result` parameter automatically receives the appropriate value
+4. **Uniform syntax**: Block parameters look just like function parameters
+
+#### Why Block Parameters Are Better
+
+**Cleaner Semantics**: Values flow explicitly through branches. You can see what data each branch provides:
+```mlir
+cf.cond_br %cond, ^then(%x : i32), ^else(%y : i32)
+// Clear: ^then gets %x, ^else gets %y
+```
+
+**Simpler IR Manipulation**: Adding a predecessor? Just pass an argument. No need to find and update all phi functions.
+
+**Better Composability with Regions**: Since blocks can be nested in regions (section 2.2.5), block parameters integrate naturally with region arguments (like function parameters).
+
+#### Connection to Section 2.2.5: Structure and Values
+
+Remember from section 2.2.5 that blocks are part of MLIR's hierarchical structure. Block arguments are **values** defined at block entry—they're part of the SSA value system:
+
+- **Operations** produce results (SSA values)
+- **Block arguments** introduce values (also SSA values)
+- Both follow SSA: defined once, used multiple times
+
+When you navigate IR with `block.getArguments()`, you're accessing these block parameters.
+
+#### Practical Example: Loop Iteration Variable
+
+Consider a for-loop. In traditional SSA, the loop counter would need phi functions. In MLIR, it's a block parameter:
+
+```mlir
+// Loop counter as block parameter
+^loop_header(%i: index):              // Counter is block parameter
+  %cond = arith.cmpi slt, %i, %N : index
+  cf.cond_br %cond, ^loop_body(%i : index), ^exit
+
+^loop_body(%i_body: index):
+  // ... loop body using %i_body ...
+  %i_next = arith.addi %i_body, %c1 : index
+  cf.br ^loop_header(%i_next : index)  // Pass updated counter back
+
+^exit:
+  func.return
+```
+
+The counter `%i` flows through block parameters—no phi functions needed.
+
+#### When You'll See Block Arguments
+
+- **Function entry blocks**: Function parameters are block arguments of the entry block
+- **Loop headers**: Loop iteration variables and carried values
+- **Conditionals**: Merged values from different branches
+- **Pattern matching** (Chapter 9): Patterns must handle block arguments correctly
+
+**Looking Ahead**: When we implement custom dialects (Chapter 8-9) and write transformations (Chapter 9-10), understanding block arguments is essential. Pattern rewrites often create new blocks with parameters, and getting the argument types wrong causes verification failures.
+
+### Safe IR Modification: Critical Patterns to Avoid Crashes
+
+Now that we understand MLIR's structure (operations, blocks, regions) and how values flow (SSA, block arguments), we need to address a critical topic: **safely modifying IR**. Starting in Chapter 8, we'll implement custom dialects and transformations that rewrite IR. Incorrect modification patterns cause segmentation faults that are difficult to debug. This section covers essential safety rules.
+
+#### **[CRITICAL WARNING]**: The Use-Def Chain Corruption Problem
+
+MLIR maintains **use-def chains**—data structures tracking which operations use each value. These chains are implemented as linked lists. **Modifying IR while iterating use-def chains corrupts the list and causes crashes.**
+
+#### DANGEROUS Pattern #1: Iterating Uses While Modifying
+
+```cpp
+// ❌ DANGEROUS - DO NOT DO THIS
+// Modifying use-def chain while iterating it
+for (auto &use : value.getUses()) {
+  use.set(newValue);  // CRASHES! Corrupts iterator
+}
+```
+
+**Why it crashes**: `value.getUses()` returns an iterator over a linked list. Calling `use.set(newValue)` modifies that list (removes old use, adds new use). The iterator is now invalid—next iteration accesses freed memory → segfault.
+
+This is the **#1 beginner mistake** in MLIR. It seems logical ("iterate over uses and change them"), but it's fundamentally unsafe.
+
+#### SAFE Pattern #1: Use MLIR's API
+
+```cpp
+// ✅ SAFE - Use MLIR's built-in method
+value.replaceAllUsesWith(newValue);
+```
+
+MLIR's `replaceAllUsesWith` handles iteration correctly. It updates the use-def chain safely without exposing the internal linked list to corruption. **Always use this API** instead of manual iteration.
+
+#### SAFE Pattern #2: Collect Then Modify
+
+If you need conditional replacement (not all uses), collect uses first:
+
+```cpp
+// ✅ SAFE - Collect first, modify later
+SmallVector<OpOperand*> usesToUpdate;
+for (auto &use : value.getUses()) {
+  if (shouldReplace(use)) {  // Conditional logic
+    usesToUpdate.push_back(&use);
+  }
+}
+// Now modify (no longer iterating the original use-chain)
+for (auto *use : usesToUpdate) {
+  use->set(newValue);
+}
+```
+
+**Why this works**: The first loop doesn't modify the use-chain—it just reads it. The second loop operates on a separate vector, so there's no iterator invalidation.
+
+#### SAFE Pattern #3: IRMapping for Bulk Replacements
+
+When replacing multiple values simultaneously (common in pattern rewriting):
+
+```cpp
+// ✅ SAFE - IRMapping for bulk value remapping
+IRMapping mapping;
+mapping.map(oldOp->getResults(), newOp->getResults());
+
+// Safe bulk replacement across multiple operands
+for (auto &operand : consumerOp->getOpOperands()) {
+  operand.set(mapping.lookupOrDefault(operand.get()));
+}
+```
+
+`IRMapping` is a value-to-value dictionary. `lookupOrDefault(value)` returns the replacement if it exists, otherwise returns the original value unchanged. This pattern appears frequently in Chapter 9's dialect lowering passes.
+
+#### DANGEROUS Pattern #2: Deleting Operations with Users
+
+```cpp
+// ❌ DANGEROUS - Operation still has users!
+op->erase();  // CRASHES if op.getUsers() is non-empty
+```
+
+**Why it crashes**: If any other operation uses `op`'s results, those operations now have dangling references. Accessing those references → segfault.
+
+#### SAFE Pattern #4: Remove Users First
+
+```cpp
+// ✅ SAFE - Ensure no users before erasing
+if (!op->use_empty()) {
+  op.replaceAllUsesWith(replacement);  // or signal error if no replacement
+}
+op->erase();  // Now safe
+```
+
+Always verify the operation has no users before erasing. MLIR's verification will catch this in debug builds, but release builds will crash silently.
+
+#### Understanding `remove()` vs `erase()` Semantics
+
+MLIR provides two operation deletion methods with different semantics:
+
+```cpp
+// op->remove(): Remove from block, keep alive
+op->remove();  // Removes from parent block but doesn't destroy
+// Can reinsert later:
+block->push_back(op);  // Re-insert into different block
+
+// op->erase(): Remove AND destroy
+op->erase();   // Removes from block AND deallocates memory
+// Cannot reuse - pointer is now dangling!
+```
+
+**Use `remove()` when**: Moving operations between blocks (control flow restructuring)
+**Use `erase()` when**: Permanently deleting dead code
+
+#### Deletion Order Constraint
+
+**Rule**: Operations must be erased in reverse post-order (users before definitions).
+
+```cpp
+// ❌ WRONG ORDER
+producer->erase();  // Producer deleted first
+consumer->erase();  // Consumer references deleted value - crash!
+
+// ✅ CORRECT ORDER
+consumer->erase();  // Consumer deleted first (no dangling refs)
+producer->erase();  // Now safe to delete producer
+```
+
+In practice, this means: **delete users before definitions**. If `%result = op1()` and `op2(%result)` uses it, delete `op2` first.
+
+#### Pattern Rewriting (Preview of Chapter 9)
+
+When we write dialect lowering in Chapter 9, we'll use `PatternRewriter` which handles safety automatically:
+
+```cpp
+// Chapter 9 preview: PatternRewriter is safe
+LogicalResult matchAndRewrite(MyOp op, PatternRewriter &rewriter) const {
+  auto newOp = rewriter.create<ReplacementOp>(...);
+  rewriter.replaceOp(op, newOp.getResult());  // Safe!
+  return success();
+}
+```
+
+`PatternRewriter` methods like `replaceOp`, `eraseOp`, and `replaceAllUsesWith` handle use-def chain updates correctly. This is why we use pattern rewriting instead of manual IR mutation—it's safe by construction.
+
+#### Debugging Tips: When Things Crash
+
+1. **Enable assertions**: Compile MLIR with `LLVM_ENABLE_ASSERTIONS=ON`. Many use-def violations are caught in debug builds.
+
+2. **Check use-def chain**: Before modifying, print uses:
+   ```cpp
+   for (auto &use : value.getUses()) {
+     llvm::errs() << "User: " << *use.getOwner() << "\n";
+   }
+   ```
+
+3. **Verify after modifications**: Call `module.verify()` after transformations to catch structural violations early.
+
+4. **Use MLIR's diagnostic system**: Don't ignore verification errors—they pinpoint exactly what's wrong.
+
+#### Summary: The Golden Rules
+
+1. **Never iterate uses while modifying** → Use `replaceAllUsesWith()`
+2. **Never erase operations with users** → Remove users first or replace with other values
+3. **Collect, then modify** → If conditional logic needed, collect pointers first
+4. **Use IRMapping for bulk replacement** → Handles multiple value remapping safely
+5. **Delete users before definitions** → Reverse post-order deletion
+6. **Prefer PatternRewriter** → Let MLIR handle safety automatically (Chapter 9)
+
+These patterns prevent 80% of beginner MLIR crashes. When you encounter a segfault in Chapters 8-10, revisit this section and verify you're following these rules.
+
+Now let's continue with the lowering phases.
 
 In this phase, the `createConvertSCFToCFPass()` transforms our structured loops:
 

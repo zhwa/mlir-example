@@ -136,6 +136,127 @@ Each operation can register canonicalization patterns (Chapter 9 showed this for
 
 The cost is coordination complexity—ensuring passes don't interfere or assume inconsistent invariants. MLIR addresses this through verification (catches violations), documentation (each pass specifies preconditions), and community conventions (shared patterns across dialects). Chapter 10's pipeline follows these conventions, providing a template for your own optimization pipelines.
 
+### 10.2.5 The Affine Dialect: Why This Book Uses Linalg Instead
+
+Before diving into specific optimizations, we should address a dialect you might encounter in other MLIR resources: the **affine dialect**. Chapter 10—and indeed this entire book—**does not use affine dialect operations**. We use Linalg for high-level structured operations and SCF for explicit loops. This section explains what affine is, why it exists, and why we chose a different path.
+
+**Important Distinction: AffineMap vs Affine Dialect**. You've already seen `AffineMap` extensively—it's the mathematical type used in Linalg's indexing maps:
+```mlir
+linalg.generic {
+  indexing_maps = [
+    affine_map<(d0, d1) -> (d0, d1)>,  // AffineMap (just a type!)
+    affine_map<(d0, d1) -> (d0, d1)>
+  ],
+  // ...
+}
+```
+
+`AffineMap` is a **core MLIR type** representing linear transformations—it's used by Linalg, Vector, and other dialects. The **affine dialect**, by contrast, is a set of **operations** (`affine.for`, `affine.load`, `affine.store`) for polyhedral loop optimization. They're different concepts that happen to share the "affine" name.
+
+**What Is the Affine Dialect?** The affine dialect provides loop operations with strict restrictions:
+```mlir
+// Affine loop: bounds must be affine expressions (linear functions)
+affine.for %i = 0 to 128 {
+  affine.for %j = %i to 256 {  // %j depends linearly on %i
+    %v = affine.load %A[%i, %j] : memref<128x256xf32>
+  }
+}
+```
+
+Compared to SCF's flexibility, affine loops are **highly restrictive**:
+- Loop bounds must be affine expressions (linear combinations: `%i + 5`, `2*%i + %j`, etc.)
+- Memory accesses must use affine indices (`A[%i]`, `A[2*%i + %j]` ✓, but not `A[%i * %j]` ✗)
+- No arbitrary control flow inside loops
+
+These restrictions enable **polyhedral optimization**: automatic loop interchange, tiling, fusion, and parallelization. Compilers can prove safety (no data races) and profitability (better cache locality) mathematically.
+
+**Why This Book Doesn't Use Affine**. We made a deliberate choice to use Linalg + SCF instead of affine dialect:
+
+**Reason 1: Linalg is Higher-Level and More Expressive**
+```mlir
+// Linalg: declarative, operation-centric
+linalg.matmul ins(%A, %B : memref<MxK>, memref<KxN>)
+              outs(%C : memref<MxN>)
+// Compiler generates optimal loop nest for target
+
+// Affine: explicit loops (requires manual loop nest design)
+affine.for %i = 0 to %M {
+  affine.for %j = 0 to %N {
+    affine.for %k = 0 to %K {
+      // Must manually express multiply-accumulate
+    }
+  }
+}
+```
+
+Linalg lets us focus on **what to compute** (matmul semantics), not **how to loop** (iteration strategy). Linalg's structured operations enable pattern matching for fusion—recognizing "matmul followed by ReLU" is easier than analyzing arbitrary loop nests.
+
+**Reason 2: Linalg's Transformation Infrastructure is More Mature**
+
+MLIR's Linalg dialect has extensive transformation libraries:
+- **Fusion patterns** (Section 10.3): `createLinalgElementwiseOpFusionPass()`
+- **Tiling strategies**: Tile sizes, interchange orders, parallelization hints
+- **Code generation targets**: CPU, GPU, TPU-specific lowerings
+
+Affine dialect optimizations require deeper polyhedral compilation knowledge and offer fewer pre-built passes. For pedagogical purposes, Linalg's high-level abstractions teach optimization concepts more directly.
+
+**Reason 3: Production ML Compilers Use Linalg**
+
+The ML compiler ecosystem converged on Linalg:
+- **Torch-MLIR**: PyTorch → Torch dialect → Linalg → SCF/Affine → LLVM
+- **IREE**: TensorFlow/JAX → Linalg-based optimizations → HAL
+- **StableHLO**: JAX's dialect, lowers to Linalg for optimization
+
+While some compilers use affine for specific kernels (XLA's polyhedral scheduler), the mainstream path is Linalg-first. Learning Linalg prepares you for real-world ML compiler work.
+
+**Reason 4: Dynamic Shapes**
+
+Chapter 2 introduced dynamic shapes (`memref<?x?xf32>`). Affine dialect struggles with dynamic bounds—polyhedral analysis assumes static iteration spaces. Linalg handles dynamic shapes naturally:
+```mlir
+linalg.matmul ins(%A, %B : memref<?x?xf32>, memref<?x?xf32>)
+              outs(%C : memref<?x?xf32>)  // Works with dynamic sizes
+```
+
+SCF loops handle dynamic bounds trivially (`scf.for %i = 0 to %N`). Affine requires escaping to SCF for dynamic cases, complicating the pipeline.
+
+**When Affine IS Useful**. Despite our choice to use Linalg, the affine dialect has legitimate use cases:
+
+1. **Static, Compute-Bound Kernels**: When you have fixed-size loops with complex iteration dependencies, affine's polyhedral analysis can find optimal loop orders and tiling strategies automatically. Useful for DSP, image processing, and some HPC workloads.
+
+2. **Research and Education in Polyhedral Compilation**: If you're studying loop optimization theory, affine dialect provides a clean implementation of polyhedral models. Academic projects like Polygeist use it to teach compiler transformations.
+
+3. **Integration with Existing Polyhedral Tools**: If you have code generated by tools like Pluto or ISL (polyhedral schedulers), affine dialect provides a natural MLIR representation.
+
+4. **Specific Production Use Cases**:
+   - **XLA's polyhedral scheduler**: Generates affine loops for GPU kernel fusion
+   - **IREE's embedded targets**: Uses affine tiling for fixed-size tensor operations on microcontrollers
+   - **Custom accelerators**: When targeting specialized hardware with predictable iteration spaces
+
+**The Typical Pipeline** (when affine is used):
+```
+High-level Dialect → Linalg → Affine (polyhedral optimization) → SCF → CF → LLVM
+```
+
+Affine is an **intermediate optimization IR**, not a starting point. Even compilers using affine start from higher-level representations (Linalg, Tensor) and lower to affine for specific optimization passes.
+
+**Our Pipeline** (this book):
+```
+NN Dialect → Linalg → SCF → CF → LLVM
+```
+
+We skip the affine layer entirely. Linalg's fusion patterns and SCF's loop optimizations (LICM, vectorization) provide sufficient optimization for pedagogical examples and most ML workloads.
+
+**Key Takeaway for This Book**. When you see `affine_map<...>` in our code (Chapters 9, 14), that's **not the affine dialect**—it's just the `AffineMap` type used by Linalg for indexing. When you encounter references to affine in MLIR documentation or other codebases, now you understand:
+- What it is (polyhedral loop optimization)
+- Why it exists (automatic analysis of structured loops)
+- Why we don't use it (Linalg + SCF is more practical for ML workloads)
+- When you might use it (static kernels, research, specific production cases)
+
+**Further Reading** (if you're curious about affine):
+- **MLIR Affine Dialect Docs**: [`Dialects/Affine.md`](https://mlir.llvm.org/docs/Dialects/Affine/)
+- **Polyhedral Compilation Primer**: Uday Bondhugula's papers on automatic loop optimization
+- **Polygeist Project**: C/C++ → Affine MLIR → Optimized parallel code
+
 ## 10.3 Linalg Fusion: Reducing Memory Traffic
 
 Fusion merges adjacent operations to reduce memory operations—the most impactful optimization for memory-bound workloads (which ML often is). MLIR's Linalg dialect enables sophisticated fusion through its structured operation abstraction. Let's understand how fusion works, why it requires careful analysis, and what MLIR automates.

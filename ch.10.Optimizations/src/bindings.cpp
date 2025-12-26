@@ -113,7 +113,7 @@ public:
         pm.addPass(mlir::createCanonicalizerPass());
 
         // 5. Vectorization (NEW! Explicit SIMD)
-        // Convert affine/scf loops to vector operations
+        // Convert vector operations to SCF (for unrolling/lowering)
         pm.addPass(mlir::createConvertVectorToSCFPass());
         pm.addPass(mlir::createCanonicalizerPass());
 

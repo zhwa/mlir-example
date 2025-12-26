@@ -11,13 +11,11 @@ Chapter 16 is divided into two parts. Part 1 (this chapter) teaches the **infere
 def serve_naive(requests):
     for req in requests:
         prompt_tokens = tokenize(req.prompt)
-        
         # Full forward pass for entire sequence every iteration
         for _ in range(req.max_tokens):
             logits = model.forward(prompt_tokens)
             next_token = sample(logits[-1])
             prompt_tokens.append(next_token)
-            
         return prompt_tokens
 ```
 
@@ -58,22 +56,22 @@ Production serving systems organize computation around **requests**—user tasks
 ```python
 class Request:
     """Represents one user generation task"""
-    
+
     # Input
     prompt: List[int]          # Token IDs [1, 2, 3, ...]
     max_tokens: int            # Generate up to N tokens
     temperature: float         # Sampling temperature
     top_k: int                 # Top-k sampling
-    
+
     # State tracking
     cached_len: int            # Tokens with computed KV cache
     device_len: int            # Tokens in GPU memory
     max_device_len: int        # Maximum capacity (prompt_len + max_tokens)
-    
+
     # Memory management
     table_idx: int             # Row in page table
     page_ids: List[int]        # Allocated physical pages
-    
+
     # Lifecycle
     status: str                # "waiting" → "running" → "finished"
     output_tokens: List[int]   # Generated tokens

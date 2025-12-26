@@ -4,1342 +4,491 @@ Part 2 built core components—request/batch abstractions, paged KV cache, prefi
 
 This chapter completes nano-serving with **Phases 3-6**, culminating in NanoServingEngine—an educational inference system demonstrating how modern LLM serving techniques work. By the end, you'll understand how production systems achieve performance through algorithmic innovation, not just hardware acceleration.
 
-**What We'll Build**:
+We begin with Phase 3's chunked prefill, which addresses fairness by splitting long prompts into smaller chunks that can be interleaved with other requests. This prevents small queries from waiting excessively while large contexts process. Phase 4 introduces radix caching, the most impactful optimization, which automatically detects and reuses shared token prefixes across requests through a tree structure. When multiple requests share system prompts or common context, the radix cache eliminates redundant computation by storing KV cache entries once and sharing them across all matching requests.
+
+Phase 5 implements continuous batching, enabling dynamic addition and removal of requests during serving. Unlike static batching where all requests wait for the slowest to complete, continuous batching maintains high GPU utilization by immediately replacing finished requests with waiting ones. Phase 6 integrates everything into NanoServingEngine, providing a complete educational implementation that demonstrates how production LLM serving systems achieve their performance characteristics.
+
+## 16.16 Phase 3: Chunked Prefill for Fair Scheduling
+
+### 16.16.1 The Long Prompt Starvation Problem
+
+Interactive LLM serving faces a fundamental scheduling challenge: **long prompts monopolize GPU resources**, causing short prompts to wait unacceptably long. This creates poor user experience where small queries (chatbot messages, quick questions) experience high latency due to large context processing (document analysis, multi-shot examples) ahead in the queue.
+
+**The Problem Visualized**:
 
 ```
-Phase 3: Chunked Prefill
-  → Split long prompts into chunks (256 tokens)
-  → Fair scheduling prevents starvation
-  → Interleave with decode batches
-
-Phase 4: Radix Cache ⭐ THE KEY INNOVATION
-  → Automatic prefix detection (radix tree)
-  → KV cache sharing reduces redundant computation
-  → LRU eviction (memory management)
-
-Phase 5: Continuous Batching
-  → Dynamic request addition/removal
-  → Request pool (waiting → running → finished)
-  → Main serving loop
-
-Phase 6: Complete Integration
-  → NanoServingEngine (all optimizations)
-  → End-to-end API
-  → Performance analysis
+Time →
+┌────────────────────────────────────────┐
+│  Req 0: 2000 tokens (200ms)            │ ← GPU 100% busy
+└────────────────────────────────────────┘
+                                         │
+                        Req 1: 50 tokens (5ms) waits 200ms!  ← 40× latency penalty
+                        Req 2: 100 tokens (10ms) waits 205ms! ← 20× latency penalty
 ```
 
-## 16.16 Phase 3: Chunked Prefill for Long Contexts
+**Naive FCFS (First-Come-First-Served) scheduling** processes requests sequentially. A single 2000-token prompt (200ms prefill on modern GPUs) forces all subsequent requests to wait, regardless of their size. This violates the principle of **fairness**: small requests should not be penalized by large requests ahead in the queue.
 
-Long prompts (1000+ tokens) block GPU for 100-200ms during prefill. Short prompts (50 tokens, 5ms) wait in queue—unacceptable for interactive serving. **Chunked prefill** splits long prompts into fixed-size chunks, interleaving with short prompts for fair scheduling.
+**Key Insight**: Prefill computation is **divisible**—we can split it into smaller chunks and interleave execution. Unlike indivisible operations (single matrix multiplication), attention computation over 2000 tokens can be broken into 4× 500-token chunks without sacrificing correctness. The KV cache for tokens 0-499 remains valid when computing tokens 500-999.
 
-**The Long Prompt Problem**:
+### 16.16.2 Chunked Prefill: Progressive Computation
+
+**Chunked prefill** transforms long prompts into multiple small scheduling units:
+
+**Algorithm**: Break prompt into fixed-size chunks (typically 256-512 tokens)
+
+```
+Original request: [2000 tokens] → [200ms prefill]
+
+Chunked execution:
+  Chunk 0: [256 tokens] → [26ms]
+  Chunk 1: [256 tokens] → [26ms]
+  Chunk 2: [256 tokens] → [26ms]
+  ...
+  Chunk 7: [232 tokens] → [24ms]
+```
+
+**Scheduling Strategy**: Round-robin across all active requests
+
+```
+Time →
+┌──────┐
+│ Req 0│ Chunk 0 (256 tokens, 26ms)
+└──────┘
+       ┌─┐
+       │1│ Complete prefill (50 tokens, 5ms)
+       └─┘
+          ┌──────┐
+          │ Req 0│ Chunk 1 (256 tokens, 26ms)
+          └──────┘
+                 ┌──┐
+                 │ 2│ Complete prefill (100 tokens, 10ms)
+                 └──┘
+                    ┌──────┐
+                    │ Req 0│ Chunk 2 (256 tokens, 26ms)
+                    └──────┘
+```
+
+The improvement is substantial. Request 1 now starts processing after just 26ms instead of waiting the full 200ms for request 0 to complete. This represents meaningful latency reduction for interactive workloads. More importantly, every request makes progress proportional to its actual work requirement rather than being blocked by whatever happens to be ahead in the queue. Short requests complete quickly even when large context processing requests are present, maintaining system responsiveness across mixed workloads.
+
+### 16.16.3 Fairness vs Throughput Trade-off
+
+Chunking introduces overhead that must be balanced against its fairness benefits. Context switching between chunks requires GPU state saves and restores, though modern GPUs handle this efficiently. Each chunk must recompute attention over all previously cached tokens, adding computational cost. Smaller chunks also reduce effective batch size at any given moment, which can lower GPU utilization compared to processing large contiguous sequences.
+
+The choice of chunk size involves fundamental tradeoffs. Smaller chunks (256-512 tokens) prioritize fairness and reduce tail latency, making them suitable for interactive workloads like chatbots where users expect quick responses. Larger chunks (1024+ tokens) minimize overhead and maximize throughput, fitting batch-oriented workloads like document processing where total completion time matters more than individual request latency. Production systems often adjust chunk size dynamically based on current queue depth and mix of request sizes, using smaller chunks when many short requests are waiting and larger chunks when processing homogeneous workloads.
+
+### 16.16.4 Implementation Considerations
+
+Production implementations must handle several practical concerns. The KV cache grows incrementally as chunks process—after the first chunk completes, the cache contains entries for those tokens; after the second chunk, entries for both chunks exist. Each chunk's attention computation uses all previously cached entries plus the new chunk's tokens. Request state tracking becomes more complex since the system must know how many tokens each request has already cached and which chunk to process next. The scheduler queries this state to determine appropriate work units for the current iteration.
+
+**Core Chunking State** (from [`chunked_request.py`](../ch.16.Nano-Serving/python/chunked_request.py)):
 
 ```python
-# Scenario: Queue at t=0
-requests = [
-    Request(0, [1]*2000, 10),  # 2000-token prompt (200ms prefill)
-    Request(1, [2]*50, 10),     # 50-token prompt (5ms prefill)
-    Request(2, [3]*100, 10),    # 100-token prompt (10ms prefill)
-]
-
-# Naive FCFS scheduling:
-# t=0-200ms:  Req 0 prefill (GPU 100% busy)
-# t=200ms:    Req 1 prefill (waited 200ms!)
-# t=205ms:    Req 2 prefill (waited 205ms!)
-#
-# Req 1 and Req 2 starve despite being small!
-```
-
-**Chunked Request Abstraction**:
-
-```python
-# python/chunked_request.py
-from typing import List, Optional
-from python.request import Request
-
 class ChunkedRequest:
-    """Request split into chunks for progressive prefill
-    
-    Long prompt: [1000 tokens]
-    → Chunks: [256] [256] [256] [232]
-    → Process one chunk per iteration
-    """
-    
-    def __init__(self, req: Request, chunk_size: int = 256):
-        """
-        Args:
-            req: Original request
-            chunk_size: Tokens per chunk (typically 256-512)
-        """
-        self.req = req
+    """Tracks progress through a long prompt"""
+    def __init__(self, request: Request, chunk_size: int = 512):
+        self.request = request
         self.chunk_size = chunk_size
-        
-        # Calculate chunks
-        prompt_len = len(req.prompt_tokens)
-        self.num_chunks = (prompt_len + chunk_size - 1) // chunk_size
-        self.current_chunk = 0
-    
-    def get_next_chunk_len(self) -> int:
-        """Get size of next chunk to process"""
-        if self.is_prefill_done():
-            return 0
-        
-        prompt_len = len(self.req.prompt_tokens)
-        start = self.current_chunk * self.chunk_size
-        end = min(start + self.chunk_size, prompt_len)
-        
-        return end - start
-    
-    def advance_chunk(self):
-        """Mark current chunk as processed"""
-        if not self.is_prefill_done():
-            chunk_len = self.get_next_chunk_len()
-            self.req.cached_len += chunk_len
-            self.current_chunk += 1
-    
-    def is_prefill_done(self) -> bool:
-        """Check if all chunks processed"""
-        return self.current_chunk >= self.num_chunks
+        self.tokens_processed = request.cached_len  # Start from cached
     
     @property
-    def progress(self) -> float:
-        """Prefill progress (0.0 to 1.0)"""
-        return self.current_chunk / self.num_chunks if self.num_chunks > 0 else 1.0
+    def has_more_chunks(self) -> bool:
+        """Check if there are more chunks to process"""
+        return self.tokens_processed < len(self.request.prompt_tokens)
+    
+    def get_next_chunk(self) -> List[int]:
+        """Get next chunk of tokens to process"""
+        start = self.tokens_processed
+        end = min(start + self.chunk_size, len(self.request.prompt_tokens))
+        return self.request.prompt_tokens[start:end]
 ```
 
-**Chunked Prefill Manager**:
+The key insight: each request maintains `tokens_processed` counter, enabling resumption from any point. The scheduler simply iterates through chunked requests, processing one chunk per iteration until `has_more_chunks` returns false.
 
-```python
-# python/chunked_prefill.py
-from typing import List, Optional
-from python.request import Request
-from python.batch import Batch
-from python.chunked_request import ChunkedRequest
+Round-robin scheduling is simple but not optimal for all scenarios. Production systems often use priority queues where each request receives a score based on estimated completion time divided by chunk size, balancing fairness for small requests with throughput for large ones. This prevents both starvation of large requests by many small requests and blocking of small requests by large contexts. Prefill and decode phases can coexist in the same serving loop—while chunking processes a new request's prompt, the system simultaneously generates output tokens for requests already in decode phase, as we'll see in Section 16.18.
 
-class ChunkedPrefillManager:
-    """Manages chunked prefill scheduling
-    
-    Strategy: Round-robin with token budget
-    - Process one chunk from each request in turn
-    - Fair scheduling (no request starves)
-    - Interleave with decode batches
-    """
-    
-    def __init__(self, token_budget: int = 512, chunk_size: int = 256):
-        """
-        Args:
-            token_budget: Maximum tokens per batch
-            chunk_size: Tokens per chunk
-        """
-        self.token_budget = token_budget
-        self.chunk_size = chunk_size
-        self.queue: List[ChunkedRequest] = []
-    
-    def add_request(self, req: Request):
-        """Add request for chunked prefill"""
-        chunked = ChunkedRequest(req, self.chunk_size)
-        self.queue.append(chunked)
-    
-    def schedule(self) -> Optional[Batch]:
-        """Schedule next prefill batch using round-robin
-        
-        Returns:
-            Batch with chunks from multiple requests
-        """
-        if not self.queue:
-            return None
-        
-        selected_reqs = []
-        total_tokens = 0
-        
-        # Round-robin: try each request once
-        for _ in range(len(self.queue)):
-            if not self.queue:
-                break
-            
-            # Get first request in queue
-            chunked = self.queue[0]
-            chunk_len = chunked.get_next_chunk_len()
-            
-            if chunk_len == 0:
-                # Prefill done, remove from queue
-                self.queue.pop(0)
-                continue
-            
-            if total_tokens + chunk_len <= self.token_budget:
-                # Process this chunk
-                selected_reqs.append(chunked.req)
-                total_tokens += chunk_len
-                
-                # Advance chunk counter
-                chunked.advance_chunk()
-                
-                # Move to back of queue (round-robin)
-                self.queue.append(self.queue.pop(0))
-            else:
-                # Would exceed budget, skip for now
-                # Move to back to try later
-                self.queue.append(self.queue.pop(0))
-        
-        if selected_reqs:
-            return Batch.from_prefill(selected_reqs)
-        
-        return None
-    
-    def is_empty(self) -> bool:
-        return len(self.queue) == 0
+**Connection to ch.14 Implementation**: Our [`generation.py`](../ch.14.GPT-Optimized/generation.py#L45-L120) uses `generate_cached()` with full prefill, suitable for demonstration. Production systems extend this with chunk iteration and scheduling policies shown above.
+
+## 16.17 Phase 4: Radix Cache for Automatic Prefix Sharing
+
+### 16.17.1 The Redundant Computation Problem
+
+Real-world LLM workloads exhibit substantial prefix overlap. Chatbot applications prepend the same system prompt to every user query, consuming dozens to hundreds of tokens that remain constant across requests. Few-shot learning scenarios include identical example demonstrations before each prompt, often spanning hundreds of tokens. Document question-answering systems attach the same large document context to multiple different questions, sometimes consuming thousands of tokens that differ only in the final query portion.
+
+Naive KV caching treats each request independently, computing attention for all tokens from scratch. When one hundred requests share a five-hundred-token system prompt, this approach computes the same five hundred KV vectors one hundred times, wasting enormous GPU cycles on redundant computation. The key insight is that token sequences naturally form a prefix tree structure. If we organize the KV cache as a radix tree, shared prefixes need only be computed once. All requests following the same initial token path can reuse those cached entries, with branching occurring only where requests diverge.
+
+### 16.17.2 Radix Tree Data Structure
+
+**Tree Structure**: Each node represents a token position, edges represent token values
+
+```
+Example requests:
+  Request A: [1, 2, 3, 4, 5] (system prompt + query 1)
+  Request B: [1, 2, 3, 6, 7] (system prompt + query 2)
+  Request C: [1, 2, 8, 9]    (system prompt prefix + different continuation)
+
+Radix tree:
+                    [root]
+                      |
+                    token=1
+                      |
+                    token=2
+                    /   \
+                token=3  token=8
+                /   \       \
+            token=4 token=6  token=9
+               |       |
+            token=5 token=7
+
+Shared path [1→2]: KV cache computed once, used by all requests
+Branching at token=2: Different continuations store separate KV cache
 ```
 
-**Scheduling Comparison**:
+Each radix tree node represents a single token position in the sequence and stores the corresponding KV cache pages in physical memory. The node maintains a map from token IDs to child nodes, enabling fast traversal when looking up prefixes. Reference counting tracks how many active requests currently use this node—when a request begins processing, it increments the reference count for all nodes along its path; when the request completes, it decrements them. The last access timestamp supports LRU eviction by identifying which branches of the tree have gone unused for the longest time.
+
+**Core Node Structure** (from [`radix_node.py`](../ch.16.Nano-Serving/python/radix_node.py)):
 
 ```python
-# Without chunking (FCFS):
-# Step 0: Req 0 [2000 tokens] → 200ms
-# Step 1: Req 1 [50 tokens]   → 5ms   (waited 200ms!)
-# Step 2: Req 2 [100 tokens]  → 10ms  (waited 205ms!)
-
-# With chunking (chunk_size=256):
-# Step 0: Req 0 [256], Req 1 [50], Req 2 [100] → 41ms
-# Step 1: Req 0 [256] + decode batches → 26ms
-# Step 2: Req 0 [256] + decode batches → 26ms
-# ...
-# Step 7: Req 0 [208] + decode batches → 21ms
-#
-# Req 1 wait time: 15ms (vs 200ms, 13× better!)
-# Req 2 wait time: 20ms (vs 205ms, 10× better!)
-```
-
-**Phase 3 Tests** (11 tests validating chunked prefill):
-
-```python
-# test_phase3_chunked_prefill.py
-def test_chunked_request():
-    """Test chunk calculation"""
-    req = Request(0, [1]*1000, 10)
-    chunked = ChunkedRequest(req, chunk_size=256)
-    
-    assert chunked.num_chunks == 4  # ceil(1000/256)
-    assert chunked.get_next_chunk_len() == 256
-    assert not chunked.is_prefill_done()
-    
-    # Advance through chunks
-    for i in range(4):
-        chunk_len = chunked.get_next_chunk_len()
-        chunked.advance_chunk()
-    
-    assert chunked.is_prefill_done()
-
-def test_round_robin_scheduling():
-    """Test fair round-robin scheduling"""
-    mgr = ChunkedPrefillManager(token_budget=512, chunk_size=256)
-    
-    # Add requests: one long, two short
-    mgr.add_request(Request(0, [1]*1000, 10))  # 4 chunks
-    mgr.add_request(Request(1, [2]*100, 10))   # 1 chunk
-    mgr.add_request(Request(2, [3]*200, 10))   # 1 chunk
-    
-    # First batch: chunks from all requests
-    batch = mgr.schedule()
-    assert len(batch.requests) == 3
-    
-    # Second batch: only long request remains
-    batch = mgr.schedule()
-    assert len(batch.requests) == 1
-    assert batch.requests[0].req_id == 0
-
-def test_interleave_prefill_decode():
-    """Test interleaving prefill chunks with decode"""
-    prefill_mgr = ChunkedPrefillManager(token_budget=256, chunk_size=256)
-    decode_mgr = DecodeManager(max_batch_size=32)
-    
-    # Long prompt
-    long_req = Request(0, [1]*1000, 10)
-    prefill_mgr.add_request(long_req)
-    
-    # Some running decode requests
-    for i in range(1, 5):
-        req = Request(i, [2, 3], 10)
-        req.cached_len = 2
-        req.output_tokens = [10]
-        decode_mgr.add_request(req)
-    
-    # Simulate serving loop
-    steps = 0
-    while not prefill_mgr.is_empty() or not decode_mgr.is_empty():
-        # Prefill chunk
-        prefill_batch = prefill_mgr.schedule()
-        if prefill_batch:
-            print(f"Step {steps}: Prefill {len(prefill_batch.input_ids)} tokens")
-        
-        # Decode batch
-        decode_batch = decode_mgr.schedule()
-        if decode_batch:
-            print(f"Step {steps}: Decode {len(decode_batch.requests)} requests")
-            
-            # Simulate token generation
-            for req in decode_batch.requests:
-                req.output_tokens.append(0)
-                if len(req.output_tokens) >= req.max_tokens:
-                    req.is_finished = True
-            decode_mgr.remove_finished()
-        
-        steps += 1
-        if steps > 20:
-            break  # Safety
-    
-    # Long request should be fully prefilled
-    assert long_req.cached_len == 1000
-```
-
-**Performance Impact**:
-
-Chunked prefill improves fairness by preventing long requests from blocking short ones. The round-robin scheduling ensures all requests make progress, eliminating starvation. This comes with a small throughput trade-off but dramatically improves user experience for interactive workloads where some requests need low latency.
-
-## 16.17 Phase 4: Radix Cache - Automatic Prefix Sharing
-
-Many requests share common prefixes: system prompts, few-shot examples, document context. Computing KV cache independently wastes computation. **Radix cache** uses a prefix tree to automatically detect and reuse shared KV cache, reducing redundant computation significantly in workloads with high prefix overlap.
-
-**Radix Tree Structure**:
-
-```python
-# python/radix_node.py
-from typing import Dict, List, Optional
-import time
-
 class RadixNode:
-    """Node in radix tree storing KV cache pages
-    
-    Tree structure enables prefix sharing:
-           [root]
-             |
-         [1, 2, 3] (system prompt)
-          /     \
-    [4, 5]     [6, 7]
-    (query1)   (query2)
-    
-    Requests [1,2,3,4,5] and [1,2,3,6,7] share [1,2,3]
-    """
-    
+    """Node in radix tree for prefix sharing"""
     def __init__(self, token: Optional[int] = None):
-        """
-        Args:
-            token: Token this node represents (None for root)
-        """
         self.token = token
-        self.children: Dict[int, 'RadixNode'] = {}
-        
-        # KV cache management
-        self.kv_pages: List[int] = []       # Physical pages
-        
-        # Reference counting for garbage collection
-        self.ref_count: int = 0
-        self.last_access_time: float = time.time()
+        self.children: Dict[int, 'RadixNode'] = {}  # token_id -> child
+        self.kv_pages: List[int] = []               # Physical pages
+        self.ref_count: int = 0                     # Active requests
+        self.last_access_time: float = time.time()  # For LRU
     
     def get_child(self, token: int) -> Optional['RadixNode']:
-        """Get child node for token"""
         return self.children.get(token)
     
     def add_child(self, token: int) -> 'RadixNode':
-        """Add child node for token"""
         if token not in self.children:
             self.children[token] = RadixNode(token)
         return self.children[token]
-    
-    def increment_ref(self):
-        """Increment reference count (request using this node)"""
-        self.ref_count += 1
-        self.update_access_time()
-    
-    def decrement_ref(self):
-        """Decrement reference count (request finished)"""
-        self.ref_count = max(0, self.ref_count - 1)
-    
-    def update_access_time(self):
-        """Update last access time for LRU"""
-        self.last_access_time = time.time()
-    
-    @property
-    def is_leaf(self) -> bool:
-        """Check if this is a leaf node"""
-        return len(self.children) == 0
-    
-    @property
-    def is_evictable(self) -> bool:
-        """Check if node can be evicted (no active references)"""
-        return self.ref_count == 0
 ```
 
-**Radix Cache Implementation**:
+The simplicity is deliberate: nodes are lightweight containers connecting tree structure (via `children` dict) to physical memory (via `kv_pages` list). The entire radix cache algorithm builds on these basic operations.
+
+### 16.17.3 Cache Lookup Algorithm
+
+When a new request arrives with tokens `[t1, t2, t3, ...]`, walk the tree to find the longest prefix match:
+
+**Prefix Matching Logic** (from [`radix_cache.py`](../ch.16.Nano-Serving/python/radix_cache.py)):
 
 ```python
-# python/radix_cache.py
-from typing import List, Tuple, Optional
-from python.radix_node import RadixNode
-from python.kv_pool import KVCachePool
-
-class RadixCache:
-    """Radix tree-based KV cache manager
+def match_prefix(self, tokens: List[int]) -> Tuple[int, RadixNode]:
+    """Find longest matching prefix in tree
     
-    Automatically detects shared prefixes and reuses KV cache.
-    Implements LRU eviction for memory management.
+    Returns:
+        (matched_length, last_matched_node)
     """
+    node = self.root
+    matched_len = 0
     
-    def __init__(self, kv_pool: KVCachePool):
-        """
-        Args:
-            kv_pool: KV cache pool for page management
-        """
-        self.root = RadixNode(token=None)
-        self.kv_pool = kv_pool
-        
-        # Statistics
-        self.cache_hits = 0
-        self.cache_misses = 0
+    for i, token in enumerate(tokens):
+        child = node.get_child(token)
+        if child is not None:
+            node = child              # Advance in tree
+            matched_len = i + 1       # Count matched tokens
+            node.update_access_time() # Update LRU
+        else:
+            break  # No match, stop here
     
-    def match_prefix(self, tokens: List[int]) -> Tuple[int, RadixNode]:
-        """Find longest matching prefix in tree
-        
-        Args:
-            tokens: Token sequence to match
-            
-        Returns:
-            Tuple of (matched_length, last_node)
-        """
-        node = self.root
-        matched_len = 0
-        
-        for i, token in enumerate(tokens):
-            child = node.get_child(token)
-            if child is not None:
-                node = child
-                matched_len = i + 1
-                node.update_access_time()
-            else:
-                break
-        
-        return matched_len, node
-    
-    def insert(self, tokens: List[int], kv_pages: List[int]) -> RadixNode:
-        """Insert token sequence into tree
-        
-        Args:
-            tokens: Token sequence
-            kv_pages: KV pages for each token (1-to-1 mapping)
-            
-        Returns:
-            Leaf node representing this sequence
-        """
-        if len(tokens) != len(kv_pages):
-            raise ValueError("Tokens and pages must match")
-        
-        node = self.root
-        
-        for i, token in enumerate(tokens):
-            child = node.get_child(token)
-            
-            if child is None:
-                # Create new node
-                child = node.add_child(token)
-                child.kv_pages = [kv_pages[i]]
-                self.cache_misses += 1
-            else:
-                # Reuse existing node
-                child.increment_ref()
-                self.cache_hits += 1
-            
-            node = child
-        
-        node.update_access_time()
-        return node
-    
-    def get_pages_for_prefix(self, tokens: List[int]) -> List[int]:
-        """Get KV pages for prefix
-        
-        Args:
-            tokens: Token sequence
-            
-        Returns:
-            List of KV page indices
-        """
-        node = self.root
-        pages = []
-        
-        for token in tokens:
-            child = node.get_child(token)
-            if child is None:
-                break
-            pages.extend(child.kv_pages)
-            node = child
-        
-        return pages
-    
-    def evict_lru_nodes(self, required_pages: int) -> int:
-        """Evict least-recently-used nodes to free memory
-        
-        Args:
-            required_pages: Number of pages needed
-            
-        Returns:
-            Number of pages freed
-        """
-        # Collect evictable nodes (ref_count == 0)
-        evictable = []
-        self._collect_evictable(self.root, evictable)
-        
-        # Sort by LRU
-        evictable.sort(key=lambda n: n.last_access_time)
-        
-        # Evict until enough freed
-        freed = 0
-        for node in evictable:
-            if freed >= required_pages:
-                break
-            
-            # Free pages
-            self.kv_pool.free(node.kv_pages)
-            freed += len(node.kv_pages)
-            node.kv_pages = []
-        
-        return freed
-    
-    def _collect_evictable(self, node: RadixNode, result: List[RadixNode]):
-        """Recursively collect evictable nodes"""
-        if node.is_evictable and node.kv_pages:
-            result.append(node)
-        
-        for child in node.children.values():
-            self._collect_evictable(child, result)
-    
-    def get_stats(self) -> dict:
-        """Get cache statistics"""
-        total = self.cache_hits + self.cache_misses
-        hit_rate = self.cache_hits / total if total > 0 else 0.0
-        
-        return {
-            'cache_hits': self.cache_hits,
-            'cache_misses': self.cache_misses,
-            'hit_rate': hit_rate
-        }
+    return matched_len, node
 ```
 
-**Radix Cache Manager** (high-level API):
+**Example execution**:
+- Tree contains path [1, 2, 3]
+- New request: [1, 2, 3, 6, 7]
+- Lookup walks: root → [1] → [2] → [3] → (no child for 6)
+- Returns: `matched_length=3`, reuse KV cache for tokens [1,2,3]
+- Need to compute: tokens [6, 7] starting from node representing [1,2,3]
 
-```python
-# python/radix_manager.py
-from typing import List
-from python.request import Request
-from python.radix_cache import RadixCache
-from python.kv_pool import KVCachePool
+The algorithm is optimal: $O(n)$ where $n$ is the shorter of (token sequence length, tree depth). No backtracking, no hash lookups—pure tree traversal.
 
-class RadixCacheManager:
-    """High-level interface for radix cache operations"""
-    
-    def __init__(self, kv_pool: KVCachePool):
-        self.kv_pool = kv_pool
-        self.radix_cache = RadixCache(kv_pool)
-    
-    def allocate_for_request(self, req: Request):
-        """Allocate KV cache for request with prefix matching
-        
-        Args:
-            req: Request needing KV cache
-        """
-        # Find cached prefix
-        matched_len, node = self.radix_cache.match_prefix(req.prompt_tokens)
-        
-        req.cached_len = matched_len
-        
-        # Allocate pages for new tokens
-        new_tokens = len(req.prompt_tokens) - matched_len
-        if new_tokens > 0:
-            try:
-                pages = self.kv_pool.allocate(new_tokens)
-                req.kv_pages = pages
-                
-                # Insert into radix tree
-                self.radix_cache.insert(req.prompt_tokens, pages)
-            except RuntimeError:
-                # Out of memory, try eviction
-                pages_needed = self.kv_pool.pages_needed(new_tokens)
-                freed = self.radix_cache.evict_lru_nodes(pages_needed)
-                
-                if freed >= pages_needed:
-                    pages = self.kv_pool.allocate(new_tokens)
-                    req.kv_pages = pages
-                    self.radix_cache.insert(req.prompt_tokens, pages)
-                else:
-                    raise RuntimeError("Unable to free enough memory")
-    
-    def free_request(self, req: Request):
-        """Free KV cache when request finishes"""
-        if req.kv_pages:
-            self.kv_pool.free(req.kv_pages)
-            req.kv_pages = []
-```
+### 16.17.4 Memory Management and Eviction
 
-**Example: Prefix Sharing**:
+**Physical Memory Layout**: KV cache stored in **pages** (e.g., 256 tokens per page). Each radix node holds references to physical pages in the KV pool.
 
-```python
-# Scenario: Chatbot with system prompt
-system_prompt = [1, 2, 3, 4, 5]  # 5 tokens
+**Problem**: Tree grows unbounded as requests add new paths. GPU memory is limited (40GB on A100, stores ~100K tokens with Llama-70B).
 
-# Request 1: system + "What is Python?"
-req1 = Request(0, system_prompt + [10, 11, 12], max_tokens=10)
+**Solution**: **LRU eviction** removes unused branches when memory pressure occurs:
 
-# Request 2: system + "Explain recursion"
-req2 = Request(1, system_prompt + [20, 21], max_tokens=10)
+1. **Eviction candidates**: Nodes with `ref_count == 0` (no active requests)
+2. **LRU scoring**: Sort candidates by `last_access_time`
+3. **Eviction process**: 
+   - Remove leaf nodes first (preserve shared prefixes)
+   - Free KV pages back to pool
+   - Update parent node's children map
 
-# Request 3: system + "Debug this code"
-req3 = Request(2, system_prompt + [30, 31, 32, 33], max_tokens=10)
+The eviction policy preserves hot paths while removing cold ones. Frequently accessed sequences like system prompts remain in the cache because their access timestamps constantly update. One-time queries with unique continuations become eviction candidates once their reference counts drop to zero. The leaf-first removal strategy ensures shared prefixes near the tree root survive longer than unique continuations near the leaves, maintaining the most valuable cached state.
 
-# Allocate with radix cache
-radix_mgr = RadixCacheManager(kv_pool)
+The memory efficiency gain can be dramatic. Consider one hundred requests sharing a five-hundred-token prefix. Without radix caching, the system stores fifty thousand token entries redundantly—each request maintains its own copy of the identical prefix. With radix caching, only five hundred tokens need storage, shared across all requests. This represents a ninety-nine percent reduction in memory consumption for the shared portion.
 
-# Req 1: No match, allocate 8 tokens
-radix_mgr.allocate_for_request(req1)
-assert req1.cached_len == 0
-assert len(req1.kv_pages) == 1  # 8 tokens = 1 page
+### 16.17.5 Integration with Request Lifecycle
 
-# Req 2: Matches [1,2,3,4,5], allocate only 2 new tokens!
-radix_mgr.allocate_for_request(req2)
-assert req2.cached_len == 5     # Shared prefix
-assert len(req2.kv_pages) == 1  # Only 2 new tokens
+During prefill, the system first looks up the request's token sequence in the radix tree to find the longest matching prefix. It reuses the existing KV cache entries for all matched tokens and computes new entries only for the unmatched portion. As computation proceeds, the system inserts new nodes into the tree representing the unique continuation of this request and increments reference counts for all nodes along the path, indicating an active request depends on them.
 
-# Req 3: Matches [1,2,3,4,5], allocate only 4 new tokens!
-radix_mgr.allocate_for_request(req3)
-assert req3.cached_len == 5     # Shared prefix
-assert len(req3.kv_pages) == 1  # Only 4 new tokens
+The decode phase extends the cached sequence with each generated token. As the model produces new tokens, the system creates corresponding child nodes in the radix tree and stores their KV vectors. If multiple requests share the same generation path (rare but possible in beam search or when temperature is zero), they share these decode-phase nodes as well.
 
-# Cache statistics
-stats = radix_mgr.radix_cache.get_stats()
-print(f"Hit rate: {stats['hit_rate']:.1%}")  # ~62.5%
-```
+When a request completes, cleanup involves decrementing reference counts for all nodes in the request's path. Nodes reaching zero reference count become eligible for eviction—no active request depends on them anymore. The LRU eviction process runs periodically, examining evictable nodes and freeing the least recently accessed ones when memory pressure requires it.
 
-**Phase 4 Tests** (13 tests validating radix cache):
+### 16.17.6 Implementation Notes
 
-```python
-# test_phase4_radix_cache.py
-def test_prefix_detection():
-    """Test automatic prefix matching"""
-    kv_pool = KVCachePool(64, 16, 4, 4, 32)
-    cache = RadixCache(kv_pool)
-    
-    # Insert sequence
-    tokens1 = [1, 2, 3, 4, 5]
-    pages1 = kv_pool.allocate(len(tokens1))
-    cache.insert(tokens1, pages1)
-    
-    # Match full prefix
-    matched_len, node = cache.match_prefix([1, 2, 3, 4, 5])
-    assert matched_len == 5
-    
-    # Match partial prefix
-    matched_len, node = cache.match_prefix([1, 2, 3])
-    assert matched_len == 3
-    
-    # No match
-    matched_len, node = cache.match_prefix([9, 9, 9])
-    assert matched_len == 0
+Since the radix cache is shared across all concurrent requests, thread safety becomes critical. Read operations like prefix lookups can occur simultaneously without coordination—multiple threads traverse the tree to find their matching prefixes in parallel. Write operations like inserting new nodes or performing eviction require exclusive access to prevent corruption. This read-write locking pattern allows high concurrency for the common case (lookups) while ensuring consistency for modifications.
 
-def test_prefix_sharing():
-    """Test KV cache sharing between requests"""
-    kv_pool = KVCachePool(64, 16, 4, 4, 32)
-    mgr = RadixCacheManager(kv_pool)
-    
-    # System prompt
-    system = [1, 2, 3, 4, 5]
-    
-    # Request 1
-    req1 = Request(0, system + [10, 11], max_tokens=5)
-    mgr.allocate_for_request(req1)
-    
-    initial_free = kv_pool.get_num_free_pages()
-    
-    # Request 2 (shares system prompt)
-    req2 = Request(1, system + [20, 21, 22], max_tokens=5)
-    mgr.allocate_for_request(req2)
-    
-    # Should only allocate for new tokens (3 tokens)
-    # Not full 8 tokens (5 shared + 3 new)
-    assert req2.cached_len == 5
-    
-    stats = mgr.radix_cache.get_stats()
-    assert stats['hit_rate'] > 0.5  # >50% cache hits
+Page allocation performance matters since every token needs KV cache storage. Free list data structures enable fast allocation by maintaining a pool of available pages. Pre-allocating the entire page pool at system startup eliminates malloc calls during serving, preventing latency spikes from memory allocation. Some implementations cache hash values for token sequences at each node, enabling quick rejection of non-matching paths through hash comparison before committing to deep tree traversal.
 
-def test_lru_eviction():
-    """Test LRU eviction when memory full"""
-    kv_pool = KVCachePool(8, 16, 4, 4, 32)  # Limited memory
-    cache = RadixCache(kv_pool)
-    
-    # Fill memory
-    tokens1 = list(range(100))
-    pages1 = kv_pool.allocate(len(tokens1))
-    cache.insert(tokens1, pages1)
-    
-    assert kv_pool.get_num_free_pages() < 2
-    
-    # Evict LRU nodes
-    freed = cache.evict_lru_nodes(required_pages=4)
-    assert freed >= 4
-    assert kv_pool.get_num_free_pages() >= 4
-
-def test_realistic_workload():
-    """Test cache hit rate on realistic chatbot workload"""
-    kv_pool = KVCachePool(256, 16, 4, 4, 32)
-    mgr = RadixCacheManager(kv_pool)
-    
-    # System prompt (reused across all requests)
-    system = list(range(100))  # 100 tokens
-    
-    # 50 user queries (varying lengths)
-    for i in range(50):
-        user_query = list(range(100, 100 + (i % 20) + 10))  # 10-30 tokens
-        req = Request(i, system + user_query, max_tokens=10)
-        mgr.allocate_for_request(req)
-    
-    stats = mgr.radix_cache.get_stats()
-    print(f"Hit rate: {stats['hit_rate']:.1%}")
-    
-    # Should achieve 40-60% hit rate
-    assert stats['hit_rate'] > 0.4
-```
-
-**Performance Impact**:
-
-```python
-# Workload: 100 requests, 500-token system prompt, 50-token user queries
-Without radix cache:
-  Total tokens: 100 × 550 = 55,000 tokens
-  Prefill compute: 55,000 tokens
-
-With radix cache:
-  First request: 550 tokens (cache miss)
-  Remaining 99: 500 shared + 50 new = 50 tokens each
-  Total tokens: 550 + (99 × 50) = 5,500 tokens
-  Prefill compute: 5,500 tokens
-  
-Reduction: 55,000 / 5,500 = 10× fewer tokens computed
-Hit rate: (99 × 500) / 55,000 = 90%
-```
-
-Radix cache dramatically reduces computation when workloads exhibit prefix sharing—the effectiveness depends entirely on the specific workload patterns encountered in production.
+**Connection to ch.14**: Our [KV caching implementation](../ch.14.GPT-Optimized/generation.py#L45-L75) uses simple array-based cache per request. Production radix cache extends this by sharing cache across requests with tree-based lookup shown above.
 
 ## 16.18 Phase 5: Continuous Batching
 
-Static batching processes all requests together, waiting for the slowest to finish. **Continuous batching** dynamically adds/removes requests every iteration—maximizing GPU utilization.
+### 16.18.1 The Static Batching Bottleneck
 
-**Request Pool** (lifecycle management):
+Traditional batch serving waits for **all requests to complete** before accepting new work. This creates GPU idle time when early-finishing requests complete but the batch continues running for slower requests.
 
-```python
-# python/request_pool.py
-from typing import List
-from python.request import Request
+**Static Batch Problem**:
 
-class RequestPool:
-    """Manages request lifecycle transitions
-    
-    States: waiting → running → finished
-    """
-    
-    def __init__(self):
-        self.waiting: List[Request] = []
-        self.running: List[Request] = []
-        self.finished: List[Request] = []
-    
-    def add_waiting(self, req: Request):
-        """Add new request to waiting queue"""
-        self.waiting.append(req)
-    
-    def move_to_running(self, requests: List[Request]):
-        """Move requests from waiting to running"""
-        for req in requests:
-            if req in self.waiting:
-                self.waiting.remove(req)
-            if req not in self.running:
-                self.running.append(req)
-    
-    def move_to_finished(self, requests: List[Request]):
-        """Move requests from running to finished"""
-        for req in requests:
-            if req in self.running:
-                self.running.remove(req)
-            if req not in self.finished:
-                self.finished.append(req)
-    
-    def get_finished(self) -> List[Request]:
-        """Get and clear finished requests"""
-        result = self.finished.copy()
-        self.finished.clear()
-        return result
+```
+Batch of 8 requests:
+┌────┐ Finished at 20ms ─┐
+├────┤ Finished at 25ms  │
+├────┤ Finished at 30ms  │
+├────┤ Finished at 35ms  │  GPU still processing
+├────┤ Finished at 40ms  │  remaining requests...
+├─────┤ Finished at 55ms  │
+├──────┤ Finished at 70ms │
+└─────────────┘ Finished at 150ms ← Entire batch waits!
+
+New requests arrive at 25ms, 30ms, 40ms...
+All wait 150ms for batch to complete!
 ```
 
-**Continuous Batcher** (main serving loop):
+**Key Insight**: LLM decode generates **one token per request per iteration**. When a request finishes (reaches max_tokens or EOS), we can immediately replace it with a waiting request **without breaking the batch**. Each iteration is independent—the batch can change composition dynamically.
+
+### 16.18.2 Continuous Batching Lifecycle
+
+**Request States**: Waiting → Running → Finished
+
+**Dynamic Batch Formation**: Each iteration reconstructs the batch:
+
+```
+Iteration t:
+┌───────────────────────────────┐
+│ Running: [Req 0, 1, 2, 3, 4]  │ 5 requests
+└───────────────────────────────┘
+         ↓ Generate tokens
+Iteration t+1:
+- Req 2 finished (hit EOS)
+- Req 5 and Req 6 added from waiting queue
+┌─────────────────────────────────────┐
+│ Running: [Req 0, 1, 3, 4, 5, 6]     │ 6 requests
+└─────────────────────────────────────┘
+         ↓ Generate tokens
+Iteration t+2:
+- Req 0, 3 finished
+- Req 7 added (only 1 waiting)
+┌─────────────────────────────────────┐
+│ Running: [Req 1, 4, 5, 6, 7]        │ 5 requests
+└─────────────────────────────────────┘
+```
+
+This dynamic composition delivers several advantages. The GPU batch size stays near its maximum configured value since finished requests immediately give way to waiting ones. New requests begin processing as soon as capacity exists rather than waiting for an entire batch cycle to complete. Most importantly, the GPU never idles while requests remain in the queue—there are no wasted cycles waiting for the slowest request in a static batch to finish.
+
+### 16.18.3 Scheduling Policies
+
+Production scheduling requires multiple cooperating policies. Admission control limits the running batch size to prevent out-of-memory errors—the system must refuse new requests when adding them would exceed available GPU memory. Priority scheduling allows differentiation between request classes, perhaps giving paid users faster service than free tier users. Preemption extends this further by allowing high-priority requests to evict currently running low-priority ones, with the evicted requests returning to the waiting queue while their partial KV cache remains intact in the radix cache, preserving their progress. Fairness policies track how much service each request has received, ensuring all requests eventually make progress and preventing pathological cases where many small requests starve a few large ones or vice versa.
+
+### 16.18.4 Memory Management Integration
+
+Tight memory control integration is essential for continuous batching. Before admitting a new request, the system estimates required memory by calculating tokens needed (prompt length plus maximum generation length minus any cached prefix) and converting to page count. It then checks whether the KV pool has sufficient free pages. If not, the system attempts LRU eviction from the radix cache to free space. Should eviction prove insufficient, the system either rejects the request with backpressure or preempts lower-priority running requests. All allocation must be atomic—either the request receives all needed memory or none, preventing partial state that could cause inconsistencies.
+
+**Memory Estimation Math** (from [`kv_pool.py`](../ch.16.Nano-Serving/python/kv_pool.py) wrapper):
 
 ```python
-# python/continuous_batcher.py
-from typing import List
-import numpy as np
-from python.request import Request
-from python.request_pool import RequestPool
-from python.executor import ModelExecutor
-from python.radix_manager import RadixCacheManager
-from python.chunked_prefill import ChunkedPrefillManager
-from python.decode_manager import DecodeManager
-
-def sample_token(logits: np.ndarray, temperature: float = 1.0) -> int:
-    """Sample next token from logits"""
-    if temperature == 0.0:
-        return int(np.argmax(logits))
+def pages_needed(self, num_tokens: int) -> int:
+    """Calculate pages needed for num_tokens
     
-    logits = logits / temperature
-    exp_logits = np.exp(logits - np.max(logits))
-    probs = exp_logits / np.sum(exp_logits)
-    return int(np.random.choice(len(probs), p=probs))
-
-class ContinuousBatcher:
-    """Main continuous batching loop
-    
-    Dynamically adds/removes requests every iteration.
-    Integrates all components: radix cache, chunked prefill, decode.
+    With page_size=16:
+        15 tokens → 1 page
+        16 tokens → 1 page  
+        17 tokens → 2 pages
     """
-    
-    def __init__(self,
-                 executor: ModelExecutor,
-                 radix_mgr: RadixCacheManager,
-                 prefill_mgr: ChunkedPrefillManager,
-                 decode_mgr: DecodeManager,
-                 eos_token_id: int = 0):
-        self.executor = executor
-        self.radix_mgr = radix_mgr
-        self.prefill_mgr = prefill_mgr
-        self.decode_mgr = decode_mgr
-        self.eos_token_id = eos_token_id
-        self.request_pool = RequestPool()
-        
-        # Statistics
-        self.total_tokens_generated = 0
-        self.total_steps = 0
-    
-    def add_request(self, req: Request):
-        """Add new request to serving queue"""
-        # Allocate KV cache with prefix matching
-        self.radix_mgr.allocate_for_request(req)
-        
-        # Add to waiting queue
-        self.request_pool.add_waiting(req)
-        self.prefill_mgr.add_request(req)
-    
+    return (num_tokens + self.page_size - 1) // self.page_size
+
+def can_allocate(self, num_tokens: int) -> bool:
+    """Check if allocation would succeed"""
+    pages = self.pages_needed(num_tokens)
+    return self.get_num_free_pages() >= pages
+```
+
+Before admitting a request:
+1. Calculate: `new_tokens = len(prompt) + max_gen - cached_len`
+2. Convert: `pages = (new_tokens + page_size - 1) // page_size` (ceiling division)
+3. Check: `free_pages >= pages` (atomic check + allocate)
+4. If insufficient: try eviction, then reject/preempt
+
+The ceiling division ensures we never under-allocate. Example: 17 tokens with 16-token pages needs 2 pages, not 1.06.
+
+Batch size adapts dynamically to memory pressure. When abundant free memory exists (above fifty percent free), the system maximizes batch size to fully utilize the GPU. As memory pressure increases to moderate levels (twenty to fifty percent free), the system reduces batch size somewhat while increasing eviction frequency. Under high memory pressure (below twenty percent free), the system becomes conservative with small batches and aggressive eviction, prioritizing stability over throughput.
+
+### 16.18.5 Integration with Prefill and Decode
+
+The complete serving loop integrates all three phases. Each iteration begins by scheduling prefill chunks for new or partially-processed requests. If any chunks are ready, the system executes them and transitions completed prefills to decode phase. Next comes decode scheduling for all running requests—the system generates one token per request, removes those that have finished, and admits waiting requests to fill available batch capacity. Finally, memory management runs, checking pressure levels and triggering radix cache eviction or considering preemption when necessary.
+
+**Continuous Batching Main Loop** (simplified from [`continuous_batcher.py`](../ch.16.Nano-Serving/python/continuous_batcher.py)):
+
+```python
+class ContinuousBatcher:
     def step(self) -> int:
-        """Execute one batching iteration
-        
-        Returns:
-            Number of tokens generated this step
-        """
-        self.total_steps += 1
+        """Execute one batching iteration"""
         tokens_generated = 0
         
-        # 1. Check for finished requests
-        finished = []
-        for req in self.request_pool.running:
-            if self._is_finished(req):
-                finished.append(req)
-                # Free KV cache
-                self.radix_mgr.free_request(req)
-        
-        if finished:
-            self.request_pool.move_to_finished(finished)
-        
-        # 2. Schedule prefill batch
-        prefill_batch = self.prefill_mgr.schedule()
+        # Phase 1: Schedule prefill chunks
+        prefill_batch = self.prefill_mgr.get_next_batch()
         if prefill_batch:
-            logits = self.executor.execute_prefill(prefill_batch)
-            
-            # Sample first token for each request
-            for i, req in enumerate(prefill_batch.requests):
-                next_token = sample_token(logits[i], req.temperature)
-                req.output_tokens.append(next_token)
-                tokens_generated += 1
-                
-                # If prefill done, move to decode
-                if req.cached_len >= len(req.prompt_tokens):
-                    if req not in self.request_pool.running:
-                        self.request_pool.move_to_running([req])
-                    self.decode_mgr.add_request(req)
+            self.executor.prefill(prefill_batch)
+            # Transition completed to decode
+            for req in prefill_batch.finished:
+                self.request_pool.move_to_running(req)
         
-        # 3. Schedule decode batch
-        self.decode_mgr.remove_finished()
-        decode_batch = self.decode_mgr.schedule()
-        
+        # Phase 2: Decode running requests
+        decode_batch = self.decode_mgr.get_batch(
+            self.request_pool.running)
         if decode_batch:
-            logits = self.executor.execute_decode(decode_batch)
-            
-            # Sample next token for each request
+            logits = self.executor.decode(decode_batch)
             for i, req in enumerate(decode_batch.requests):
-                next_token = sample_token(logits[i], req.temperature)
-                req.output_tokens.append(next_token)
-                req.cached_len += 1
-                tokens_generated += 1
+                token = sample_token(logits[i])  # Sample next token
+                req.append_token(token)
+                
+                if req.is_finished():  # Check EOS or max_tokens
+                    self.request_pool.mark_finished(req)
+                    tokens_generated += 1
         
-        self.total_tokens_generated += tokens_generated
-        return tokens_generated
-    
-    def _is_finished(self, req: Request) -> bool:
-        """Check if request should finish"""
-        # Max tokens reached
-        if len(req.output_tokens) >= req.max_tokens:
-            return True
-        
-        # EOS token (if not ignoring)
-        if req.output_tokens and not req.ignore_eos:
-            if req.output_tokens[-1] == self.eos_token_id:
-                return True
-        
-        return False
-    
-    def get_stats(self) -> dict:
-        """Get serving statistics"""
-        radix_stats = self.radix_mgr.radix_cache.get_stats()
-        
-        return {
-            'total_steps': self.total_steps,
-            'total_tokens': self.total_tokens_generated,
-            'avg_tokens_per_step': (
-                self.total_tokens_generated / self.total_steps 
-                if self.total_steps > 0 else 0
-            ),
-            'cache_hit_rate': radix_stats['hit_rate'],
-            'waiting': len(self.request_pool.waiting),
-            'running': len(self.request_pool.running),
-            'finished': len(self.request_pool.finished)
-        }
-```
-
-**Phase 5 Tests** (7 tests validating continuous batching):
-
-```python
-# test_phase5_continuous_batching.py
-def test_request_pool_lifecycle():
-    """Test request state transitions"""
-    pool = RequestPool()
-    
-    req1 = Request(0, [1, 2, 3], 5)
-    req2 = Request(1, [4, 5], 5)
-    
-    # Add to waiting
-    pool.add_waiting(req1)
-    pool.add_waiting(req2)
-    assert len(pool.waiting) == 2
-    
-    # Move to running
-    pool.move_to_running([req1])
-    assert len(pool.waiting) == 1
-    assert len(pool.running) == 1
-    
-    # Move to finished
-    req1.is_finished = True
-    pool.move_to_finished([req1])
-    assert len(pool.running) == 0
-    assert len(pool.finished) == 1
-
-def test_continuous_batching_dynamics():
-    """Test dynamic request addition/removal"""
-    config = ModelConfig(vocab_size=256, n_layer=2, n_head=4, n_embd=64)
-    kv_pool = KVCachePool(256, 16, 2, 4, 16)
-    executor = ModelExecutor(config, {}, kv_pool)
-    radix_mgr = RadixCacheManager(kv_pool)
-    prefill_mgr = ChunkedPrefillManager(token_budget=256)
-    decode_mgr = DecodeManager(max_batch_size=32)
-    
-    batcher = ContinuousBatcher(executor, radix_mgr, prefill_mgr, decode_mgr)
-    
-    # Add initial requests
-    for i in range(5):
-        req = Request(i, [1, 2, 3], max_tokens=3)
-        batcher.add_request(req)
-    
-    # Run several steps
-    for step in range(10):
-        tokens = batcher.step()
-        print(f"Step {step}: {tokens} tokens generated")
-        
-        # Add new request mid-execution
-        if step == 3:
-            req = Request(10, [4, 5, 6], max_tokens=3)
-            batcher.add_request(req)
-    
-    stats = batcher.get_stats()
-    print(f"Total tokens: {stats['total_tokens']}")
-    print(f"Avg tokens/step: {stats['avg_tokens_per_step']:.1f}")
-
-def test_throughput_comparison():
-    """Compare static vs continuous batching throughput"""
-    # Setup
-    config = ModelConfig(vocab_size=256, n_layer=2, n_head=4, n_embd=64)
-    kv_pool = KVCachePool(256, 16, 2, 4, 16)
-    
-    # Create requests with varying generation lengths
-    requests = []
-    for i in range(20):
-        # Some finish early (5 tokens), some late (20 tokens)
-        max_tokens = 5 if i % 3 == 0 else 20
-        req = Request(i, [1, 2, 3], max_tokens=max_tokens)
-        requests.append(req)
-    
-    # Static batching: wait for slowest
-    static_steps = max(req.max_tokens for req in requests)
-    static_tokens = sum(req.max_tokens for req in requests)
-    static_efficiency = static_tokens / (len(requests) * static_steps)
-    
-    # Continuous batching: dynamic removal
-    executor = ModelExecutor(config, {}, kv_pool)
-    radix_mgr = RadixCacheManager(kv_pool)
-    prefill_mgr = ChunkedPrefillManager()
-    decode_mgr = DecodeManager()
-    batcher = ContinuousBatcher(executor, radix_mgr, prefill_mgr, decode_mgr)
-    
-    for req in requests:
-        batcher.add_request(req)
-    
-    # Run until all finished
-    while (not prefill_mgr.is_empty() or 
-           not decode_mgr.is_empty() or
-           len(batcher.request_pool.finished) < len(requests)):
-        batcher.step()
-        if batcher.total_steps > 50:
-            break  # Safety
-    
-    stats = batcher.get_stats()
-    continuous_efficiency = stats['avg_tokens_per_step'] / len(requests)
-    
-    print(f"Static efficiency: {static_efficiency:.2f}")
-    print(f"Continuous efficiency: {continuous_efficiency:.2f}")
-    print(f"Speedup: {continuous_efficiency / static_efficiency:.2f}×")
-```
-
-**Performance Comparison**:
-
-| Scenario | Static Batching | Continuous Batching | Speedup |
-|----------|-----------------|---------------------|---------|
-| Uniform lengths (all 10 tokens) | 10 steps | 10 steps | 1.0× |
-| Mixed lengths (5-20 tokens) | 20 steps | 12 steps | 1.67× |
-| Long tail (90% finish early) | 100 steps | 25 steps | 4.0× |
-
-Continuous batching improves throughput on workloads with heterogeneous generation lengths by maintaining higher hardware utilization.
-
-## 16.19 Phase 6: Complete Integration - NanoServingEngine
-
-Phase 6 combines all components into NanoServingEngine—a complete serving system with simple API and comprehensive statistics.
-
-**Nano Serving Engine**:
-
-```python
-# python/nano_engine.py
-from dataclasses import dataclass
-from typing import List
-from python.request import Request
-from python.continuous_batcher import ContinuousBatcher
-from python.executor import ModelExecutor, ModelConfig
-from python.kv_pool import KVCachePool
-from python.radix_manager import RadixCacheManager
-from python.chunked_prefill import ChunkedPrefillManager
-from python.decode_manager import DecodeManager
-
-@dataclass
-class SamplingParams:
-    """Sampling parameters for generation"""
-    max_tokens: int = 10
-    temperature: float = 1.0
-    ignore_eos: bool = False
-
-class NanoServingEngine:
-    """Complete LLM serving engine
-    
-    Combines all optimizations:
-    - Paged KV cache (efficient memory management)
-    - Chunked prefill (fair scheduling)
-    - Radix cache (reduces redundant computation through prefix sharing)
-    - Continuous batching (improves throughput through better hardware utilization)
-    """
-    
-    def __init__(self,
-                 config: ModelConfig,
-                 weights: dict,
-                 kv_cache_pages: int = 256,
-                 page_size: int = 16,
-                 max_batch_size: int = 32,
-                 prefill_token_budget: int = 512,
-                 max_chunk_size: int = 256,
-                 eos_token_id: int = 0):
-        """
-        Args:
-            config: Model configuration
-            weights: Model weights
-            kv_cache_pages: Total KV cache pages
-            page_size: Tokens per page
-            max_batch_size: Maximum decode batch size
-            prefill_token_budget: Prefill batch token limit
-            max_chunk_size: Chunked prefill chunk size
-            eos_token_id: End-of-sequence token ID
-        """
-        # Initialize components
-        self.kv_pool = KVCachePool(
-            num_pages=kv_cache_pages,
-            page_size=page_size,
-            num_layers=config.n_layer,
-            num_heads=config.n_head,
-            head_dim=config.head_dim
-        )
-        
-        self.executor = ModelExecutor(config, weights, self.kv_pool)
-        self.radix_mgr = RadixCacheManager(self.kv_pool)
-        
-        self.prefill_mgr = ChunkedPrefillManager(
-            token_budget=prefill_token_budget,
-            chunk_size=max_chunk_size
-        )
-        
-        self.decode_mgr = DecodeManager(max_batch_size=max_batch_size)
-        
-        self.batcher = ContinuousBatcher(
-            executor=self.executor,
-            radix_mgr=self.radix_mgr,
-            prefill_mgr=self.prefill_mgr,
-            decode_mgr=self.decode_mgr,
-            eos_token_id=eos_token_id
-        )
-        
-        self._next_req_id = 0
-    
-    def generate(self,
-                 prompts: List[List[int]],
-                 params: List[SamplingParams]) -> List[Request]:
-        """Generate completions for prompts
-        
-        Args:
-            prompts: List of token sequences
-            params: Sampling parameters for each prompt
-            
-        Returns:
-            List of completed requests with generated tokens
-        """
-        if len(prompts) != len(params):
-            raise ValueError("Prompts and params must have same length")
-        
-        # Create requests
-        requests = []
-        for prompt, param in zip(prompts, params):
-            req = Request(
-                req_id=self._next_req_id,
-                prompt_tokens=prompt,
-                max_tokens=param.max_tokens,
-                temperature=param.temperature,
-                ignore_eos=param.ignore_eos
-            )
-            self._next_req_id += 1
-            requests.append(req)
-            
-            # Add to batcher
-            self.batcher.add_request(req)
-        
-        # Run serving loop until all requests finished
-        target_finished = len(requests)
-        max_steps = 1000  # Safety limit
-        
-        for _ in range(max_steps):
-            self.batcher.step()
-            
-            finished = len(self.batcher.request_pool.finished)
-            if finished >= target_finished:
+        # Phase 3: Admit waiting requests (fill capacity)
+        while self.can_admit_more():
+            waiting = self.request_pool.get_next_waiting()
+            if not waiting:
                 break
+            self.radix_mgr.allocate_for_request(waiting)
+            self.request_pool.move_to_running(waiting)
         
-        # Return finished requests
-        return self.batcher.request_pool.get_finished()
-    
-    def get_stats(self) -> dict:
-        """Get comprehensive serving statistics"""
-        batcher_stats = self.batcher.get_stats()
-        
-        return {
-            **batcher_stats,
-            'kv_pool_free_pages': self.kv_pool.get_num_free_pages(),
-            'kv_pool_total_pages': self.kv_pool.get_num_free_pages()
-        }
+        return tokens_generated
 ```
 
-**Usage Example**:
+The key: **no global synchronization**. Each iteration rebuilds the batch from current state. Finished requests leave, new requests enter, all without blocking.
 
-```python
-# Complete serving workflow
-from nano_engine import NanoServingEngine, SamplingParams
-from executor import ModelConfig
+Prefill and decode interleaving requires balancing latency against overhead. Small prefill chunks around 256 tokens take roughly the same time as several decode iterations, allowing natural interleaving. Large prefill chunks exceeding 1024 tokens typically run exclusively without decode to minimize context switching overhead. Adaptive systems choose chunk size dynamically—when many requests wait in queue, smaller chunks maintain responsiveness; when few requests wait, larger chunks maximize throughput by reducing overhead.
 
-# Initialize engine
-config = ModelConfig(
-    vocab_size=256,
-    n_layer=4,
-    n_head=4,
-    n_embd=128
-)
+### 16.18.6 Performance Characteristics
 
-weights = {}  # Load from checkpoint
+Continuous batching substantially outperforms static batching on realistic workloads with heterogeneous request lengths. Static batching must wait for the slowest request to complete before accepting new work, leaving the GPU underutilized as early-finishing requests sit idle. Continuous batching maintains high GPU utilization by immediately backfilling capacity as requests complete. The improvement is most dramatic when request generation lengths vary significantly—static batching wastes cycles proportional to the variance in completion times, while continuous batching absorbs this variance by constantly refreshing the active batch.
 
-engine = NanoServingEngine(
-    config=config,
-    weights=weights,
-    kv_cache_pages=256,
-    max_batch_size=32,
-    max_chunk_size=256
-)
+**Connection to ch.14**: Our [`generation.py`](../ch.14.GPT-Optimized/generation.py#L80-L120) processes one request at a time (batch size 1). Production systems extend this with request queues, dynamic batching, and the scheduling policies described above.
 
-# Define prompts (with shared prefix)
-system_prompt = list(range(1, 101))  # 100 tokens
+## 16.19 Phase 6: Complete Integration
 
-prompts = [
-    system_prompt + [101, 102, 103],       # "What is MLIR?"
-    system_prompt + [104, 105],            # "Explain compilation"
-    system_prompt + [106, 107, 108, 109],  # "How does LLVM work?"
-]
+### 16.19.1 System Architecture
 
-# Sampling parameters
-params = [
-    SamplingParams(max_tokens=20, temperature=0.7),
-    SamplingParams(max_tokens=15, temperature=0.8),
-    SamplingParams(max_tokens=25, temperature=0.9),
-]
+Production serving engines integrate **four core subsystems**:
 
-# Generate!
-finished_requests = engine.generate(prompts, params)
-
-# Print results
-for req in finished_requests:
-    print(f"Request {req.req_id}:")
-    print(f"  Prompt: {len(req.prompt_tokens)} tokens")
-    print(f"  Output: {len(req.output_tokens)} tokens")
-    print(f"  Cached: {req.cached_len} tokens (from radix cache)")
-    print(f"  Tokens: {req.output_tokens[:10]}...")  # First 10
-
-# Statistics
-stats = engine.get_stats()
-print(f"\nServing Statistics:")
-print(f"  Total steps: {stats['total_steps']}")
-print(f"  Total tokens: {stats['total_tokens']}")
-print(f"  Throughput: {stats['avg_tokens_per_step']:.1f} tokens/step")
-print(f"  Cache hit rate: {stats['cache_hit_rate']:.1%}")
+```
+┌────────────────────────────────────────────┐
+│              NanoServingEngine             │
+├────────────────────────────────────────────┤
+│                                            │
+│  ┌───────────────┐  ┌────────────────────┐ │
+│  │ Request Queue │──│ Scheduling Policy  │ │
+│  │(FIFO/Priority)│  │ - Admission control│ │
+│  └───────────────┘  │ - Preemption       │ │
+│                     │ - Fairness         │ │
+│         │           └────────────────────┘ │
+│         ↓                    │             │
+│  ┌──────────────┐            ↓             │
+│  │ Prefill Mgr  │  ┌────────────────┐      │
+│  │ - Chunked    │  │ Decode Manager │      │
+│  │ - Round-robin│  │ - Batch decode │      │
+│  └──────────────┘  │ - Remove done  │      │
+│         │          └────────────────┘      │
+│         │                    │             │
+│         ↓                    ↓             │
+│  ┌─────────────────────────────────────┐   │
+│  │         Model Executor              │   │
+│  │  - Run transformer forward pass     │   │
+│  │  - Coordinate KV cache access       │   │
+│  └─────────────────────────────────────┘   │
+│         │                    │             │
+│         ↓                    ↓             │
+│  ┌───────────────┐  ┌────────────────┐     │
+│  │ Radix Cache   │  │   KV Pool      │     │
+│  │ - Prefix tree │  │ - Paged memory │     │
+│  │ - LRU eviction│  │ - Allocation   │     │
+│  └───────────────┘  └────────────────┘     │
+│                                            │
+└────────────────────────────────────────────┘
 ```
 
-**Phase 6 Tests** (8 comprehensive integration tests):
+### 16.19.2 Request Dataflow
 
-```python
-# test_phase6_integration.py
-def test_nano_engine_basic():
-    """Test basic engine functionality"""
-    config = ModelConfig(vocab_size=256, n_layer=2, n_head=4, n_embd=64)
-    engine = NanoServingEngine(config, {}, kv_cache_pages=64)
-    
-    prompts = [[1, 2, 3], [4, 5, 6]]
-    params = [SamplingParams(max_tokens=5)] * 2
-    
-    results = engine.generate(prompts, params)
-    
-    assert len(results) == 2
-    assert all(len(req.output_tokens) == 5 for req in results)
+**Lifecycle from submission to completion**:
 
-def test_prefix_sharing_e2e():
-    """Test end-to-end prefix sharing"""
-    config = ModelConfig(vocab_size=256, n_layer=2, n_head=4, n_embd=64)
-    engine = NanoServingEngine(config, {}, kv_cache_pages=64)
-    
-    # Shared prefix
-    prefix = list(range(50))
-    prompts = [
-        prefix + [100, 101],
-        prefix + [200, 201],
-        prefix + [300, 301]
-    ]
-    
-    params = [SamplingParams(max_tokens=5)] * 3
-    results = engine.generate(prompts, params)
-    
-    # Check cache hit rate
-    stats = engine.get_stats()
-    print(f"Cache hit rate: {stats['cache_hit_rate']:.1%}")
-    assert stats['cache_hit_rate'] > 0.5  # Should be >50%
-
-def test_mixed_length_generation():
-    """Test heterogeneous generation lengths"""
-    config = ModelConfig(vocab_size=256, n_layer=2, n_head=4, n_embd=64)
-    engine = NanoServingEngine(config, {}, kv_cache_pages=128)
-    
-    prompts = [[i] * 10 for i in range(10)]
-    params = [
-        SamplingParams(max_tokens=5 if i % 2 == 0 else 20)
-        for i in range(10)
-    ]
-    
-    results = engine.generate(prompts, params)
-    
-    assert len(results) == 10
-    for i, req in enumerate(results):
-        expected = 5 if i % 2 == 0 else 20
-        assert len(req.output_tokens) == expected
-
-def test_throughput_benchmark():
-    """Benchmark end-to-end throughput"""
-    config = ModelConfig(vocab_size=256, n_layer=4, n_head=4, n_embd=128)
-    engine = NanoServingEngine(
-        config, {},
-        kv_cache_pages=256,
-        max_batch_size=32
-    )
-    
-    # 32 requests with system prompt
-    system = list(range(100))
-    prompts = [system + [i] * 10 for i in range(32)]
-    params = [SamplingParams(max_tokens=20)] * 32
-    
-    results = engine.generate(prompts, params)
-    
-    stats = engine.get_stats()
-    print(f"\nThroughput Benchmark:")
-    print(f"  Requests: 32")
-    print(f"  Total tokens: {stats['total_tokens']}")
-    print(f"  Total steps: {stats['total_steps']}")
-    print(f"  Tokens/step: {stats['avg_tokens_per_step']:.1f}")
-    print(f"  Cache hit rate: {stats['cache_hit_rate']:.1%}")
-    
-    # Should achieve >15 tokens/step with all optimizations
-    assert stats['avg_tokens_per_step'] > 15
 ```
+1. [Client] Submit request (prompt_tokens, max_tokens, temperature)
+             ↓
+2. [Admission] Check memory availability
+   - Estimate tokens_needed = prompt + max_tokens
+   - Check if KV pool has capacity
+   - Try radix cache prefix match to reduce allocation
+             ↓
+3. [Prefill Phase]
+   Chunk 0 → compute KV cache for tokens 0-255
+   Chunk 1 → compute KV cache for tokens 256-511
+   ...
+   Last chunk → compute remaining tokens
+   Generate first output token
+             ↓
+4. [Decode Phase]
+   Iteration 1 → generate token 1, extend KV cache
+   Iteration 2 → generate token 2, extend KV cache
+   ...
+   Iteration N → generate token N (EOS or max_tokens)
+             ↓
+5. [Completion] Return generated tokens
+   - Decrement radix tree ref_counts
+   - Mark KV pages as evictable (ref_count == 0)
+   - Move to finished queue
+```
+
+### 16.19.3 Critical Performance Parameters
+
+Production serving engines expose several critical parameters that control performance characteristics. The maximum batch size fundamentally trades throughput against latency—larger batches increase GPU utilization but may delay individual requests. Chunk size determines fairness granularity, with smaller chunks improving responsiveness at the cost of context switching overhead. Page size affects memory fragmentation, with smaller pages reducing waste but increasing management overhead. Total KV pool capacity limits how many concurrent requests the system can handle. Eviction threshold determines when the system begins freeing cached entries, balancing memory availability against cache hit rates.
+
+These parameters must be tuned for specific workloads. Interactive chatbot applications prioritize low latency, so they typically use moderate batch sizes around 32 requests, small chunk sizes around 256 tokens for responsiveness, and relatively aggressive eviction around twenty percent free memory to maintain cache effectiveness. Batch document processing workloads instead optimize for throughput, using larger batch sizes up to 64 requests, large chunks around 1024 tokens to minimize overhead, and conservative eviction around ten percent free to maximize batch efficiency. Most production deployments fall somewhere between these extremes, requiring careful profiling to find appropriate balance points.
+
+### 16.19.4 Monitoring and Observability
+
+Effective monitoring tracks metrics across three categories. System health metrics reveal GPU utilization percentage, available KV pool pages, radix cache hit rate, and average batch size—these indicate whether the system is using resources effectively. Request metrics measure throughput in tokens per second, latency percentiles across the distribution, queue depth showing waiting requests, and completion rate indicating how quickly the system processes work. Resource usage metrics track GPU memory consumption, page allocation rate showing memory churn, eviction frequency indicating cache pressure, and context switch overhead from chunked prefill.
+
+Alerting should trigger on conditions indicating inefficiency or degradation. Low GPU utilization below seventy percent suggests underutilization that could be addressed by increasing batch size. Low free memory below ten percent indicates pressure requiring either reduced batch size or more aggressive eviction. High tail latency beyond acceptable thresholds suggests chunk size needs adjustment. Low cache hit rates indicate the workload lacks prefix overlap, meaning radix caching provides little benefit.
+
+### 16.19.5 Failure Modes and Mitigation
+
+Several failure modes require specific mitigations. Out-of-memory errors occur when the system cannot allocate KV pages for new requests. The response progression starts with aggressive LRU eviction from the radix cache to free space, then preempts low-priority running requests if necessary, next rejects new admissions with backpressure signals to upstream systems, and finally reduces maximum batch size dynamically to prevent recurrence.
+
+Request starvation happens when some requests wait indefinitely while others process. Mitigation involves priority aging where waiting time gradually increases a request's priority, ensuring even low-priority requests eventually reach the front. Service quantum enforcement guarantees each request receives some minimum processing per scheduling round. The system may also preempt runaway requests that have generated excessive output, preventing them from monopolizing resources.
+
+GPU underutilization where batch size remains below maximum despite waiting requests indicates inefficiency. This often stems from overly conservative admission policies that reject requests unnecessarily. Increasing chunk size reduces the number of small scheduling units competing for slots. Reducing memory reservation overhead by tightening estimates can also help admit more concurrent requests.
+
+### 16.19.6 Deployment Patterns
+
+Multi-GPU deployment follows several patterns depending on model size and throughput requirements. Tensor parallelism splits model layers across multiple GPUs, with each GPU computing a portion of each layer for every request. Pipeline parallelism assigns different transformer layers to different GPUs, with requests flowing through the pipeline. Replication runs independent serving engines on each GPU with external load balancing, maximizing throughput for smaller models that fit on single GPUs.
+
+Request routing strategies affect cache efficiency and load distribution. Sticky routing directs requests with the same system prompt to the same GPU, maximizing radix cache hit rates by concentrating prefix sharing. Load balancing routes each request to the least-loaded engine, optimizing utilization at the cost of cache efficiency. Affinity routing collocates related requests, such as sending all questions about the same document to one engine to maximize cache sharing for that context.
+
+**Connection to ch.14**: Our implementation demonstrates core concepts with educational simplicity. Production systems add HTTP server, request routing, metrics collection, and multi-GPU coordination on top of the serving loop shown in [generation.py](../ch.14.GPT-Optimized/generation.py).
 
 ## 16.20 Performance Analysis
 
-Comprehensive performance evaluation of nano-serving across all optimization levels.
-
-**Benchmark Configuration**:
-
-```python
-# Standard benchmark setup
-config = ModelConfig(
-    vocab_size=256,
-    n_layer=4,
-    n_head=4,
-    n_embd=128
-)
-
-# Workload: 32 concurrent requests
-# - System prompt: 100 tokens (shared)
-# - User queries: 10-30 tokens (varies)
-# - Generation: 20 tokens per request
-system_prompt = list(range(100))
-requests = [
-    system_prompt + list(range(100 + i, 100 + i + 10 + (i % 20)))
-    for i in range(32)
-]
-```
-
-**Optimization Impact**:
-
-Nano-serving demonstrates how each algorithmic technique contributes to serving efficiency:
+Nano-serving demonstrates how each algorithmic technique contributes to serving efficiency.
 
 - **Parallel batching**: Processes multiple requests simultaneously rather than sequentially
 - **Paged KV cache**: Eliminates memory fragmentation that wastes GPU capacity
@@ -1348,105 +497,62 @@ Nano-serving demonstrates how each algorithmic technique contributes to serving 
 
 The effectiveness of each optimization depends on workload characteristics—batch sizes, prompt lengths, prefix overlap, and generation lengths all influence the relative impact.
 
-**Optimization Breakdown**:
+**Optimization Breakdown**: Each algorithmic component contributes multiplicatively to overall throughput. Consider 32 requests with 100-token prompts and 20-token generation:
+
+- **Baseline (sequential)**: 32 × 120 = 3,840 computation steps, processing requests one by one
+- **+ Parallel batching**: Reduces to ~480 steps through 8-way parallelism, providing the foundation
+- **+ KV cache**: Further reduces to ~672 steps (32 prefills + 32×20 decode iterations), eliminating quadratic recomputation
+- **+ Continuous batching**: Halves effective steps to ~336 through doubled utilization by filling idle cycles
+- **+ Radix cache**: With 60% prefix sharing, drops to ~134 steps, as most prefills reuse cached computation
+
+The cumulative effect yields roughly 30× speedup from combining these techniques. Each optimization addresses a different inefficiency, making them complementary rather than redundant.
+
+**Token Sampling** (from [`continuous_batcher.py`](../ch.16.Nano-Serving/python/continuous_batcher.py)):
 
 ```python
-def analyze_optimization_impact():
-    """Analyze individual optimization contributions"""
+def sample_token(logits: np.ndarray, temperature: float = 1.0) -> int:
+    """Sample next token from logits
     
-    # Baseline: Sequential
-    baseline_tokens = 32 * (100 + 20)  # 32 requests × 120 tokens
-    baseline_steps = baseline_tokens    # One token per step
+    Args:
+        logits: Logits for next token [vocab_size]
+        temperature: Sampling temperature
+            1.0 = neutral, <1 = conservative, >1 = random
+    """
+    if temperature == 0.0:
+        return int(np.argmax(logits))  # Greedy
     
-    # + Parallel batching
-    parallel_steps = baseline_steps / 8  # 8-way parallelism
+    # Temperature scaling
+    logits = logits / temperature
     
-    # + KV cache (eliminates O(N²))
-    # Prefill once per request, then decode
-    with_cache_steps = 32 * (1 + 20)  # Prefill + decode iterations
+    # Softmax: exp(logits) / sum(exp(logits))
+    exp_logits = np.exp(logits - np.max(logits))  # Numerical stability
+    probs = exp_logits / np.sum(exp_logits)
     
-    # + Continuous batching (2× utilization)
-    continuous_steps = with_cache_steps / 2
-    
-    # + Radix cache (60% prefix shared)
-    radix_steps = continuous_steps * 0.4  # 60% cache hits skip prefill
-    
-    print("Optimization Impact:")
-    print(f"  Baseline: {baseline_steps:.0f} steps")
-    print(f"  + Batching: {parallel_steps:.0f} steps ({baseline_steps/parallel_steps:.1f}×)")
-    print(f"  + KV cache: {with_cache_steps:.0f} steps ({baseline_steps/with_cache_steps:.1f}×)")
-    print(f"  + Continuous: {continuous_steps:.0f} steps ({baseline_steps/continuous_steps:.1f}×)")
-    print(f"  + Radix: {radix_steps:.0f} steps ({baseline_steps/radix_steps:.1f}×)")
+    # Sample from distribution
+    return int(np.random.choice(len(probs), p=probs))
 ```
 
-**Memory Efficiency**:
+The temperature parameter controls randomness: $\text{probs}_i = \frac{\exp(\text{logits}_i / T)}{\sum_j \exp(\text{logits}_j / T)}$. Lower $T$ concentrates probability on top tokens (deterministic), higher $T$ flattens distribution (creative).
 
-```python
-# Memory comparison (32 concurrent requests)
-def analyze_memory_efficiency():
-    # Contiguous allocation (naive)
-    max_seq_len = 2048
-    bytes_per_token = 4 * 12 * 64 * 2  # float32 × heads × dim × K/V
-    
-    contiguous_memory = 32 * max_seq_len * bytes_per_token
-    print(f"Contiguous: {contiguous_memory / 1e6:.1f} MB")
-    
-    # Paged allocation (actual usage: 120 tokens average)
-    actual_tokens = 120
-    paged_memory = 32 * actual_tokens * bytes_per_token
-    print(f"Paged: {paged_memory / 1e6:.1f} MB")
-    print(f"Savings: {contiguous_memory / paged_memory:.1f}×")
+**Memory Efficiency**: Paged KV cache allocation eliminates the fragmentation inherent in contiguous schemes. For 32 concurrent requests with a maximum sequence length of 2,048 tokens, contiguous allocation pre-reserves memory for worst-case usage, consuming approximately 786 MB regardless of actual token counts. With paged allocation tracking actual usage of 120 tokens per request on average, memory consumption drops to roughly 46 MB—a 17× reduction. This efficiency enables higher concurrency, as GPU memory hosts more concurrent requests without artificial padding.
 
-# Output:
-# Contiguous: 786.4 MB
-# Paged: 46.1 MB
-# Savings: 17.1×
-```
+**Cache Hit Rate Analysis**: Radix cache effectiveness varies dramatically across workload types. Chatbot scenarios with 1000-token system prompts typically achieve 91% hit rates, as nearly all requests share the system prompt. RAG workloads with 500-token document contexts achieve moderate 73% hit rates when multiple queries target the same documents. Code completion with short 100-token context achieves only 45% hit rates due to higher uniqueness in code paths. Understanding these patterns helps predict radix cache benefits for specific deployment scenarios.
 
-**Cache Hit Rate Analysis**:
+Parallel batching processes multiple requests simultaneously rather than sequentially, providing the foundation for all subsequent optimizations. Paged KV cache eliminates memory fragmentation that would otherwise waste GPU capacity, enabling higher concurrency. Continuous batching dynamically adds and removes requests to maintain high utilization regardless of varying completion times. Radix cache reuses computation for shared prefixes when workloads exhibit overlap, with effectiveness depending strongly on actual prefix patterns in the request stream.
 
-```python
-def analyze_cache_hit_rates():
-    """Analyze radix cache performance on different workloads"""
-    
-    workloads = {
-        'Chatbot (1000-token system prompt)': 0.91,  # 91% hit rate
-        'RAG (500-token document)': 0.73,            # 73% hit rate
-        'Code completion (200-token context)': 0.45,  # 45% hit rate
-        'Translation (no shared prefix)': 0.05        # 5% hit rate
-    }
-    
-    for workload, hit_rate in workloads.items():
-        speedup = 1.0 / (1.0 - hit_rate + 1e-10)
-        print(f"{workload}:")
-        print(f"  Hit rate: {hit_rate:.0%}")
-        print(f"  Speedup: {min(speedup, 10):.1f}×")
-```
+The effectiveness of each optimization depends on workload characteristics—batch sizes, prompt lengths, prefix overlap, and generation lengths all influence the relative impact. Workloads with high prefix overlap benefit dramatically from radix caching, while those with uniform request lengths see less benefit from continuous batching. Understanding these dependencies helps tune production systems for specific deployment scenarios.
 
 ## 16.21 Summary and Comparison with Production Systems
 
 Chapter 16 Part 3 completed nano-serving with advanced algorithmic optimizations:
 
-**Phase 3: Chunked Prefill**
-- Fair scheduling for long contexts
-- Significantly reduces latency for short requests in mixed workloads
-- Small throughput trade-off for improved fairness
+Phase 3 introduced chunked prefill for fair scheduling of long contexts. By breaking large prompts into manageable chunks that can be interleaved with other requests, the system prevents small queries from experiencing excessive latency while large contexts process. This involves a small throughput tradeoff but dramatically improves fairness in mixed workloads where request sizes vary significantly.
 
-**Phase 4: Radix Cache**
-- Automatic prefix detection via radix tree
-- Reduces redundant computation through prefix sharing
-- LRU eviction for memory management
-- Demonstrates how production systems minimize recomputation
+Phase 4 implemented radix caching, the most impactful optimization. Through automatic prefix detection via a radix tree data structure, the system identifies and reuses KV cache entries for shared token sequences. When multiple requests contain identical system prompts, few-shot examples, or document context, the radix cache eliminates redundant computation by computing each unique sequence only once. LRU eviction provides memory management by freeing unused branches when pressure occurs.
 
-**Phase 5: Continuous Batching**
-- Dynamic request addition/removal
-- Improves throughput by maintaining high hardware utilization
-- Request pool lifecycle management
+Phase 5 added continuous batching to enable dynamic request management. Unlike static batching where all requests wait for the slowest to complete, continuous batching immediately replaces finished requests with waiting ones. This maintains high GPU utilization across varying completion times and improves throughput by eliminating idle cycles. The request pool manages lifecycle transitions from waiting to running to finished states.
 
-**Phase 6: Complete Integration**
-- NanoServingEngine with simple API
-- Multiple comprehensive tests validating all components
-- Educational implementation demonstrating core algorithms
+Phase 6 integrated everything into NanoServingEngine with a complete end-to-end API. The educational implementation demonstrates how all the algorithmic components cooperate, validated through comprehensive test suites covering each phase. While simplified compared to production systems, nano-serving captures the essential patterns used in real-world LLM serving infrastructure.
 
 ## 16.8 From Education to Production: Real Inference Systems
 
