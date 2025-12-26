@@ -46,18 +46,9 @@ Throughout Chapters 1 and 2, we used MLIR's `ExecutionEngine` to compile and exe
 
 ### What ExecutionEngine Provides
 
-`ExecutionEngine` is a thin wrapper around LLVM's LLJIT (Lazy LLVM JIT), providing a simple interface for JIT compilation:
+`ExecutionEngine` is a thin wrapper around LLVM's LLJIT (Lazy LLVM JIT) that makes JIT compilation accessible with a simple API. It handles the entire pipeline: translating MLIR to LLVM IR, optimizing the code, compiling to machine code in memory, and providing function pointers you can call directly. This is enormously convenient for learning and testing—you get a runnable function in milliseconds with just a few lines of code. Section 3.5 explains these internal steps and the API in detail.
 
-```cpp
-// High-level API (what we've used)
-auto engine = ExecutionEngine::create(module, options);
-auto funcPtr = engine->lookup("gemm");
-(*funcPtr)(args...);  // Call the compiled function
-```
-
-Under the hood, ExecutionEngine performs several critical tasks. It **translates MLIR to LLVM IR** by converting MLIR's dialects to LLVM IR using registered translations. It **optimizes LLVM IR** by applying LLVM's optimization passes including inlining, constant folding, vectorization, and many others. It **generates machine code** by compiling LLVM IR to native instructions for the current CPU. Importantly, it **keeps code in memory** with no files written to disk—compiled code lives entirely in process memory. It **provides function lookup** to map function names to callable function pointers. Finally, it **manages memory** by handling the code cache, data sections, and dynamic linking.
-
-This is enormously convenient for learning and testing—you get a runnable function in milliseconds with just a few lines of code. But convenience comes with trade-offs.
+However, convenience comes with trade-offs.
 
 ### When ExecutionEngine is Appropriate
 
@@ -98,8 +89,6 @@ Think of ExecutionEngine as **scaffolding**—temporary infrastructure that supp
 **Connection to Chapter 1**: Remember when we first used ExecutionEngine in Chapter 1 to compile our matrix multiplication? We treated it as a simple "compile and run" black box. Now you understand what's really happening: ExecutionEngine wraps LLVM's JIT, translates MLIR dialects to LLVM IR, optimizes the code, compiles to machine code in memory, and gives us a function pointer. That "magic" was LLVM's battle-tested JIT infrastructure working behind the scenes.
 
 For this book, we use ExecutionEngine for three pragmatic reasons. It simplifies learning by letting us focus on IR rather than build systems. It enables rapid experimentation—we can change code and test immediately without rebuild cycles. It makes Python integration trivial, avoiding the complexity of linking and loading compiled libraries.
-
-But as we progress toward production-grade systems—particularly in Chapters 13-14 when we build GPT inference engines—we'll see how real deployments work: compile MLIR to object files, link to create libraries, and deploy statically compiled binaries for predictable latency and minimal memory overhead.
 
 ## 3.3 The Pass Infrastructure: Orchestrating Transformations
 
@@ -644,23 +633,21 @@ struct GlobalJITCache {
 void executeGemm(float* A, float* B, float* C, ...) {
   // Check cache
   if (!gGemmJIT.isCompiled) {
-    // First call: compile (expensive, ~10-100ms)
+    // First call: compile (noticeable overhead)
     auto [engine, funcPtr] = compileGemmFunction();
     gGemmJIT.engine = engine;
     gGemmJIT.funcPtr = funcPtr;
     gGemmJIT.isCompiled = true;
   }
   
-  // All calls: execute cached function (fast, <1µs)
+  // All calls: execute cached function (fast)
   gGemmJIT.funcPtr(A, B, C, ...);
 }
 ```
 
-**First call**: Pays compilation cost (10-100ms for a simple function, seconds for complex modules). This is the "warmup" phase.
+**Why caching matters for performance**: The first call pays compilation cost—this can be noticeable for even simple functions and substantial for complex modules. This "warmup" phase creates unpredictable latency: the first invocation is much slower than subsequent ones. For production serving systems where consistent latency matters, this unpredictability is problematic. But for development, testing, and workloads where the same function is called many times, caching makes JIT overhead negligible.
 
-**Subsequent calls**: No compilation, just direct function invocation. Performance is identical to AOT-compiled code.
-
-**Amortization**: If your program calls the function 1000 times, the compilation cost is amortized across all calls. Total overhead: 100ms ÷ 1000 = 0.1ms per call—negligible.
+**Key insight**: With dynamic shapes, the compiled code is reusable across different input sizes. Compile once for `memref<?x?xf32>`, use for any matrix dimensions. This amortization is why JIT can be practical for research and prototyping despite the initial compilation overhead.
 
 ### When Caching Breaks: Recompilation Triggers
 
@@ -675,18 +662,6 @@ Caching assumes the compiled code remains valid. When does it need to recompile?
 **Dynamic shapes**: These **don't** require recompilation! That's the whole point of dynamic shapes. The same compiled code works for 8×32 and 1024×2048 matrices.
 
 **Static shapes (if used)**: If you hardcode dimensions (`memref<8x32xf32>`), recompiling for different dimensions is necessary. But we avoid this by using dynamic shapes.
-
-### Performance Measurement: JIT Overhead in Practice
-
-Let's quantify JIT overhead with realistic numbers:
-
-**Compilation time** measurements on x86_64 with a 3.5 GHz CPU show predictable patterns. A simple function like matrix addition takes 10-20ms to compile. Our matrix multiplication example requires 30-50ms. A complex graph with 10+ operations needs 100-500ms. A large model like a transformer layer can take 1-5 seconds.
-
-**Execution time** for a 1024×1024 matrix multiplication shows where JIT overhead matters. The first call, including compilation, takes 40ms total (35ms compilation + 5ms execution). Subsequent calls take only 5ms each since they reuse the cached compiled code.
-
-**Amortization** reveals when JIT overhead becomes negligible. After 8 calls, the total time is 75ms (40ms + 7×5ms), averaging 9.4ms per call. After 100 calls, the total is 535ms, averaging 5.35ms per call. After 1000 calls, the average drops to 5.035ms per call, barely more than the 5ms execution time.
-
-For a serving system handling 1000 requests per second, the compilation cost becomes negligible after one second of runtime. But that first second—with unpredictable latency—is why production systems avoid JIT.
 
 ### Advanced Caching: Persistent Cache to Disk
 
@@ -720,14 +695,13 @@ We've seen two compilation strategies—let's synthesize the trade-offs and perf
 
 The fundamental trade-off: **time spent compiling vs time spent executing**.
 
-Consider **Scenario 1: Run once**. A program compiles and executes a function **once**, then exits. AOT compilation spends 1 second compiling ahead of time, then 1ms executing, totaling 1001ms. JIT compilation spends 50ms compiling on the first call plus 1ms executing, totaling 51ms. **JIT wins** by 20x for single execution, since the upfront AOT compilation overhead dominates.
+Consider **Scenario 1: Run once**. A program compiles and executes a function **once**, then exits. AOT compilation requires substantial upfront build time before any execution. JIT compilation delays compilation until the function is actually called. **JIT is faster** for single-execution workloads since it avoids compiling code that might never run and has lower baseline compilation overhead.
 
-In **Scenario 2: Run 100 times**, the function executes **100 times** in a loop. AOT still spends 1 second compiling ahead, then executes 100 times at 1ms each, totaling 1100ms. JIT compiles once on the first call (50ms) then executes 100 times at 1ms each, totaling 150ms. **JIT still wins** by 7x due to amortization—the compilation cost is amortized over 100 executions, while AOT's higher upfront cost remains fixed.
+In **Scenario 2: Run many times**, the function executes repeatedly in a loop or across many invocations. With AOT, you pay the compilation cost once upfront, then every execution is fast. With JIT, you pay compilation cost on the first call, then subsequent calls are fast. **Both converge to similar performance** once the JIT overhead is amortized over many calls.
 
-**Scenario 3: Production serving** considers a server handling **1 million requests** over days or weeks. AOT compiles ahead once (1 second), then executes 1 million times at 1ms each, totaling 1001 seconds. JIT compiles on the first request (50ms once), then executes 1 million times at 1ms each, totaling 1000.05 seconds.
-- **Winner: Tie** (compilation cost is negligible at this scale)
+**Scenario 3: Production serving** considers a server handling millions of requests over days or weeks. When compilation cost is amortized over this many executions, both approaches have negligible per-request overhead. **Winner: Tie** in aggregate throughput.
 
-But scenario 3 has a critical difference: **latency distribution**. With AOT, all requests take 1ms. With JIT, the first request takes 51ms—a 50x outlier. For user-facing services, this outlier is unacceptable. Serving systems care about p99 latency (99th percentile), and JIT's first-request penalty ruins this metric.
+But scenario 3 has a critical difference: **latency distribution**. With AOT, all requests have consistent latency. With JIT, the first request pays the compilation penalty—a significant outlier. For user-facing services, this outlier is unacceptable. Serving systems care about p99 latency (99th percentile), and JIT's first-request penalty ruins this metric.
 
 ### Memory Footprint
 
