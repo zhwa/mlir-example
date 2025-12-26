@@ -14,7 +14,7 @@ Control flow is how programs make decisions and repeat operations. Every program
 
 ### What is Structured Control Flow?
 
-Structured control flow refers to control constructs that have well-defined entry and exit points, following a hierarchical structure. A `for` loop in C is structured: execution enters at the loop header, iterates through the body, and exits when the condition fails. There's no jumping arbitrarily to different parts of the program with `goto` statements. Structured control flow makes programs easier to reason about, optimize, and verify for correctness.
+Structured control flow refers to control constructs that have well-defined entry and exit points, following a hierarchical structure. A `for` loop in C is structured when there's no `goto` statement jumping arbitrarily to different parts of the program: execution enters at the loop header, iterates through the body, and exits when the condition fails. Structured control flow makes programs easier to reason about, optimize, and verify for correctness.
 
 In contrast, unstructured control flow uses explicit branches and labels, as found in assembly language or MLIR's CF (Control Flow) dialect. With unstructured flow, you can jump to any label at any time, creating complex control graphs that are harder to analyze. Compilers prefer structured control flow during optimization phases because the structure provides guarantees that enable transformations like loop unrolling, fusion, and parallelization.
 
@@ -187,7 +187,7 @@ Now we have all the pieces needed to implement SAXPY: `C[i] = α · A[i] + B[i]`
 
 ### The SAXPY Algorithm
 
-SAXPY stands for "Single-Precision A·X Plus Y" from BLAS (Basic Linear Algebra Subprograms), the standard library for linear algebra operations. Despite its name, we'll implement it for any floating-point precision, not just single precision (f32). The operation is conceptually simple:
+SAXPY stands for "Single-Precision A·X Plus Y" from BLAS (Basic Linear Algebra Subprograms), the standard library for linear algebra operations. We'll implement it for single precision (f32) as the name suggests. The operation is conceptually simple:
 
 Given a scalar α (alpha) and vectors A, B of length n, compute vector C where each element is:
 
@@ -368,10 +368,64 @@ OwningOpRef<ModuleOp> createSaxpyModule(MLIRContext& context) {
   context.getOrLoadDialect<memref::MemRefDialect>();
   
   OpBuilder builder(&context);
-  auto module = ModuleOp::create(builder.getUnknownLoc());
+  auto loc = builder.getUnknownLoc();
+  auto module = ModuleOp::create(loc);
+  builder.setInsertionPointToEnd(module.getBody());
   
-  // ... build function, loop, and body operations ...
+  // Define types
+  auto f32Type = builder.getF32Type();
+  auto dynamicMemRefType = MemRefType::get({ShapedType::kDynamic}, f32Type);
   
+  // Function type: (f32, memref<?xf32>, memref<?xf32>, memref<?xf32>) -> ()
+  auto funcType = builder.getFunctionType(
+    {f32Type, dynamicMemRefType, dynamicMemRefType, dynamicMemRefType},
+    {}
+  );
+  
+  // Create function
+  auto funcOp = builder.create<func::FuncOp>(loc, "saxpy", funcType);
+  funcOp.setPublic();
+  
+  // Create function body
+  auto& entryBlock = *funcOp.addEntryBlock();
+  builder.setInsertionPointToStart(&entryBlock);
+  
+  // Get function arguments
+  Value alpha = entryBlock.getArgument(0);  // f32
+  Value A = entryBlock.getArgument(1);      // memref<?xf32>
+  Value B = entryBlock.getArgument(2);      // memref<?xf32>
+  Value C = entryBlock.getArgument(3);      // memref<?xf32>
+  
+  // Create constants
+  Value c0 = builder.create<arith::ConstantIndexOp>(loc, 0);
+  Value c1 = builder.create<arith::ConstantIndexOp>(loc, 1);
+  
+  // Get dynamic size: %size = memref.dim %A, %c0
+  Value size = builder.create<memref::DimOp>(loc, A, c0);
+  
+  // Create scf.for loop: for i = 0 to size step 1
+  auto forOp = builder.create<scf::ForOp>(loc, c0, size, c1);
+  
+  // Build loop body
+  builder.setInsertionPointToStart(forOp.getBody());
+  Value i = forOp.getInductionVar();
+  
+  // Load A[i] and B[i]
+  Value a = builder.create<memref::LoadOp>(loc, A, ValueRange{i});
+  Value b = builder.create<memref::LoadOp>(loc, B, ValueRange{i});
+  
+  // Compute: scaled = alpha * a
+  Value scaled = builder.create<arith::MulFOp>(loc, alpha, a);
+  
+  // Compute: result = scaled + b
+  Value result = builder.create<arith::AddFOp>(loc, scaled, b);
+  
+  // Store result to C[i]
+  builder.create<memref::StoreOp>(loc, result, C, ValueRange{i});
+  
+  // Return to function level
+  builder.setInsertionPointAfter(forOp);
+  builder.create<func::ReturnOp>(loc);
   return module;
 }
 ```
@@ -544,38 +598,6 @@ def test_saxpy():
 ```
 
 The test generates random input vectors, computes SAXPY with both our MLIR implementation and NumPy's arithmetic, and verifies they match within floating-point tolerance. The `np.allclose` function allows small differences due to rounding—floating-point arithmetic isn't perfectly associative, so different orderings of operations can produce slightly different results.
-
-For performance testing, we can benchmark execution time:
-
-```python
-import time
-
-size = 10_000_000  # 10 million elements
-A = np.random.randn(size).astype(np.float32)
-B = np.random.randn(size).astype(np.float32)
-
-# Warm up
-_ = ch5_vector_ops.saxpy(2.0, A, B)
-
-# Time MLIR implementation
-start = time.time()
-for _ in range(100):
-    C = ch5_vector_ops.saxpy(2.0, A, B)
-end = time.time()
-mlir_time = (end - start) / 100
-
-# Time NumPy implementation
-start = time.time()
-for _ in range(100):
-    C = 2.0 * A + B
-end = time.time()
-numpy_time = (end - start) / 100
-
-print(f"MLIR: {mlir_time*1000:.2f} ms")
-print(f"NumPy: {numpy_time*1000:.2f} ms")
-```
-
-This benchmark runs SAXPY 100 times and averages the execution time. On modern hardware, the MLIR implementation should match or exceed NumPy's performance because both use vectorized operations (SIMD instructions). MLIR might be slightly faster due to JIT optimization for the specific CPU, or slightly slower due to JIT compilation overhead if the function isn't cached.
 
 ## 5.8 When to Use SCF vs Linalg
 
