@@ -80,9 +80,11 @@ In contrast, the third pass doesn't need loop-carried variables because it only 
 
 In Chapter 5, we constructed `scf.for` loops using a multi-step process: create the loop operation, set the insertion point inside its body, build the body operations, and finally restore the insertion point. This approach works well for simple loops, but it becomes cumbersome when working with loop-carried variables, where we need to carefully manage block arguments and yield operations. For loops with `iter_args`, MLIR provides a more concise **lambda-style construction** that we use throughout this chapter.
 
+**Note on notation**: In the MLIR textual format we've been reading, loop-carried variables use the syntax `iter_args(%var = %initial_value)`. When we transition to using the C++ API in the following code examples, this becomes the parameter name `iterArgs` (camelCase, as is standard in C++ APIs). These refer to the same concept—variables that carry values across loop iterations.
+
 The lambda-style approach passes a callback function to the `scf::ForOp` constructor, and this callback receives four parameters: an `OpBuilder` for constructing operations inside the loop, a `Location` for debugging information, the induction variable (loop counter), and a `ValueRange` containing the current values of loop-carried variables. The callback builds the loop body and must call `scf.yield` to pass values to the next iteration. The loop operation automatically manages the block structure, insertion points, and block arguments—details that required manual handling in the multi-step approach.
 
-Consider the first pass in our softmax implementation, which finds the maximum value. Using the lambda style, we write:
+Consider the first pass in our softmax implementation, which finds the maximum value. Using the lambda style in C++ API, we write:
 
 ```cpp
 auto findMaxLoop = builder.create<scf::ForOp>(
@@ -362,7 +364,36 @@ This approach has several advantages. The libm implementations are extremely acc
 
 The alternative **math-to-llvm** pass generates inline code using polynomial approximations or LLVM intrinsics. Instead of function calls, this pass might generate a sequence of multiply and add instructions that evaluate a polynomial approximation to the exponential function. These inline expansions avoid function call overhead and may enable additional optimizations (like vectorization or constant folding) that couldn't occur across function boundaries. However, they typically provide less accuracy than libm and don't always handle special cases correctly—acceptable for some applications but problematic for numerical algorithms that rely on precise behavior.
 
-In our softmax implementation, we prioritize correctness and clarity, so we use the math-to-libm pass. The lowering pipeline first applies this pass, then continues with the other dialect conversions we've seen before. The complete pipeline is:
+In our softmax implementation, we prioritize correctness and clarity, so we use the math-to-libm pass. The lowering pipeline first applies this pass, then continues with the other dialect conversions we've seen before. Here's how this is implemented in practice:
+
+```cpp
+PassManager pm(context);
+
+// Disable multi-threading for deterministic behavior
+context->disableMultithreading();
+
+// === Phase 1: Canonicalization ===
+pm.addPass(createCanonicalizerPass());
+
+// === Phase 2: Lower Math operations FIRST ===
+// Convert math.exp to LLVM intrinsics or libm calls
+pm.addPass(createConvertMathToLLVMPass());
+pm.addPass(createConvertMathToLibmPass());
+
+// === Phase 3: Lower SCF to Control Flow ===
+pm.addPass(createConvertSCFToCFPass());
+
+// === Phase 4: Convert everything to LLVM dialect ===
+pm.addPass(createArithToLLVMConversionPass());
+pm.addPass(createConvertControlFlowToLLVMPass());
+pm.addPass(createFinalizeMemRefToLLVMConversionPass());
+pm.addPass(createConvertFuncToLLVMPass());
+
+// === Phase 5: Cleanup ===
+pm.addPass(createReconcileUnrealizedCastsPass());
+```
+
+The complete pipeline is:
 
 1. **Canonicalization**: Simplify IR by applying algebraic identities and removing redundant operations
 2. **Math to LLVM**: Convert any math operations to LLVM intrinsics (we apply this first as a fallback)
@@ -379,13 +410,30 @@ Integrating our softmax implementation with Python follows the same patterns we 
 
 The Python wrapper function accepts a NumPy array as input, validates that it's a 1D float32 array, allocates an output array of the same size, constructs memref descriptors for both arrays (as we learned in Chapter 2), calls the JIT-compiled function, and returns the output array. This pattern is identical to what we used for SAXPY in Chapter 5, demonstrating the consistent interface that out-parameters provide: regardless of the operation's complexity, the Python integration looks essentially the same.
 
-Testing softmax requires verifying both correctness and numerical stability. For basic correctness, we compare our MLIR implementation against NumPy's softmax implementation (which we write ourselves using NumPy operations, since NumPy doesn't have a built-in softmax). A simple test case with inputs `[1.0, 2.0, 3.0]` should produce probabilities approximately `[0.09, 0.24, 0.67]` that sum to 1.0. We use `np.allclose()` for comparison, which allows small floating-point differences, and verify that the sum is close to 1.0.
+Testing softmax requires verifying both correctness and numerical stability. For basic correctness, we compare our MLIR implementation against a NumPy reference implementation:
+
+```python
+def test_softmax_basic():
+    """Test basic softmax operation."""
+    input_arr = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    
+    # NumPy reference implementation
+    def numpy_softmax(x):
+        exp_x = np.exp(x - np.max(x))  # Numerical stability
+        return exp_x / np.sum(exp_x)
+    
+    expected = numpy_softmax(input_arr)
+    result = ch6_softmax.softmax(input_arr)  # MLIR JIT version
+    
+    assert np.allclose(result, expected, rtol=1e-5)
+    assert np.abs(np.sum(result) - 1.0) < 1e-6  # Sum should be 1.0
+```
+
+A simple test case with inputs `[1.0, 2.0, 3.0]` should produce probabilities approximately `[0.09, 0.24, 0.67]` that sum to 1.0. We use `np.allclose()` for comparison, which allows small floating-point differences, and verify that the sum is close to 1.0.
 
 The crucial test for numerical stability uses large input values that would cause overflow without max subtraction. If we input `[1000.0, 1001.0, 1002.0]`, a naive implementation would attempt to compute `exp(1000.0)`, which vastly exceeds float32's maximum representable value (approximately 3.4 × 10^38), resulting in infinity. Our implementation subtracts the maximum (1002.0), so the largest exponential is `exp(0.0) = 1.0`, and all computations stay in representable range. The test verifies that our result matches NumPy's (which also uses max subtraction) and contains no NaN or infinity values.
 
 Additional tests cover edge cases and random inputs. When all inputs are zero, softmax should produce a uniform distribution (all values equal to 1/n, where n is the vector size), since all exponentials are `exp(0) = 1`. For random inputs, we verify that probabilities are all positive, sum to 1.0, and match NumPy's results within floating-point tolerance. These tests exercise different code paths and ensure our implementation handles the full range of valid inputs correctly.
-
-We can also benchmark performance against NumPy to understand the overhead of JIT compilation and the efficiency of generated code. For vectors of size 10,000, we typically see performance comparable to NumPy—sometimes faster due to LLVM's optimization, sometimes slower due to function call overhead from the libm calls. The important point is that we're within the same order of magnitude, demonstrating that MLIR can generate competitive code for numerical operations. As we build more complex operations in later chapters, MLIR's ability to optimize across operation boundaries will show increasingly large advantages over frameworks that optimize operations in isolation.
 
 The test suite also includes functions to print the generated IR at different stages of lowering. We can examine the high-level IR (with `scf.for` and `math.exp`) to verify our IR generation, and the fully lowered IR (with only LLVM dialect operations) to see the final form before JIT compilation. These inspection capabilities are valuable for understanding MLIR's transformations and debugging when results don't match expectations.
 
