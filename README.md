@@ -9,7 +9,7 @@ A hands-on tutorial demonstrating MLIR JIT compilation, progressing from basic m
 - Chapters 10-11: Optimization passes and attention mechanisms
 - Chapters 12-14: Complete GPT model with KV-caching and optimizations
 - Chapter 15: GPU programming concepts
-- **Chapter 16: Production LLM serving engine (100-500x speedup)** ⭐
+- Chapter 16: NANO LLM serving engine
 
 ## Quick Start
 
@@ -17,13 +17,13 @@ A hands-on tutorial demonstrating MLIR JIT compilation, progressing from basic m
 
 ```bash
 # Ubuntu/WSL2 - LLVM 19 Required
-sudo apt install -y llvm-19 llvm-19-dev llvm-19-runtime
-sudo apt install -y mlir-19-tools libmlir-19-dev
-sudo apt install -y clang-19
+sudo apt install -y llvm-20 llvm-20-dev llvm-20-runtime
+sudo apt install -y mlir-20-tools libmlir-20-dev
+sudo apt install -y clang-20
 sudo apt install -y python3-dev python3-numpy ninja-build libzstd-dev
 
 # Fix LLVM header conflict (required for pybind11)
-sudo mv /usr/lib/llvm-19/include/cxxabi.h /usr/lib/llvm-19/include/cxxabi.h.backup
+sudo mv /usr/lib/llvm-20/include/cxxabi.h /usr/lib/llvm-19/include/cxxabi.h.backup
 ```
 
 ### Build All Chapters
@@ -43,15 +43,6 @@ Outputs: `build/x64-release/ch.*/ch*_*.so`
 ```bash
 cd ch.1.Fixed-size
 python3 test_jit.py
-```
-
-Expected output:
-```
-Using build directory: ../build/x64-release/ch.1.Fixed-size
-✓ Success! Result shape: (8, 16)
-✓ All values correct!
-✓ Results match NumPy (within float32 precision)!
-=== All tests complete ===
 ```
 
 ## Chapter Progression
@@ -223,8 +214,6 @@ Using build directory: ../build/x64-release/ch.1.Fixed-size
 - MLIR optimization passes (linalg fusion, vectorization)
 - Batch inference support
 
-**Performance**: 10-50x speedup over naive implementation
-
 **Documentation**: `ch.14.GPT-Optimized/README.md`, `TUTORIAL.md`
 
 ### Chapter 15: GPU Programming Concepts
@@ -239,7 +228,7 @@ Using build directory: ../build/x64-release/ch.1.Fixed-size
 
 **Documentation**: `ch.15.GPU-Concepts/README.md`, `TUTORIAL.md`
 
-### Chapter 16: Nano LLM Serving ⭐
+### Chapter 16: Nano LLM Serving
 **Goal**: Build production-style LLM serving engine with modern optimizations
 
 **6 Implementation Phases**:
@@ -254,8 +243,6 @@ Using build directory: ../build/x64-release/ch.1.Fixed-size
 - Radix attention (SGLang-style prefix caching)
 - Continuous batching (vLLM-style dynamic scheduling)
 - Chunked prefill (TensorRT-LLM-style fairness)
-
-**Tests**: 67 comprehensive tests across all phases
 
 **Documentation**: `ch.16.Nano-Serving/README.md`, `ch.16.Nano-Serving/TUTORIAL.md` (1,300+ lines)
 
@@ -371,44 +358,6 @@ This is necessary because:
 
 The user sees a clean functional API, but internally it uses efficient imperative memory operations with out-parameters.
 
-## Troubleshooting
-
-### "Could not find LLVM/MLIR"
-```bash
-sudo apt install llvm-19-dev mlir-19-tools libmlir-19-dev
-```
-
-### "cxxabi.h duplicate declarations"
-```bash
-sudo mv /usr/lib/llvm-19/include/cxxabi.h /usr/lib/llvm-19/include/cxxabi.h.backup
-```
-
-### Chapter 11 Build Errors
-
-**BytecodeOpInterface not found**
-- Fixed: Operations with attributes trigger BytecodeOpInterface in LLVM 19
-- Solution: Remove attributes from operation definitions, infer from shapes instead
-
-**createLinalgGeneralizationPass not found**
-- LLVM 19 renamed it to `createLinalgGeneralizeNamedOpsPass()`
-
-**.cast<T>() errors**
-- LLVM 19 changed to `mlir::cast<T>()`
-
-### "Module not found" when running tests
-Ensure you're in the chapter directory:
-```bash
-cd ch.1.Fixed-size  # Not root!
-python3 test_jit.py
-```
-
-### Build fails with "pybind11 not found"
-pybind11 is auto-fetched. If fetch fails:
-```bash
-rm -rf build/deps
-cmake --preset x64-release  # Re-fetch
-```
-
 ## Python API Examples
 
 All chapters export the same clean API:
@@ -440,41 +389,3 @@ prompts = [[1, 2, 3], [4, 5, 6]]
 params = [SamplingParams(max_tokens=50, temperature=0.8) for _ in prompts]
 results = engine.generate(prompts, params)  # Batch inference with all optimizations
 ```
-
-## Project Highlights
-
-This tutorial demonstrates a complete learning path from MLIR basics to production systems:
-
-**Foundation (Ch. 1-4)**: MLIR compilation basics
-- Dynamic shapes, JIT caching, bufferization strategies
-
-**Neural Operations (Ch. 5-11)**: Building blocks for deep learning
-- Mathematical operations, computation graphs, custom dialects, attention
-
-**Complete Models (Ch. 12-14)**: End-to-end transformer implementation
-- GPT architecture, weight loading, KV-caching, optimization passes
-
-**Production Systems (Ch. 16)**: Modern LLM serving techniques
-- 67 comprehensive tests validating each optimization
-- Techniques from vLLM, SGLang, and TensorRT-LLM
-- **100-500x speedup** through radix caching, continuous batching, and paged memory
-
-## Learning Resources
-
-Each chapter includes:
-- `README.md`: Quick reference and key concepts
-- `TUTORIAL.md`: In-depth explanations (where available)
-- `test_*.py`: Working examples and validation
-- Commented source code demonstrating best practices
-
-**Recommended Path**:
-1. Start with Chapter 1-4 to understand MLIR fundamentals
-2. Progress through Ch. 5-11 for neural operations
-3. Build complete models in Ch. 12-14
-4. Study production serving in Ch. 16 for real-world deployment
-
-**Total**: 16 chapters, ~15,000 lines of educational code, comprehensive documentation
-
----
-
-Built with ❤️ for learning MLIR and modern ML systems
