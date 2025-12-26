@@ -148,7 +148,7 @@ The dual representation reflects a fundamental tradeoff in compiler design:
 
 **Memrefs are necessary for execution** because at some point, we must generate code that runs on real hardware. CPUs and GPUs don't have "immutable tensors"—they have memory addresses, load instructions, and store instructions. When we call our JIT-compiled matrix multiplication from Python, we pass NumPy arrays, which are fundamentally pointers to buffers. The execution engine needs concrete memory locations to read inputs and write outputs.
 
-This leads to a **two-phase compilation strategy** common in modern ML compilers:
+This leads to a **two-phase compilation strategy** common in modern AI compilers:
 
 1. **High-level optimizations on tensors**: Fusion, tiling, distribution, and other transformations operate on immutable tensor operations, taking advantage of clean mathematical semantics.
 
@@ -164,7 +164,7 @@ For this book, we take a pragmatic shortcut: **we work directly with memrefs** a
 
 Working with memrefs offers several advantages for learning MLIR fundamentals. First, it's simpler to understand because we avoid the complexity of bufferization (though Chapter 4 will cover the conceptual foundations of this transformation in depth). Second, the IR we write directly corresponds to how the code will execute—there are no hidden transformations that might surprise us along the way. Third, NumPy arrays are memory buffers at their core, so they map naturally to memrefs, making Python integration straightforward (Chapter 8 will show how the binding code works in detail). Finally, this approach enables faster initial development because we can focus on MLIR's core concepts without navigating the bufferization pipeline.
 
-However, this choice involves trade-offs that readers should understand. By skipping tensors, we forgo some high-level optimizations—tensor-level transformations like fusion and tiling are more difficult or less effective when working directly with mutable memrefs. We must also be explicit about allocation and mutation, whereas tensor operations delegate these concerns to the bufferization pass. Finally, our approach isn't fully representative of production ML compiler pipelines; real systems like TensorFlow/MLIR, PyTorch 2.0, and JAX use tensors extensively at high levels before lowering to memrefs.
+However, this choice involves trade-offs that readers should understand. By skipping tensors, we forgo some high-level optimizations—tensor-level transformations like fusion and tiling are more difficult or less effective when working directly with mutable memrefs. We must also be explicit about allocation and mutation, whereas tensor operations delegate these concerns to the bufferization pass. Finally, our approach isn't fully representative of production AI compiler pipelines; real systems like TensorFlow/MLIR, PyTorch 2.0, and JAX use tensors extensively at high levels before lowering to memrefs.
 
 This is an acceptable trade-off for learning. As we build increasingly sophisticated examples (attention mechanisms in Chapter 11, transformers in Chapter 12, serving engines in Chapter 14), working with memrefs keeps the compilation pipeline transparent and the concepts grounded. Readers interested in production-scale tensor-based optimizations can explore MLIR's bufferization documentation and the Linalg-on-tensors workflow after mastering the fundamentals presented here.
 
@@ -1028,7 +1028,7 @@ A natural question: Does using dynamic shapes hurt performance? The answer is **
 
 For a matrix multiplication of size 8×32 × 32×16 (4096 multiply-add operations), the overhead of loading 21 descriptor fields is negligible—less than 0.1% of the total work. Modern CPUs are very good at this kind of indirection.
 
-However, for **very small operations** (e.g., adding two 4-element vectors), static shapes might be measurably faster because the compiler can unroll loops and eliminate overhead entirely. Production ML compilers often use heuristics: generate specialized kernels for common shapes (e.g., batch size 1, sequence length 512) and fall back to dynamic kernels for rare shapes.
+However, for **very small operations** (e.g., adding two 4-element vectors), static shapes might be measurably faster because the compiler can unroll loops and eliminate overhead entirely. Production AI compilers often use heuristics: generate specialized kernels for common shapes (e.g., batch size 1, sequence length 512) and fall back to dynamic kernels for rare shapes.
 
 ## 2.8 Beyond 2D: Higher-Rank Tensors
 
@@ -1110,7 +1110,7 @@ Modern serving systems like vLLM and SGLang use hybrid approaches that combine b
 
 ## 2.11 Looking Ahead: Bufferization
 
-We deliberately chose to work with memrefs directly in this chapter to avoid the complexity of **bufferization**—the process of converting tensor operations to memref operations. However, it's important to understand this transformation conceptually, as it's central to how production ML compilers work.
+We deliberately chose to work with memrefs directly in this chapter to avoid the complexity of **bufferization**—the process of converting tensor operations to memref operations. However, it's important to understand this transformation conceptually, as it's central to how production AI compilers work.
 
 ### The Tensor-to-MemRef Pipeline
 

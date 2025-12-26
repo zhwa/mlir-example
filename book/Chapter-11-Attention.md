@@ -2025,4 +2025,4 @@ This chapter built a complete attention implementation in MLIR, from high-level 
 - **Chapter 14** (Production Optimizations): Apply DRR for pattern matching, write custom interfaces, implement FlashAttention-inspired fusion, explore KV caching for inference.
 - **Chapter 15** (GPU Concepts): Port attention to GPUs, leveraging thousands of parallel threads.
 
-Attention is the heart of transformers. Mastering its implementation—understanding each operation, each lowering decision, each numerical consideration—provides the foundation for modern ML compilers. From here, we scale: more layers, more optimizations, more targets. MLIR gives us the tools; we provide the insights.
+Attention is the heart of transformers. Mastering its implementation—understanding each operation, each lowering decision, each numerical consideration—provides the foundation for modern AI compilers. From here, we scale: more layers, more optimizations, more targets. MLIR gives us the tools; we provide the insights.

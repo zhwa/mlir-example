@@ -14,7 +14,7 @@ When we wrote Chapter 7's graph API, every operation immediately generated its i
 
 **Problem 2: Optimization Opportunities**. Optimizations that reason about domain semantics (like "this matrix multiply followed by ReLU can be fused" or "these two attention blocks can share Q/K/V projections") require recognizing patterns in the IR. With explicit loops, the pattern matching code must reconstruct the intent from implementation details—a difficult, fragile process. If operations retain high-level types like `nn.attention`, the optimizer sees intent directly and can apply domain-specific transformations confidently. The pattern "matmul → relu" is easy to detect when spelled `nn.matmul %x, %W` followed by `nn.relu %result`. It's much harder when spelled as thirty operations involving allocation, loops, comparisons, and stores.
 
-**Problem 3: Flexibility in Lowering**. Different backends or optimization levels may want different lowerings of the same high-level operation. Matrix multiplication might lower to `linalg.matmul` for CPU, to `gpu.matmul` for GPUs, or to vendor-specific intrinsics on specialized accelerators. If your graph builder directly emits Linalg, you've committed to one lowering strategy. With a high-level `nn.matmul`, the lowering is a separate pass that chooses the appropriate implementation based on target, optimization flags, or tensor shapes. This flexibility is critical for portable ML compilers targeting diverse hardware.
+**Problem 3: Flexibility in Lowering**. Different backends or optimization levels may want different lowerings of the same high-level operation. Matrix multiplication might lower to `linalg.matmul` for CPU, to `gpu.matmul` for GPUs, or to vendor-specific intrinsics on specialized accelerators. If your graph builder directly emits Linalg, you've committed to one lowering strategy. With a high-level `nn.matmul`, the lowering is a separate pass that chooses the appropriate implementation based on target, optimization flags, or tensor shapes. This flexibility is critical for portable AI compilers targeting diverse hardware.
 
 **Problem 4: Multiple Compilation Paths**. Production ML systems often need different code generation strategies for different phases of model execution. Training might use one set of passes emphasizing numerical precision and gradient computation, while inference emphasizes latency and throughput. Serving systems might apply aggressive optimizations that would be unsafe during training. If high-level operations encode these intents explicitly (`nn.matmul` vs. `training.matmul_backward`), the compiler can route them to appropriate lowering strategies. Without custom dialects, you're forced to handle these differences outside MLIR, losing the benefits of a unified IR.
 
@@ -664,7 +664,7 @@ except RuntimeError as e:
 
 The error message might indicate parsing failure (invalid MLIR syntax), pass failure (transformation error), or lookup failure (function name doesn't exist). For teaching, explicit error handling is valuable—students see exactly where and why compilation fails, not just "something went wrong."
 
-This C++ implementation—150 lines managing parsing, passes, and compilation—demonstrates MLIR's power as an infrastructure. We didn't write a parser, implement lowering algorithms, or build a JIT compiler. We configured existing components, trusting the framework to handle complexity correctly and efficiently. This division of labor—Python for high-level logic, MLIR for compilation infrastructure—enables rapid development of ML compilers without reimplementing compiler fundamentals.
+This C++ implementation—150 lines managing parsing, passes, and compilation—demonstrates MLIR's power as an infrastructure. We didn't write a parser, implement lowering algorithms, or build a JIT compiler. We configured existing components, trusting the framework to handle complexity correctly and efficiently. This division of labor—Python for high-level logic, MLIR for compilation infrastructure—enables rapid development of AI compilers without reimplementing compiler fundamentals.
 
 ## 8.10 Universal Execution with libffi
 
@@ -795,7 +795,7 @@ From the compiled function's perspective, it was called normally—arguments arr
 - **2×2 matmul**: ~30 floating-point operations
 - **256×256 matmul**: ~33 million floating-point operations
 
-For small operations, libffi overhead is a few percent. For production-sized operations (hundreds or thousands of elements), it's noise. The flexibility gain—handling arbitrary signatures without code generation—far outweighs the tiny performance cost. This is why IREE (Google's ML compiler) and other production systems use similar dynamic dispatch techniques.
+For small operations, libffi overhead is a few percent. For production-sized operations (hundreds or thousands of elements), it's noise. The flexibility gain—handling arbitrary signatures without code generation—far outweighs the tiny performance cost. This is why IREE (Google's AI compiler) and other production systems use similar dynamic dispatch techniques.
 
 **Comparison with Chapter 7's Explicit Cases**. Chapter 7 implemented explicit cases for common parameter counts (10, 14, 21, 28):
 
@@ -935,7 +935,7 @@ output = g.matmul(x, output_weights)
 
 Each transformer block is 10-15 operations (attention, layer norm, feed-forward), so 50 layers is 500-750 operations. Our graph builder handles this effortlessly—operations append to a list, IDs increment, shapes propagate. Lowering generates thousands of standard operations, but that's MLIR's job, not ours. Compilation might take seconds instead of milliseconds, but it's one-time cost amortized over many inferences.
 
-The key lesson: appropriate abstractions at each level. Users work with `nn` operations (semantic level), lowering works with Linalg operations (computational pattern level), MLIR works with loops and LLVM (implementation level). Each level focuses on its concerns without being overwhelmed by details from other levels. This separation of concerns is what makes ML compilers tractable.
+The key lesson: appropriate abstractions at each level. Users work with `nn` operations (semantic level), lowering works with Linalg operations (computational pattern level), MLIR works with loops and LLVM (implementation level). Each level focuses on its concerns without being overwhelmed by details from other levels. This separation of concerns is what makes AI compilers tractable.
 
 ## 8.12 Comparison with Chapter 7: Architectural Differences
 

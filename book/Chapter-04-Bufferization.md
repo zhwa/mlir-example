@@ -142,54 +142,128 @@ func.func @compute(%arg: memref<8x16xf32>) -> memref<8x16xf32> {
 
 The problems are multifaceted. First, **memory allocation** raises the question: where do memrefs come from and who allocates them? Second, **ownership** becomes ambiguous: who is responsible for freeing allocated memory? Third, **ABI mismatch** creates problems because returning pointers is problematic—who owns the returned memory? Finally, **mutability** represents a semantic shift: tensors are immutable values while memrefs are mutable pointers, representing fundamentally different semantics.
 
-One-Shot Bufferize solves these problems through a multi-step transformation.
+One-Shot Bufferize solves these problems through systematic transformation. But beyond allocation and ownership issues, naive bufferization faces an even more insidious problem: **data hazards**. Without proper analysis, converting immutable tensors to mutable memrefs can silently introduce read-after-write (RAW) conflicts that produce incorrect results. This correctness concern provides yet another compelling reason for One-Shot Bufferization's whole-program analysis approach.
 
-### The Read-After-Write Problem
+### Why One-Shot Bufferization: Preventing Data Hazards
 
-Before diving into the algorithm, we need to understand a critical correctness issue that naive bufferization can introduce: the **read-after-write (RAW) hazard**.
+Understanding **Read-After-Write (RAW) data hazards** is critical because they represent a fundamental correctness issue that makes bufferization challenging.
 
-Consider this seemingly innocent tensor code:
+#### Understanding RAW Hazards
+
+In compiler design and parallel programming, a **Read-After-Write (RAW) hazard** occurs when an instruction attempts to read data before a previous write operation has completed. This is a **data dependency** error that produces incorrect results when timing goes wrong.
+
+**The Core Problem**: Modern processors use pipelining and parallelism to overlap instruction execution. A RAW hazard happens when these overlaps violate logical dependencies:
+
+```
+Logical Order:
+  1. Instruction A: WRITE value to Location X
+  2. Instruction B: READ value from Location X
+  
+RAW Bug:
+  If Instruction B executes before Instruction A completes,
+  it reads stale/garbage data instead of the updated value.
+```
+
+**Hardware Example** (Assembly):
+```asm
+ADD R1, R2, R3   ; Write: R1 = R2 + R3
+SUB R4, R1, R5   ; Read:  R4 = R1 - R5 (depends on R1!)
+
+Bug: If SUB reads R1 before ADD finishes writing,
+     R4 gets garbage from R1's previous contents.
+```
+
+Modern CPUs handle this through **pipeline stalls** or **data forwarding**, but compilers must track these dependencies.
+
+**Multi-threading Example**:
+```c
+// Thread 1: Calculate and write
+balance = calculate_balance(user);  // WRITE
+
+// Thread 2: Read and use
+invoice = generate_invoice(balance);  // READ
+
+Bug: If Thread 2 reads before Thread 1 writes,
+     invoice uses stale balance value.
+```
+
+#### RAW Hazards in Bufferization
+
+During bufferization, RAW hazards emerge when the compiler doesn't track whether memory locations alias (point to the same data). Consider this tensor code:
 
 ```mlir
 func.func @problem(%input: tensor<8xf32>) -> (tensor<8xf32>, tensor<8xf32>) {
   %c1 = arith.constant 1.0 : f32
   
-  // Step 1: Add 1.0 to input
+  // Step 1: Add 1.0 to input → creates NEW tensor
   %modified = linalg.map ins(%input : tensor<8xf32>)
-                         outs(%empty1 : tensor<8xf32>) {
+                         outs(%empty : tensor<8xf32>) {
     ^bb0(%val: f32):
       %sum = arith.addf %val, %c1 : f32
       linalg.yield %sum : f32
   } -> tensor<8xf32>
   
   // Step 2: Return BOTH original and modified
+  // Safe: tensors are immutable, %input and %modified are distinct
   return %input, %modified : tensor<8xf32>, tensor<8xf32>
 }
 ```
 
-With tensors, this is perfectly safe: `%input` is immutable, so returning both original and modified values makes sense. They're different values.
+With immutable tensors, `%input` and `%modified` are guaranteed distinct—no aliasing possible.
 
-**Naive bufferization** (WRONG!):
+**Naive bufferization without alias analysis** (WRONG!):
 ```mlir
-func.func @problem(%input: memref<8xf32>,
-                   %out1: memref<8xf32>,
-                   %out2: memref<8xf32>) {
-  // Mutate %input in-place to save memory
-  linalg.map ins(%input) outs(%input) {  // ← BUG! Writing to %input
+func.func @problem(%input: memref<8xf32>) -> (memref<8xf32>, memref<8xf32>) {
+  // Compiler tries to optimize: reuse %input buffer in-place
+  linalg.map ins(%input) outs(%input) {  // ← WRITE to %input
     ^bb0(%val: f32):
       %sum = arith.addf %val, %c1
       linalg.yield %sum : f32
   }
   
-  // Copy results
-  memref.copy %input, %out1  // ← Should be original, but it's modified!
-  memref.copy %input, %out2  // ← Same as out1 (both modified)
+  // Return both buffers
+  return %input, %input  // ← RAW HAZARD!
+  // The caller expects:
+  //   - First return: original input (READ)
+  //   - Second return: modified input (WRITE already happened)
+  // But both point to the SAME modified buffer!
 }
 ```
 
-**The bug**: We wanted to return the original `%input` unchanged, but naive in-place bufferization modified it. This is a **read-after-write hazard**—we read `%input` after writing to it, expecting the old value, but got the new value.
+**The RAW violation**: The caller reads the "original" buffer expecting unchanged data, but that buffer was written to during the map operation. The READ happens logically before the WRITE in the tensor semantics, but physically after the WRITE in naive bufferization.
 
-This is a **correctness bug**, not just an optimization issue. Naive bufferization produces wrong results!
+This is exactly the RAW problem: **reading data that was written out of the expected logical order**. The compiler created an alias (`%input` used for both input and output) without tracking the true dependency.
+
+#### How One-Shot Bufferization Prevents RAW Hazards
+
+One-Shot Bufferization performs **whole-program alias analysis** to detect these potential RAW conflicts:
+
+1. **Track all uses**: Find every place a tensor value is read
+2. **Track all definitions**: Find where new tensor values are created  
+3. **Detect conflicts**: If a value is both read-after and written-to, mark as conflicting
+4. **Allocate separate buffers**: For conflicts, allocate distinct memory to prevent aliasing
+
+**Correct bufferization** (One-Shot):
+```mlir
+func.func @problem(%input: memref<8xf32>) -> (memref<8xf32>, memref<8xf32>) {
+  // Alias analysis detects: %input read after potential write
+  // Solution: Allocate NEW buffer for output
+  %modified = memref.alloc() : memref<8xf32>
+  
+  linalg.map ins(%input) outs(%modified) {  // Write to SEPARATE buffer
+    ^bb0(%val: f32):
+      %sum = arith.addf %val, %c1
+      linalg.yield %sum : f32
+  }
+  
+  // Now safe: %input unchanged, %modified has new data
+  return %input, %modified  // No aliasing → No RAW hazard
+}
+```
+
+By ensuring `%input` and `%modified` point to **different memory locations**, One-Shot guarantees the READ of original data happens from memory that was never WRITTEN to—preventing the RAW hazard.
+
+**Summary**: RAW hazards are data dependency violations where reads get stale data because writes haven't completed. One-Shot Bufferization prevents these by tracking tensor dataflow and allocating separate buffers when aliasing would create RAW conflicts. This preserves correctness while maximizing safe in-place updates.
 
 ### The One-Shot Bufferize Algorithm
 
@@ -208,7 +282,6 @@ One-Shot Bufferize performs a whole-program analysis to **prevent read-after-wri
 │  │   return %result                    │                     │
 │  │ }                                   │                     │
 │  └──────────────┬──────────────────────┘                     │
-│                 │                                            │
 │                 ▼                                            │
 │  ┌─────────────────────────────────────┐                     │
 │  │ Phase 1: Alias Analysis             │                     │
@@ -238,7 +311,6 @@ One-Shot Bufferize performs a whole-program analysis to **prevent read-after-wri
 │  │  • Eliminate unnecessary copies     │                     │
 │  │  • Mutate buffers where safe        │                     │
 │  └──────────────┬──────────────────────┘                     │
-│                 │                                            │
 │                 ▼                                            │
 │  OUTPUT: MemRef IR (Imperative Semantics)                    │
 │  ┌─────────────────────────────────────┐                     │
@@ -393,60 +465,6 @@ func.func @compute(%A: memref<8x16xf32>, %out: memref<8x16xf32>) {
 
 Now:
 This transformation clarifies memory ownership and simplifies calling conventions. The caller allocates the output buffer before calling the function, and the callee writes results into the caller-provided buffer. There's no ambiguity about ownership—the caller owns everything. This matches the standard C calling convention where all arguments are passed and nothing is returned (void return type).
-
-### How It Works: Signature Transformation
-
-The pass analyzes function signatures and transforms them:
-
-**Pattern**: Any function returning one or more memrefs gets those return values moved to out-parameters.
-
-**Original**:
-```mlir
-func.func @multi_return(%in: memref<8xf32>) 
-    -> (memref<8xf32>, memref<8xf32>) {
-  %out1 = memref.alloc() : memref<8xf32>
-  %out2 = memref.alloc() : memref<8xf32>
-  // ... compute ...
-  return %out1, %out2 : memref<8xf32>, memref<8xf32>
-}
-```
-
-**Transformed**:
-```mlir
-func.func @multi_return(%in: memref<8xf32>,
-                        %out1: memref<8xf32>,  // New parameter
-                        %out2: memref<8xf32>) {// New parameter
-  // Caller-allocated buffers, just write to them
-  // ... compute into %out1 and %out2 ...
-  return  // No return values
-}
-```
-
-Call sites are updated automatically:
-```mlir
-// Before: %r1, %r2 = call @multi_return(%arg)
-// After:
-%r1 = memref.alloc() : memref<8xf32>
-%r2 = memref.alloc() : memref<8xf32>
-call @multi_return(%arg, %r1, %r2)
-// Now %r1, %r2 contain results
-```
-
-### Why This Matters for Python Integration
-
-This transformation is crucial for Python bindings. Python's ctypes and pybind11 work naturally with functions that take all arguments as inputs:
-
-```python
-# Memref with return value (hard to bind)
-result_ptr = lib.compute(input_ptr)  # Who frees result_ptr?
-
-# Memref with out-parameter (easy to bind)
-result = np.zeros((8, 16), dtype=np.float32)  # Python allocates
-lib.compute(input_ptr, result.ctypes.data)    # C++ fills it in
-# Python manages result lifetime automatically
-```
-
-With out-parameters, Python controls memory allocation and deallocation through NumPy's garbage collector. No manual memory management needed.
 
 ### Performance Benefits
 
@@ -1037,7 +1055,7 @@ The complexity increases in several ways. The approach is more complex overall, 
 
 **Use direct memrefs** in scenarios requiring low-level control or C integration. This includes building low-level libraries where you need full control over memory layout, interfacing with existing C APIs that use pointers, implementing custom memory management strategies, working on memory-constrained systems like embedded devices or mobile platforms, and situations where compilation time is critical such as development and interactive use.
 
-**Use tensors + bufferization** for high-level compiler construction and optimization-focused work. This approach suits building high-level ML compilers that serve as framework frontends, situations where optimization is the top priority such as production serving, interfacing with tensor-based systems like PyTorch, TensorFlow, and JAX, leveraging MLIR's optimization passes for fusion, tiling, and vectorization, and following MLIR best practices for new code.
+**Use tensors + bufferization** for high-level compiler construction and optimization-focused work. This approach suits building high-level AI compilers that serve as framework frontends, situations where optimization is the top priority such as production serving, interfacing with tensor-based systems like PyTorch, TensorFlow, and JAX, leveraging MLIR's optimization passes for fusion, tiling, and vectorization, and following MLIR best practices for new code.
 
 ### The Practical Reality
 
@@ -1055,17 +1073,17 @@ Each stage uses the representation best suited to its task. Tensors for optimiza
 
 ## 4.8 Bufferization in the ML Compilation Stack
 
-To understand where bufferization fits in real systems, let's examine how production ML compilers use it.
+To understand where bufferization fits in real systems, let's examine how production AI compilers use it.
 
 ### TensorFlow → XLA → MLIR
 
 TensorFlow's XLA (Accelerated Linear Algebra) compiler uses MLIR internally.
 
-**Stage 1: TensorFlow Graph to MLIR HLO** (High-Level Operations) uses tensor-based operations like `mhlo.add` and `mhlo.dot`, maintaining functional semantics throughout. Graph-level optimizations include constant folding and algebraic simplification.
+**Stage 1: TensorFlow Graph to StableHLO** (High-Level Operations) converts the computation graph to StableHLO, the industry-standard dialect that replaced MHLO for backward compatibility. StableHLO uses tensor-based operations like `stablehlo.add` and `stablehlo.dot`, maintaining functional semantics throughout. Graph-level optimizations include constant folding and algebraic simplification.
 
-**Stage 2: HLO Optimizations** apply operation fusion to combine multiple operations into fused kernels, perform layout assignment to decide between formats like NCHW versus NHWC, and execute all optimizations on tensor IR without aliasing concerns.
+**Stage 2: HLO Optimizations** apply operation fusion to combine multiple operations into fused kernels using destination-passing style to write results directly into final buffers, avoiding RAW hazards. Layout assignment decides between formats like NCHW versus NHWC. All optimizations operate on tensor IR without aliasing concerns. Critical fusion decisions also happen during or just before bufferization using LHLO (Late HLO) patterns and GSPMD for parallelism.
 
-**Stage 3: Bufferization** uses One-Shot Bufferize to convert tensors into memrefs, inserts buffer allocations for intermediate results, and converts to imperative calling conventions.
+**Stage 3: Bufferization** uses MLIR-based bufferization infrastructure to convert tensors into memrefs, inserting buffer allocations for intermediate results and converting to imperative calling conventions. XLA's integration with MLIR combines its legacy buffer assignment logic with MLIR bufferization passes, forming a hybrid approach.
 
 **Stage 4: Lowering to LLVM/PTX** takes the memref-based IR and lowers it to target code. For CPU, this means generating LLVM IR that becomes x86 or ARM assembly. For GPU, LLVM IR becomes PTX for NVIDIA or AMDGPU code.
 
@@ -1073,23 +1091,25 @@ Bufferization happens late, after all high-level optimizations complete.
 
 ### PyTorch → torch-mlir → LLVM
 
-PyTorch 2.0's `torch.compile` can use MLIR through torch-mlir.
+PyTorch 2.0's `torch.compile` uses MLIR through torch-mlir as a compilation backend.
 
-**Stage 1: PyTorch Model to TorchScript/FX Graph** begins by tracing or scripting the Python model to capture the computation graph.
+**Stage 1: PyTorch Model to FX Graph** captures the computation graph via `torch.compile`, which traces execution to build an FX Graph representation. This is the primary modern path; TorchScript (tracing/scripting) remains supported as a legacy option.
 
-**Stage 2: TorchScript to torch-mlir** imports the graph into the `torch` dialect, which is tensor-based and includes operations like `torch.aten.matmul` and `torch.aten.relu`.
+**Stage 2: FX Graph to torch-mlir** imports the graph into the `torch` dialect, which is tensor-based and includes operations like `torch.aten.matmul` and `torch.aten.relu`. The torch dialect contains thousands of ATen operations representing PyTorch's native operations.
 
-**Stage 3: torch dialect to linalg dialect** converts high-level torch operations to linalg structured operations while remaining tensor-based, enabling generic optimizations like tiling and vectorization.
+**Stage 3: Decomposition** breaks down complex ATen operations into a smaller set of primitive operations. This crucial step reduces the thousands of torch ops to a manageable core set before further lowering.
 
-**Stage 4: Bufferization** uses One-Shot Bufferize to transform linalg tensors into linalg memrefs, inserting memory management as needed.
+**Stage 4: torch dialect to linalg dialect** converts decomposed torch operations to linalg structured operations while remaining tensor-based, enabling generic optimizations like tiling and vectorization.
 
-**Stage 5: Lowering to execution** proceeds through the sequence Linalg to Loops to LLVM, generating CPU or GPU code as appropriate.
+**Stage 5: Bufferization** uses One-Shot Bufferize to transform linalg tensors into linalg memrefs, inserting memory management as needed.
+
+**Stage 6: Lowering to execution** proceeds through the sequence Linalg to Loops to LLVM, generating CPU or GPU code as appropriate.
 
 Again, bufferization is the bridge between high-level optimization and low-level execution.
 
 ### The Pattern: Optimize High, Execute Low
 
-All modern ML compilers follow this pattern:
+All modern AI compilers follow this pattern:
 
 ```
 High-level IR (tensors)
@@ -1125,11 +1145,11 @@ linalg.mul ins(%buf1, %C) outs(%buf2)  // Read buf1, write to buf2
 linalg.relu ins(%buf2) outs(%buf3)  // Read buf2, write to buf3
 ```
 
-This allocates three 16MB buffers (1024×1024×4 bytes each) and performs 32MB of memory writes. Wasteful!
+This allocates three 4MB buffers (1024×1024×4 bytes each) and performs 12MB of memory writes. Wasteful!
 
-### In-Place Updates
+### In-Place Updates via Destination-Passing Style
 
-One-Shot Bufferize analyzes tensor usage to enable **in-place updates**—reusing buffers when safe:
+One-Shot Bufferize enables **in-place updates** through MLIR's **Destination-Passing Style (DPS)**. The key is the `outs` operand in linalg operations—it specifies where results should be written.
 
 ```mlir
 // Smart bufferization (single buffer reused)
@@ -1139,17 +1159,17 @@ linalg.mul ins(%buf, %C) outs(%buf)  // REUSE buf (in-place!)
 linalg.relu ins(%buf) outs(%buf)     // REUSE buf (in-place!)
 ```
 
-Only one 16MB buffer, writes happen in-place. Memory usage reduced 3x, memory traffic reduced dramatically.
+Only one 4MB buffer, writes happen in-place. Memory usage reduced 3x, memory traffic reduced dramatically.
+
+The compiler works **backwards** from results to arguments: for each operation, it asks "Can I write the output into an existing buffer instead of allocating a new one?" This is only safe if no conflicts exist.
 
 ### When Is In-Place Safe?
 
-In-place updates are safe when:
+One-Shot Bufferize performs **alias and conflict analysis** using SSA use-def chains to detect when buffers can be safely reused. In-place updates are safe when:
 
-1. **No future reads**: The input tensor isn't used after the operation
-2. **Exclusive ownership**: No other operations reference the buffer
-3. **Compatible shape**: Input and output have identical shapes/strides
-
-One-Shot Bufferize performs **liveness analysis** to determine when these conditions hold.
+1. **No future reads**: The input tensor isn't used after the operation (primary check)
+2. **No aliasing conflicts**: No other tensor aliases this buffer (if two tensors might point to the same memory, in-place updates risk overwriting data still needed elsewhere)
+3. **Compatible operations**: The operation supports DPS (linalg ops typically require matching shapes/strides for in-place execution)
 
 **Example where in-place is safe**:
 ```mlir
@@ -1158,32 +1178,38 @@ One-Shot Bufferize performs **liveness analysis** to determine when these condit
 // ✓ Can reuse %t1's buffer for %t2 (in-place)
 ```
 
-**Example where in-place is unsafe**:
+**Example where in-place creates a conflict**:
 ```mlir
 %t1 = some_op(%t0)
-%t2 = other_op(%t1)
-%t3 = final_op(%t1, %t2)  // %t1 used again!
-// ✗ Cannot reuse %t1's buffer—still needed for %t3
+%t2 = other_op(%t1)  // Want to reuse %t1's buffer?
+%t3 = final_op(%t1, %t2)  // %t1 is read here!
+// ✗ CONFLICT: other_op cannot be in-place on %t1
+// because %t1's original data is needed by final_op
 ```
+
+One-Shot Bufferize detects this conflict and forces `other_op` to allocate a new buffer, preserving correctness.
 
 ### Controlling Bufferization Behavior
 
-One-Shot Bufferize provides options to control in-place updates:
+One-Shot Bufferize provides options to control transformation behavior:
 
 ```cpp
 bufferization::OneShotBufferizationOptions options;
 
-// Allow in-place updates (default)
-options.allowReturnAllocsFromLoops = true;
+// Allow unknown ops (if false, fail on ops without BufferizableOpInterface)
+options.allowUnknownOps = true;
 
-// More conservative (safer but more copies)
+// Control if allocations inside loops can be returned (usually problematic)
 options.allowReturnAllocsFromLoops = false;
 
-// Control memory alignment
+// Make function arguments read-only (forces copies)
+// Alternatively use bufferization.writable = false attribute on arguments
+
+// Control memory space
 options.setMemorySpace(0);  // Default memory space
 ```
 
-For learning and development, defaults work well. For production optimization, tuning these options can significantly reduce memory usage.
+For learning and development, defaults work well. For production optimization, tuning these options—especially marking arguments as read-only or writable—can significantly impact memory reuse patterns.
 
 ## 4.10 Summary
 
@@ -1205,7 +1231,7 @@ We examined **read-after-write hazards**, where naive bufferization can produce 
 
 8. **Optimization story**: Tensor-level optimizations (fusion, rewriting) are simpler and more powerful than memref-level optimizations. Bufferize late in the pipeline, after high-level transformations complete.
 
-9. **Production pattern**: Modern ML compilers universally follow the pattern: high-level tensor IR → optimization → bufferization → low-level memref IR → code generation.
+9. **Production pattern**: Modern AI compilers universally follow the pattern: high-level tensor IR → optimization → bufferization → low-level memref IR → code generation.
 
 With bufferization mastered, we've completed the foundational infrastructure (Chapters 1-4). We now understand:
 - IR generation (Chapter 1)

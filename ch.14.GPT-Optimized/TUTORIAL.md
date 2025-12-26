@@ -212,7 +212,7 @@ auto geluOp = rewriter.create<linalg::GenericOp>(
 ### 🎓 College-Level Education: Complete Transform Dialect Pipeline
 
 This is **production-grade** compiler optimization - same approach used in:
-- **IREE** (Google's ML compiler)
+- **IREE** (Google's AI compiler)
 - **Torch-MLIR** (PyTorch compiler)
 - **Production compilers** at Meta, NVIDIA, etc.
 
@@ -1009,7 +1009,7 @@ Test suite complete - All 22 tests passing! ✅
    - [Linalg Transform Ops](https://mlir.llvm.org/docs/Dialects/Linalg/)
 
 2. **Production Examples**
-   - [IREE](https://github.com/iree-org/iree): Google's ML compiler
+   - [IREE](https://github.com/iree-org/iree): Google's AI compiler
    - [Torch-MLIR](https://github.com/llvm/torch-mlir): PyTorch compiler
    - [Enzyme](https://github.com/EnzymeAD/Enzyme): Automatic differentiation
 
@@ -1021,7 +1021,7 @@ Test suite complete - All 22 tests passing! ✅
 
 - **Polyhedral Compilation**: Mathematical loop optimization
 - **Halide**: Image processing DSL with scheduling
-- **TVM**: ML compiler with scheduling primitives
+- **TVM**: AI compiler with scheduling primitives
 - **TACO**: Tensor algebra compiler with fusion
 
 ### Academic Papers

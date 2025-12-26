@@ -987,7 +987,7 @@ This baseline helps evaluate Chapter 14's production optimizations (targeting su
 - **Chapter 11's attention**: Extended to multi-head attention
 - **Tensor API**: Maintained for user-facing interface
 
-This compositional approach mirrors production ML compilers: stable foundations, incremental improvements, backward compatibility.
+This compositional approach mirrors production AI compilers: stable foundations, incremental improvements, backward compatibility.
 
 ## 12.6 Summary
 

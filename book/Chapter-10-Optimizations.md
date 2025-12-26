@@ -1,6 +1,6 @@
 # Chapter 10: Optimization Passes and Performance
 
-Chapters 8 and 9 taught dialect design: building high-level operations (the `nn` dialect) using Python strings (pedagogical approach) and TableGen (production approach), then lowering them to standard MLIR dialects. We created operations like `nn.matmul`, implemented lowering patterns converting them to `linalg` operations, and compiled everything to executable code. That pipeline works correctly—operations compute the right results—but it's not optimized. The generated code performs redundant work, misses SIMD opportunities, and allocates unnecessary temporary buffers. Production ML compilers must deliver not just correctness but **performance**.
+Chapters 8 and 9 taught dialect design: building high-level operations (the `nn` dialect) using Python strings (pedagogical approach) and TableGen (production approach), then lowering them to standard MLIR dialects. We created operations like `nn.matmul`, implemented lowering patterns converting them to `linalg` operations, and compiled everything to executable code. That pipeline works correctly—operations compute the right results—but it's not optimized. The generated code performs redundant work, misses SIMD opportunities, and allocates unnecessary temporary buffers. Production AI compilers must deliver not just correctness but **performance**.
 
 This chapter explores MLIR's **optimization infrastructure**: passes that transform IR to execute faster while preserving semantics. We'll examine Linalg fusion (merging adjacent operations to reduce memory traffic), loop-invariant code motion (hoisting computations out of loops), and vectorization (converting scalar loops to SIMD operations using the `vector` dialect). Unlike Chapters 8-9 where we built a dialect from scratch, Chapter 10 reuses the `nn` dialect unchanged—operations stay the same, Python API stays the same, but the compilation pipeline adds optimization passes between high-level lowering and final code generation. This separation of concerns mirrors production systems: stable user-facing APIs, evolving backend optimizations.
 
@@ -200,14 +200,14 @@ MLIR's Linalg dialect has extensive transformation libraries:
 
 Affine dialect optimizations require deeper polyhedral compilation knowledge and offer fewer pre-built passes. For pedagogical purposes, Linalg's high-level abstractions teach optimization concepts more directly.
 
-**Reason 3: Production ML Compilers Use Linalg**
+**Reason 3: Production AI compilers Use Linalg**
 
-The ML compiler ecosystem converged on Linalg:
+The AI compiler ecosystem converged on Linalg:
 - **Torch-MLIR**: PyTorch → Torch dialect → Linalg → SCF/Affine → LLVM
 - **IREE**: TensorFlow/JAX → Linalg-based optimizations → HAL
 - **StableHLO**: JAX's dialect, lowers to Linalg for optimization
 
-While some compilers use affine for specific kernels (XLA's polyhedral scheduler), the mainstream path is Linalg-first. Learning Linalg prepares you for real-world ML compiler work.
+While some compilers use affine for specific kernels (XLA's polyhedral scheduler), the mainstream path is Linalg-first. Learning Linalg prepares you for real-world AI compiler work.
 
 **Reason 4: Dynamic Shapes**
 

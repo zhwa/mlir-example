@@ -161,7 +161,7 @@ This chapter teaches **production-grade** compiler optimization:
 ### Transform Dialect Resources
 
 - [MLIR Transform Dialect Guide](https://mlir.llvm.org/docs/Dialects/Transform/)
-- [IREE](https://github.com/iree-org/iree) - Google's ML compiler
+- [IREE](https://github.com/iree-org/iree) - Google's AI compiler
 - [Torch-MLIR](https://github.com/llvm/torch-mlir) - PyTorch compiler
 - [MLIR Discourse](https://discourse.llvm.org/c/mlir/31) - Community
 
