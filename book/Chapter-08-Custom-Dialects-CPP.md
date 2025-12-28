@@ -4,7 +4,7 @@ Chapter 7 built a computation graph system where operations tracked dependencies
 
 **Custom dialects** solve this by introducing operation types that represent domain-specific computations at the right abstraction level. Instead of generating twenty lines of Linalg and Arith operations for a matrix multiply, we generate one `nn.matmul` operation that captures the intent directly. The dialect defines what operations mean (semantics), what types they accept (constraints), and how they print (assembly format). Lowering to standard dialects happens separately, as a transformation pass that runs after the high-level IR is constructed. This separation—high-level representation first, implementation details later—is the essence of MLIR's multi-level approach.
 
-This chapter demonstrates custom dialects using a **string-based Python implementation** that generates MLIR text directly, focusing on understanding dialect concepts without the complexity of TableGen or C++ IR builders. We define an `nn` (neural network) dialect with operations like `nn.add`, `nn.matmul`, and `nn.relu`, build computation graphs in Python that generate `nn` dialect IR, then implement lowering passes in Python that convert `nn` operations to standard MLIR. The C++ side handles MLIR text parsing, compilation, and execution using the universal libffi approach from Chapter 7. This architecture teaches dialect design clearly while showing how Python and C++ responsibilities partition naturally in MLIR-based systems.
+This chapter demonstrates custom dialects using a **string-based Python implementation** that generates MLIR text directly, focusing on understanding dialect concepts without the complexity of TableGen or OpBuilder APIs. We define an `nn` (neural network) dialect with operations like `nn.add`, `nn.matmul`, and `nn.relu`, build computation graphs in Python that generate `nn` dialect IR, then implement lowering passes in Python that convert `nn` operations to standard MLIR. The C++ side handles MLIR text parsing, compilation, and execution using the universal libffi approach from Chapter 7. This architecture teaches dialect design clearly while showing how Python and C++ responsibilities partition naturally in MLIR-based systems.
 
 ## 8.1 Why Custom Dialects? The Abstraction Gap
 
@@ -26,7 +26,7 @@ Before diving into implementation, let's understand the architecture choices for
 
 **Why Strings?** When you write `%0 = nn.add %arg0, %arg1 : tensor<4xf32>` in Python code and emit it as a string, you see exactly what gets parsed and compiled. There's no abstraction hiding details, no C++ types to wrestle with, no template errors to debug. If the IR is wrong, you see it immediately in the generated string. For learning dialect concepts—operation syntax, type constraints, custom attributes—this transparency is invaluable. You iterate quickly: edit Python code, print MLIR string, inspect what changed, repeat. The feedback loop is instant.
 
-**Why Not Strings in Production?** Production systems rarely generate IR as text for several reasons. First, **error handling**: string manipulation doesn't catch type errors or malformed operations until runtime parsing, while C++ IR builders validate at compile time. Second, **performance**: parsing text is slower than constructing IR in-memory, though for model compilation (not inference), this overhead is negligible. Third, **tooling**: C++ builders integrate with MLIR's verification infrastructure, catching invariant violations immediately, while string generation delays errors until parsing. Fourth, **composition**: combining IR fragments from multiple sources is tricky with strings (concatenation, scope management) but natural with C++ builders (just create operations in the same block).
+**Why Not Strings in Production?** Production systems rarely generate IR as text for several reasons. First, **error handling**: string manipulation doesn't catch type errors or malformed operations until runtime parsing, while OpBuilder APIs validate at compile time. Second, **performance**: parsing text is slower than constructing IR in-memory, though for model compilation (not inference), this overhead is negligible. Third, **tooling**: OpBuilder integrates with MLIR's verification infrastructure, catching invariant violations immediately, while string generation delays errors until parsing. Fourth, **composition**: combining IR fragments from multiple sources is tricky with strings (concatenation, scope management) but natural with OpBuilder (just create operations in the same block).
 
 For our educational goals, these production concerns don't outweigh the learning benefits. We want to understand what dialects **are** before learning how to build them idiomatically. The string approach teaches dialect syntax, operation semantics, type systems, and lowering patterns without the cognitive load of C++ template metaprogramming or TableGen's declarative language. Once these concepts are clear, Chapter 9's TableGen approach will make sense as a productivity tool, not a mysterious code generator.
 
@@ -34,9 +34,7 @@ For our educational goals, these production concerns don't outweigh the learning
 
 The Python `Graph` class tracks operations using dataclasses—simple, readable data structures that store operation types, operands, and results. When generating IR, Python code walks the graph and emits MLIR strings using f-strings and basic formatting. The `MLIRLowering` class implements transformation logic entirely in Python, reading operations from the graph and outputting lowered MLIR text. This Python-side lowering is unusual compared to production MLIR (which uses C++ rewrite patterns), but it's pedagogically powerful: you see lowering logic directly, without pattern matchers or dialect interfaces obscuring the transformations.
 
-On the C++ side, we use MLIR's public APIs but in the simplest possible way. The `parseMLIR()` function takes a string and returns a `ModuleOp`—no custom parsing logic, just the built-in text parser. The compilation pipeline uses the same passes as Chapter 7 (Linalg → Loops → LLVM), configured with the same `PassManager` setup. Execution uses the same libffi-based `execute()` function that marshals memref descriptors and dispatches dynamically. The C++ code is under 150 lines total (plus pybind11 bindings), demonstrating how much heavy lifting MLIR's infrastructure provides. You focus on dialect semantics, not infrastructure.
-
-This architecture also previews production patterns. In systems like TensorFlow MLIR or PyTorch's Torch-MLIR, Python often generates high-level IR (TF dialect or Torch dialect), then C++ passes handle lowering and optimization. The boundary between languages isn't arbitrary—it reflects where dynamism (Python's strength) vs. static analysis and optimization (C++'s strength) matter most. Our string-based approach exaggerates this split for teaching, but the principle holds: define abstractions where they're most natural, implement transformations where they're most efficient.
+On the C++ side, we use MLIR's public APIs but in the simplest possible way. The `parseMLIR()` function takes a string and returns a `ModuleOp`—no custom parsing logic, just the built-in text parser. The compilation pipeline uses the same passes as Chapter 7 (Linalg → Loops → LLVM), configured with the same `PassManager` setup. Execution uses the same libffi-based `execute()` function that marshals memref descriptors and dispatches dynamically. The C++ code is under 150 lines total, demonstrating how much heavy lifting MLIR's infrastructure provides. You focus on dialect semantics, not infrastructure.
 
 ## 8.3 The nn Dialect: Operations and Syntax
 
@@ -50,7 +48,7 @@ Our `nn` (neural network) dialect provides five core operations covering the fun
 
 Semantics: Element-wise floating-point addition. For inputs of shape `[4]`, computes `result[i] = lhs[i] + rhs[i]` for all indices. The operation requires matching shapes for both operands and returns a tensor of the same shape. Type signature: `(tensor<...xf32>, tensor<...xf32>) -> tensor<...xf32>` where all shapes match.
 
-The syntax follows MLIR conventions: operation name (`nn.add`), operands in SSA form (`%lhs`, `%rhs`), a colon separator, and the result type. We specify only the result type because operand types can be inferred (they must match the result). Production dialects often omit redundant type information, but for clarity, our initial implementation includes it. The operation is pure (no side effects), deterministic (same inputs always produce same outputs), and parallelizable (each output element computed independently).
+The syntax follows MLIR conventions: operation name (`nn.add`), operands in SSA form (`%lhs`, `%rhs`), a colon separator, and the result type. We specify only the result type because operand types can be inferred (they must match the result). Production dialects often omit redundant type information, but for clarity, our initial implementation includes it. The operation has no side effects (does not modify global state or memory), is deterministic (same inputs always produce same outputs), and is parallelizable (each output element computed independently).
 
 **Element-Wise Multiplication**: `nn.mul`
 
@@ -352,7 +350,7 @@ Element-wise lowering demonstrates how high-level operations decompose into comb
 
 ## 8.7 Matrix Multiplication and ReLU Lowering
 
-Matrix multiplication represents a different pattern: not element-wise, but a **reduction** over a shared dimension. Where element-wise operations use `linalg.generic` with parallel iterators, matmul uses the specialized `linalg.matmul` operation that encapsulates three-loop reduction semantics. Let's examine how `nn.matmul` lowers, then cover ReLU's simpler pattern.
+Matrix multiplication represents a different pattern: not element-wise, but a **reduction** over a shared dimension. While element-wise operations use `linalg.generic` with parallel iterators, matmul uses the specialized `linalg.matmul` operation that encapsulates three-loop reduction semantics. Let's examine how `nn.matmul` lowers, then cover ReLU's simpler pattern.
 
 **Matrix Multiplication with Linalg.Matmul**. For `nn.matmul %lhs, %rhs : tensor<2x3xf32>, tensor<3x4xf32> -> tensor<2x4xf32>`, we generate:
 
@@ -419,7 +417,7 @@ linalg.generic {
 
 The operation has **one** input and one output (unary operation). The region block receives two arguments: `%arg0` from the input tensor, `%arg1` from the output (unused here). We compute `max(%arg0, 0)` and yield the result. The unary pattern is common for activations, normalizations, and other element-wise transformations. Linalg's generality handles binary, unary, or even ternary operations uniformly—adjust the `ins` and `outs` lists, and the region signature changes accordingly.
 
-**Comparison with Chapter 7**. In Chapter 7, we generated ReLU using explicit `scf.for` loops, `memref.load`, `arith.cmpf`, `arith.select`, and `memref.store`. The generated IR was ~15 operations for 2D ReLU. Here, one `linalg.generic` expresses the same computation at a higher level. The difference isn't just verbosity—it's analyzability. Pattern matchers can detect "matmul followed by relu" when both are structured operations. With explicit loops, the pattern is buried in imperative code. Optimizers can fuse the two `linalg.generic` operations (matmul and relu), eliminating the intermediate buffer write. With explicit loops, fusion requires complex dependence analysis.
+**Comparison with Chapter 7**. In Chapter 7, we generated ReLU using explicit `scf.for` loops, `memref.load`, `arith.cmpf`, `arith.select`, and `memref.store`. The generated IR involved multiple operations for 2D ReLU. Here, one `linalg.generic` expresses the same computation at a higher level. The difference isn't just verbosity—it's analyzability. Pattern matchers can detect "matmul followed by relu" when both are structured operations. With explicit loops, the pattern is buried in imperative code. Optimizers can fuse the two `linalg.generic` operations (matmul and relu), eliminating the intermediate buffer write. With explicit loops, fusion requires complex dependence analysis.
 
 This demonstrates the custom dialect's value proposition: operations remain at appropriate abstraction levels through multiple compilation stages. High-level `nn` dialect captures user intent, mid-level Linalg captures computational patterns, low-level SCF captures control flow, and LLVM captures machine instructions. Each level enables different optimizations and analyses. MLIR's multi-level design isn't an abstraction for abstraction's sake—it's a tool for managing compilation complexity by separating concerns across layers.
 
@@ -517,17 +515,13 @@ module {
 
 This IR is ready for standard MLIR compilation: Linalg operations will lower to loops, loops to control flow, control flow to LLVM, LLVM to machine code. The transformation from high-level `nn` dialect (5 operations: 2 matmuls, 1 relu, 2 variables) to mid-level standard dialects (15+ operations) happens entirely in Python string manipulation. No C++ required, no compiler infrastructure beyond basic string formatting.
 
-**Advantages of Python Lowering**. This Python-based lowering is unusual—production MLIR uses C++ rewrite patterns. What do we gain from the Python approach? **Rapid iteration**: edit Python code, see new IR instantly, no compilation. **Transparency**: every transformation step is visible in source code, not hidden in framework abstractions. **Accessibility**: engineers familiar with Python but not C++ can implement lowerings, lowering the barrier to experimentation. **Teaching**: students see transformations as straightforward text manipulation, making the concept concrete before introducing pattern rewriters, dialect conversion frameworks, and other MLIR complexities.
-
-The disadvantages are also clear: no compile-time validation (type errors only caught at MLIR parsing), no composition with existing C++ patterns, limited performance (string manipulation vs. IR node manipulation). For production, C++ is necessary. For learning, Python suffices and excels. Chapter 9 will show the idiomatic C++ approach with TableGen, but the concepts learned here—operation semantics, lowering patterns, type conversions—transfer directly.
-
 This completes the lowering pipeline: high-level `nn` operations become standard Linalg, Arith, and MemRef operations through simple Python code. Next, we'll implement the C++ side: parsing this MLIR text, compiling it, and executing it using the techniques from Chapter 7.
 
 ## 8.9 C++ Compilation: Parsing and Pass Pipeline
 
-The C++ side of our system handles three responsibilities: parsing MLIR text into in-memory IR, applying lowering passes to convert standard dialects to LLVM, and JIT compiling the result to executable machine code. This implementation in [src/compiler.cpp](../ch.8.Custom-dialect/src/compiler.cpp) is remarkably concise—under 150 lines—because MLIR's infrastructure provides the heavy lifting. We configure components and let the framework handle complexity.
+The C++ side of our system handles three responsibilities: parsing MLIR text into in-memory IR, applying lowering passes to convert standard dialects to LLVM, and JIT compiling the result to executable machine code. This differs from Chapter 7, where we generated MLIR directly in C++ using OpBuilder APIs. Here, Python generates MLIR text strings, and C++ parses them. The implementation in [src/compiler.cpp](../ch.8.Custom-dialect/src/compiler.cpp) demonstrates how to work with MLIR text rather than direct IR construction.
 
-**Parsing MLIR Text**. The first step is converting string IR to MLIR's in-memory representation:
+**Parsing MLIR Text**. The key new API is `parseSourceString`:
 
 ```cpp
 OwningOpRef<ModuleOp> parseMLIR(const std::string& mlirText) {
@@ -536,11 +530,9 @@ OwningOpRef<ModuleOp> parseMLIR(const std::string& mlirText) {
 }
 ```
 
-This single function call uses MLIR's built-in text parser. The `parseSourceString` template function takes MLIR text as a string, parses it according to MLIR syntax rules, verifies the IR (checking type correctness, SSA form, operation constraints), and returns a `ModuleOp`—MLIR's top-level container. If parsing fails (syntax error, type mismatch, unknown operation), it returns `nullptr` and prints diagnostics. For our purposes, successful parsing means the Python-generated text is valid MLIR.
+This single function call uses MLIR's built-in text parser. The `parseSourceString` template function takes MLIR text as a string, parses it according to MLIR syntax rules, verifies the IR (checking type correctness, SSA form, operation constraints), and returns a `ModuleOp`. If parsing fails, it returns `nullptr` and prints diagnostics. This is essential for our string-based approach—Python generates text, C++ parses it back into structured IR.
 
-**Why Parse Text?** Production systems often build IR directly with C++ APIs (OpBuilder, etc.), avoiding text parsing entirely. Why do we parse? **Simplicity**: Python generates human-readable text, which we can inspect, debug, and understand. **Flexibility**: text is a universal interface—any tool can generate MLIR text, not just C++ programs. **Teaching**: seeing the text makes IR transformations concrete. The performance cost (parsing) is negligible for model compilation workloads—we compile once, execute many times, so microseconds spent parsing don't matter.
-
-**Compilation Pipeline**. Once we have a `ModuleOp`, we apply a series of transformation passes:
+**Pass Pipeline**. Once parsed, we apply the same lowering passes as any MLIR program:
 
 ```cpp
 void runPasses(ModuleOp module) {
@@ -568,15 +560,7 @@ void runPasses(ModuleOp module) {
 }
 ```
 
-The `PassManager` orchestrates transformations. Each pass operates on the IR, lowering high-level constructs to lower-level equivalents. Let's understand the pipeline stages:
-
-**Stage 1: Linalg to Loops**. `createConvertLinalgToLoopsPass()` converts structured operations (`linalg.matmul`, `linalg.generic`) into explicit `scf.for` loops. Our `linalg.matmul` becomes three nested loops (over rows, columns, and reduction dimension), our `linalg.generic` element-wise operations become parallel loops. This transformation from structured to imperative form makes the computation explicit—no more high-level operation abstractions, just loops, loads, arithmetic, and stores.
-
-**Stage 2: SCF to Control Flow**. `createConvertSCFToCFPass()` converts `scf.for` and `scf.if` operations to basic blocks and branches (the Control Flow dialect). Structured control flow (`for`, `if`) becomes unstructured (`br`, conditional branches). This matches how machine code represents control: jump instructions and labels, not high-level loop constructs. LLVM doesn't understand `scf.for`; it understands branches.
-
-**Stage 3: Dialect to LLVM**. The remaining passes convert specific dialects to the LLVM dialect, MLIR's abstraction of LLVM IR. Each pass handles one dialect: Math operations to LLVM intrinsics or libm calls, Func operations to LLVM functions, Arith operations to LLVM arithmetic, MemRef operations to LLVM pointers and GEPs (get element pointer), and Control Flow to LLVM branches. The `createReconcileUnrealizedCastsPass()` cleans up temporary type casts inserted during conversion.
-
-After this pipeline, the entire module is in LLVM dialect—a direct representation of LLVM IR within MLIR's framework. At this point, we're one step from machine code: MLIR can translate LLVM dialect to actual LLVM IR, which LLVM can compile.
+The pipeline progressively lowers IR through dialect hierarchies: linalg→loops (scf.for), structured control flow→branches (cf.br), math operations→libm, then everything→LLVM dialect. These are the standard MLIR lowering passes documented in MLIR's dialect conversion documentation.
 
 **ExecutionEngine: JIT Compilation**. MLIR provides `ExecutionEngine`, a wrapper around LLVM's JIT compiler:
 
@@ -668,171 +652,17 @@ This C++ implementation—150 lines managing parsing, passes, and compilation—
 
 ## 8.10 Universal Execution with libffi
 
-The execution layer in [src/bindings.cpp](../ch.8.Custom-dialect/src/bindings.cpp) implements the universal `execute()` function that calls JIT-compiled functions with arbitrary signatures using libffi. This is the same technique we introduced in Chapter 7.13, but here it's the only execution path—no explicit parameter-count cases, just pure dynamic dispatch. The implementation demonstrates production-grade flexibility: one function handles 1D arrays, 2D arrays, any number of inputs, any output shape, without code changes.
+The execution layer in [src/bindings.cpp](../ch.8.Custom-dialect/src/bindings.cpp) implements the universal `execute()` function that calls JIT-compiled functions with arbitrary signatures using libffi. As covered in detail in Chapter 7.13, libffi provides dynamic dispatch for functions with any signature, solving the binding explosion problem elegantly. Chapter 8 uses the same technique—the implementation follows the pattern established in Chapter 7, with memref marshaling helpers that convert NumPy arrays to MLIR's calling convention, and `ffi_call()` to execute the compiled function.
 
-**The Universal API**:
+The key points from Chapter 7.13 apply here: MLIR's memref convention uses only pointer-sized values, making every argument `ffi_type_pointer` in libffi's terms. This uniformity enables one universal execution function to handle any shape combination, any number of inputs, and any operation type without code changes. The overhead is negligible for ML workloads—a few dozen CPU cycles for dispatch versus millions of operations for actual computation.
 
-```python
-result = ch8.execute(mlir_text, func_name, inputs, output_shape)
-```
+For the complete explanation of how libffi works, memref marshaling details, and performance characteristics, see Chapter 7.13. The implementation here is identical in principle, adapted for our string-based custom dialect workflow.
 
-Four parameters: MLIR text (string), function name (string), input arrays (list of NumPy arrays), expected output shape (tuple of integers). The function compiles the MLIR, marshals arguments, calls the compiled function via libffi, and returns the result. No shape specialization, no operation-specific code—truly universal.
+## 8.11 Testing: Verifying Graph-to-Code Correctness
 
-**Memref Marshaling**. NumPy arrays must be converted to MLIR's memref calling convention. From Chapter 2, we know memrefs expand to multiple parameters: pointers, sizes, and strides. For 1D `memref<4xf32>`, that's 5 parameters. For 2D `memref<2x3xf32>`, 7 parameters. The marshaling helpers handle this:
+Testing the string-based custom dialect implementation requires verifying that Python-generated MLIR text produces correct numerical results. The [test_jit.py](../ch.8.Custom-dialect/test_jit.py) test suite demonstrates this verification process, comparing our compiled functions against NumPy's reference implementations. Understanding these tests shows how to validate custom dialects and lowering logic systematically.
 
-```cpp
-void marshal_memref_1d(std::vector<void*>& args, py::array_t<float> arr) {
-    auto buf = arr.request();
-    float* data = static_cast<float*>(buf.ptr);
-
-    args.push_back(data);                              // allocated_ptr
-    args.push_back(data);                              // aligned_ptr
-    args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(0)));    // offset
-    args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[0])));  // size
-    args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(1)));    // stride
-}
-
-void marshal_memref_2d(std::vector<void*>& args, py::array_t<float> arr) {
-    auto buf = arr.request();
-    float* data = static_cast<float*>(buf.ptr);
-
-    args.push_back(data);                              // allocated_ptr
-    args.push_back(data);                              // aligned_ptr
-    args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(0)));    // offset
-    args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[0])));  // size0
-    args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[1])));  // size1
-    args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[1])));  // stride0
-    args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(1)));    // stride1
-}
-```
-
-Each helper pushes descriptor values onto a `std::vector<void*>`. The `void*` type is critical: libffi expects argument values as `void*` pointers, regardless of the actual type. We cast integers to `intptr_t` then to `void*`, and store pointers directly as `void*`. This type-erasing approach is what enables universality—all arguments become `void*` in the vector, libffi handles type interpretation.
-
-**Dynamic Marshaling Loop**. The `execute()` function doesn't know how many inputs it will receive or their dimensions until runtime:
-
-```cpp
-std::vector<void*> args;
-
-// Marshal inputs
-for (auto item : inputs) {
-    auto arr = py::cast<py::array_t<float>>(item);
-    auto buf = arr.request();
-
-    if (buf.ndim == 1) {
-        marshal_memref_1d(args, arr);
-    } else if (buf.ndim == 2) {
-        marshal_memref_2d(args, arr);
-    } else {
-        throw std::runtime_error("Only 1D and 2D arrays supported");
-    }
-}
-
-// Marshal output
-if (out_shape.size() == 1) {
-    marshal_memref_1d(args, output);
-} else if (out_shape.size() == 2) {
-    marshal_memref_2d(args, output);
-}
-```
-
-We iterate through the Python input list, introspect each array's dimensionality (`buf.ndim`), and call the appropriate marshaling helper. The `args` vector grows dynamically: if we have three 2D inputs (21 parameters) and one 2D output (7 parameters), we end up with 28 elements in `args`. If we have two 1D inputs (10 parameters) and one 1D output (5 parameters), we get 15 elements. The vector adapts automatically to any combination.
-
-**libffi Setup**. Now we have a vector of argument values. We need to tell libffi the function signature:
-
-```cpp
-size_t num_args = args.size();
-
-// All arguments are pointer-sized (void* or intptr_t cast to void*)
-std::vector<ffi_type*> arg_types(num_args, &ffi_type_pointer);
-
-// Prepare pointers to argument values
-std::vector<void*> arg_values(num_args);
-for (size_t i = 0; i < num_args; ++i) {
-    arg_values[i] = &args[i];  // Address of the void* in args vector
-}
-
-// Setup call interface
-ffi_cif cif;
-ffi_status status = ffi_prep_cif(
-    &cif,
-    FFI_DEFAULT_ABI,      // Platform calling convention
-    num_args,              // Parameter count (dynamic!)
-    &ffi_type_void,       // Return type (void, we use out-param)
-    arg_types.data()      // Array of argument types
-);
-
-if (status != FFI_OK) {
-    throw std::runtime_error("libffi ffi_prep_cif failed");
-}
-```
-
-The `ffi_cif` (Call Interface) structure describes the function signature to libffi. We specify:
-- **ABI**: `FFI_DEFAULT_ABI` uses the platform's C calling convention (SysV on Linux x64, Windows x64 calling convention on Windows).
-- **Parameter count**: `num_args`, determined dynamically from our marshaling.
-- **Return type**: `&ffi_type_void` since our functions return nothing (out-parameter pattern).
-- **Argument types**: All `&ffi_type_pointer` because memref descriptors are pointer-sized values.
-
-The key insight from Chapter 7 applies here: MLIR's memref convention uses only pointer-sized values (pointers and 64-bit integers), so every argument is `ffi_type_pointer`. This uniformity eliminates the need for complex type descriptions. If memrefs used structs or smaller integers, we'd need conditional type handling. MLIR's design choice simplifies our implementation.
-
-**Dynamic Function Call**:
-
-```cpp
-ffi_call(&cif, FFI_FN(fnPtr), nullptr, arg_values.data());
-```
-
-This single line executes the compiled function. libffi:
-1. Allocates a stack frame
-2. Loads arguments from `arg_values` into registers and/or stack according to the calling convention
-3. Calls the function at address `fnPtr`
-4. The function executes, reading inputs and writing to the output buffer
-5. Returns control to `ffi_call`
-
-From the compiled function's perspective, it was called normally—arguments arrived in the expected registers/stack slots, memory pointers were valid. libffi's abstraction is perfect: the callee doesn't know it was called dynamically, the caller doesn't need compile-time knowledge of the signature.
-
-**Performance Characteristics**. How much does libffi cost? From Chapter 7, we know the overhead is negligible for ML workloads—a few dozen instructions for dispatch, unmeasurable compared to matrix multiply or activation functions computing on large tensors. Here are realistic numbers:
-
-- **libffi overhead**: ~50-100 CPU cycles (ffi_prep_cif + ffi_call)
-- **2×2 matmul**: ~30 floating-point operations
-- **256×256 matmul**: ~33 million floating-point operations
-
-For small operations, libffi overhead is a few percent. For production-sized operations (hundreds or thousands of elements), it's noise. The flexibility gain—handling arbitrary signatures without code generation—far outweighs the tiny performance cost. This is why IREE (Google's AI compiler) and other production systems use similar dynamic dispatch techniques.
-
-**Comparison with Chapter 7's Explicit Cases**. Chapter 7 implemented explicit cases for common parameter counts (10, 14, 21, 28):
-
-```cpp
-// Chapter 7 style (educational)
-switch (num_args) {
-    case 10:  // Two 1D inputs, one 1D output
-        typedef void (*Func10)(void*, void*, void*, ...);
-        reinterpret_cast<Func10>(fnPtr)(...args...);
-        break;
-    case 21:  // Two 2D inputs, one 2D output
-        typedef void (*Func21)(void*, void*, void*, ...);
-        reinterpret_cast<Func21>(fnPtr)(...args...);
-        break;
-    // ... more cases
-}
-```
-
-This approach has zero overhead (direct function call), excellent debugger support (clear stack traces), and educational value (shows calling convention explicitly). But it doesn't scale: each new shape combination requires a new case. For production systems with dynamic graphs, thousands of shape combinations, and evolving operation sets, explicit cases are impractical.
-
-Chapter 8's libffi approach has tiny overhead (~0.001% for realistic operations), works for any signature without code changes, and scales perfectly to arbitrary complexity. The tradeoff favors universality. For teaching, Chapter 7 shows "how it works under the hood." Chapter 8 shows "how production systems handle it."
-
-**Error Handling and Debugging**. When compilation fails or functions crash, Python exceptions provide clear messages:
-
-```python
-try:
-    result = ch8.execute(bad_mlir, "func", inputs, shape)
-except RuntimeError as e:
-    print(f"Error: {e}")
-    # Prints: "Failed to parse MLIR" or "Function not found: func"
-```
-
-Debugging compiled code is harder—the function is JIT-compiled machine code without debug symbols by default. For development, you can enable debug info by modifying the ExecutionEngine transformer, but for most purposes, validating the MLIR text before execution (by inspecting the lowered output) suffices.
-
-The universal execution layer completes our implementation. Python generates high-level IR, lowers it to standard MLIR, C++ compiles and JIT-executes it, and libffi dispatches dynamically. The system handles arbitrary computation graphs with five operation types, 1D and 2D tensors, and any number of inputs—all in under 400 lines of Python and 300 lines of C++. This demonstrates custom dialects' power: appropriate abstractions at each level, minimal code, maximum flexibility.
-
-## 8.11 Composing Operations: Building Multi-Layer Networks
+## 8.12 Composing Operations: Building Multi-Layer Networks
 
 With our custom dialect and compilation infrastructure complete, let's examine how operations compose into larger computations. The [test_jit.py](../ch.8.Custom-dialect/test_jit.py) test suite demonstrates this progression from simple operations to multi-layer neural networks. Understanding these examples shows how the abstractions scale from primitives to production-sized models.
 
@@ -936,96 +766,6 @@ output = g.matmul(x, output_weights)
 Each transformer block is 10-15 operations (attention, layer norm, feed-forward), so 50 layers is 500-750 operations. Our graph builder handles this effortlessly—operations append to a list, IDs increment, shapes propagate. Lowering generates thousands of standard operations, but that's MLIR's job, not ours. Compilation might take seconds instead of milliseconds, but it's one-time cost amortized over many inferences.
 
 The key lesson: appropriate abstractions at each level. Users work with `nn` operations (semantic level), lowering works with Linalg operations (computational pattern level), MLIR works with loops and LLVM (implementation level). Each level focuses on its concerns without being overwhelmed by details from other levels. This separation of concerns is what makes AI compilers tractable.
-
-## 8.12 Comparison with Chapter 7: Architectural Differences
-
-Chapters 7 and 8 implement similar functionality—building and executing computation graphs for neural network operations—but use fundamentally different architectures. Understanding these differences clarifies when to use each approach and prepares us for Chapter 9's production techniques. Let's compare systematically.
-
-**IR Generation: C++ vs. Python**
-
-Chapter 7 generates MLIR directly in C++ using OpBuilder APIs:
-
-```cpp
-auto matmul_result = builder.create<linalg::MatmulOp>(
-    loc,
-    ValueRange{lhs, rhs},
-    ValueRange{output}
-);
-```
-
-Chapter 8 generates MLIR as Python strings:
-
-```python
-line = f"%{result_id} = nn.matmul %{lhs_id}, %{rhs_id} : {types}"
-```
-
-The C++ approach provides compile-time type safety, immediate verification, and integration with MLIR's C++ infrastructure. The Python approach provides rapid iteration, clear visibility into generated IR, and no C++ compilation overhead. For teaching, Python's transparency wins—you see exactly what's being generated. For production, C++'s safety and tooling integration win—errors caught at compile time, not runtime parsing.
-
-**Dialect Choice: Standard vs. Custom**
-
-Chapter 7 uses only standard dialects (Linalg, Arith, MemRef, SCF) throughout:
-
-```mlir
-%result = memref.alloc() : memref<4xf32>
-scf.for %i = %c0 to %c4 step %c1 {
-  %lhs_val = memref.load %lhs[%i] : memref<4xf32>
-  %rhs_val = memref.load %rhs[%i] : memref<4xf32>
-  %sum = arith.addf %lhs_val, %rhs_val : f32
-  memref.store %sum, %result[%i] : memref<4xf32>
-}
-```
-
-Chapter 8 introduces the `nn` custom dialect for high-level operations:
-
-```mlir
-%result = nn.add %lhs, %rhs : tensor<4xf32>
-```
-
-The standard dialect approach is verbose but explicit—every implementation detail is visible. The custom dialect approach is concise but requires lowering—the high-level operation eventually becomes the same standard operations, but that happens in a separate transformation step. For single operations, the verbosity difference is minor. For large graphs (50+ operations), the custom dialect's compression is significant.
-
-**Lowering: Immediate vs. Staged**
-
-Chapter 7 generates implementation details immediately during graph construction. When you add an `add` operation to the graph, it generates allocation, loops, loads, arithmetic, and stores right away. Chapter 8 generates high-level `nn.add`, deferring implementation to the lowering phase. This staging enables multiple benefits:
-
-1. **Inspection**: Before lowering, you can analyze the high-level graph—count operations, visualize data flow, estimate complexity.
-2. **Optimization**: High-level patterns are easier to detect and optimize than low-level loop nests.
-3. **Portability**: Different targets can have different lowerings (CPU loops, GPU kernels, custom accelerators).
-4. **Separation of Concerns**: Graph construction logic doesn't mix with implementation details.
-
-For simple systems or when you need absolute control over generated code, immediate lowering (Chapter 7) is simpler. For complex systems with multiple targets or aggressive optimization, staged lowering (Chapter 8) provides necessary flexibility.
-
-**Execution: Explicit Cases vs. Universal libffi**
-
-Chapter 7 uses explicit function pointer casts for common signatures:
-
-```cpp
-switch (num_params) {
-    case 10:  // Two 1D + one 1D output
-        auto fn = reinterpret_cast<void(*)(void*, void*, intptr_t, ...)>(fnPtr);
-        fn(data_ptrs...);
-        break;
-    // ... more cases
-}
-```
-
-Chapter 8 uses libffi for all signatures:
-
-```cpp
-ffi_cif cif;
-ffi_prep_cif(&cif, FFI_DEFAULT_ABI, num_args, &ffi_type_void, arg_types.data());
-ffi_call(&cif, FFI_FN(fnPtr), nullptr, arg_values.data());
-```
-
-The explicit approach has zero overhead and clear code structure, excellent for teaching and debugging. The libffi approach handles arbitrary signatures universally, essential for production systems with dynamic shapes, evolving operation sets, or user-defined operations. Chapter 7 teaches "how calling conventions work." Chapter 8 teaches "how to scale beyond fixed patterns."
-
-**Code Organization: Monolithic vs. Layered**
-
-Chapter 7's graph builder contains IR generation, lowering, and compilation in one C++ class. The Python API is thin—just pybind11 wrappers. Chapter 8 splits responsibilities across layers:
-
-- **Python**: Graph construction, high-level IR generation, lowering logic
-- **C++**: Text parsing, pass management, compilation, execution
-
-This layering matches production ML frameworks. TensorFlow's Python API builds graphs, C++ handles optimization and execution. PyTorch's JIT traces Python functions, C++ compiles them. Our architecture demonstrates this pattern at small scale. The advantage: each language does what it's good at. Python handles dynamism and string manipulation. C++ handles performance-critical compilation and execution.
 
 ## 8.13 Looking Ahead: From Python Strings to TableGen
 
