@@ -1,11 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(ch9-tablegen-dialect)
 
-# Find Python
-find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
-
-# MLIR is already found by root CMakeLists.txt
-
 include(TableGen)
 include(AddLLVM)
 include(AddMLIR)

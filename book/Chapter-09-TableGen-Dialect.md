@@ -34,7 +34,7 @@ This automation eliminates entire classes of bugs. If you change an operand's ty
 
 **The Learning Curve Tradeoff**. TableGen adds a learning curve: you must understand its syntax (record types, dags, multiclass), operation traits (SideEffects, Commutative, etc.), and code generation mechanics. For simple prototypes or one-off experiments, string generation (Chapter 8) might be faster. But for dialects intended for reuse, extension, or optimization, TableGen pays dividends quickly. Once familiar with the patterns (which we'll cover systematically), defining new operations becomes mechanical: copy an existing definition, modify operands/results, regenerate code, implement lowering pattern. The overhead is fixed; the benefits scale with dialect size.
 
-**Production Ecosystem Standards**. Every major MLIR-based project uses TableGen: TensorFlow's TF dialect, PyTorch's Torch dialect, StableHLO, XLA, IREE's VM dialect, Flang's FIR dialect. When you join these projects or integrate with them, understanding TableGen is mandatory—it's the lingua franca of MLIR dialect development. Learning it through our `nn` dialect example prepares you for reading, understanding, and contributing to production codebases. The investment in Chapter 9's techniques transfers directly to professional compiler development.
+**Production Ecosystem Standards**. Every major MLIR project relies on TableGen as its source of truth. This includes frontends like TensorFlow (TF dialect) and PyTorch (Torch dialect); interchange standards like StableHLO (used by XLA and JAX); and execution environments like IREE (VM dialect) and Flang (FIR dialect). When you join these projects or integrate with them, understanding TableGen is mandatory—it's the lingua franca of MLIR dialect development. Learning it through our `nn` dialect example prepares you for reading, understanding, and contributing to production codebases. The investment in Chapter 9's techniques transfers directly to professional compiler development.
 
 This chapter walks through TableGen systematically: dialect definition, operation specifications, generated code examination, pattern rewriter implementation, and Python API construction. We'll compare each step with Chapter 8's string approach, clarifying what TableGen automates and why. By the end, you'll write production-quality dialect definitions confidently, understand the generated C++ code thoroughly, and appreciate the engineering principles behind MLIR's design.
 
@@ -80,42 +80,23 @@ def NN_AddOp : NN_Op<"add"> {
 
 This 12-line declaration specifies everything about the operation: its mnemonic (`add`), what operands it takes (three memrefs named `lhs`, `rhs`, `output`), how it appears in MLIR text (the `assemblyFormat`), and what it means (the `description`). From this specification, mlir-tblgen generates approximately 200 lines of C++ code handling construction, parsing, printing, and verification.
 
-**Comparing Architectures**. The shift from implicit to explicit definition has several implications:
-
-| Aspect | Chapter 8 (Strings) | Chapter 9 (TableGen) |
-|--------|---------------------|----------------------|
-| **Definition Location** | Scattered across Python functions | Centralized in .td file |
-| **Operation Syntax** | Whatever string you emit | Declared in `assemblyFormat` |
-| **Type Checking** | At MLIR parse time (runtime) | At C++ compile time |
-| **Error Detection** | When running Python → parsing text | When compiling C++ |
-| **Code Reuse** | Copy-paste Python functions | Inherit patterns, use multiclass |
-| **Documentation** | Separate (if it exists) | Embedded in TableGen definition |
-| **Tooling** | Manual string inspection | mlir-opt, mlir-tblgen, IDE support |
-
-The architectural principle: **separate specification from implementation**. TableGen describes **what** operations are; generated C++ implements **how** they work. This separation enables:
+**The TableGen Advantage**. TableGen's declarative approach provides several benefits:
 
 1. **Single Source of Truth**: The .td file is the authoritative definition. Generated code, documentation, and tools all derive from it consistently.
 
-2. **Verification at Appropriate Levels**: Structural constraints (number of operands, type categories) verified at C++ compile time. Semantic constraints (shape compatibility, value ranges) verified at IR construction time. No runtime text parsing unless loading external MLIR.
+2. **Verification at Appropriate Levels**: Structural constraints (number of operands, type categories) verified at C++ compile time. Semantic constraints (shape compatibility, value ranges) verified at IR construction time.
 
 3. **Incremental Development**: Add operations by writing small TableGen records, not implementing full parsing/printing/verification manually. The pattern scales: first operation takes learning time, subsequent operations are fast.
 
-4. **Professional Ecosystem Integration**: Your dialect works with mlir-opt (pass testing), mlir-translate (format conversion), IDE plugins (syntax highlighting, autocomplete), and documentation generators. All these tools understand TableGen-generated operations automatically.
-
-**What Doesn't Change**. Despite the architectural shift, core concepts from Chapter 8 remain:
-
-- **Semantic Meaning**: `nn.add` still performs element-wise addition. TableGen changes how we define it, not what it does.
-- **Lowering Logic**: We still convert `nn.add` to `linalg.generic` with `arith.addf`. The transformation happens in C++ pattern rewriters instead of Python string manipulation, but the target IR is identical.
-- **Compilation Pipeline**: MLIR text (whether generated by Python or OpBuilder) goes through the same passes: NN→Linalg→Loops→LLVM. TableGen affects the front end (IR construction), not the optimization pipeline.
-- **Multi-Level IR Philosophy**: High-level `nn` operations lower to mid-level Linalg, then low-level loops, then LLVM. TableGen makes this pattern easier to implement correctly, but the abstraction layering is the same.
+4. **Professional Ecosystem Integration**: Your dialect works with mlir-opt (pass testing), mlir-translate (format conversion), IDE plugins (syntax highlighting, autocomplete), and documentation generators automatically.
 
 **The Learning Investment**. Understanding TableGen requires learning a new syntax and thinking declaratively rather than imperatively. Instead of "write code to generate strings representing operations," you think "declare what operations look like and let the generator produce implementation code." This shift feels awkward initially—experienced programmers want to control implementation details. But TableGen's constraints (limited expressiveness, rigid structure) are features, not bugs. They force consistency, prevent clever hacks, and ensure generated code follows MLIR best practices. Trust the generator; specify declaratively.
 
-We'll explore TableGen syntax systematically in the next sections, starting with the dialect definition file, then examining operation records in detail, and finally looking at the generated C++ code to understand what TableGen produces. Each section compares with Chapter 8's approach, showing what automation replaces and what flexibility remains.
+We'll explore TableGen syntax systematically in the next sections, starting with the dialect definition file, then examining operation records in detail, and finally looking at the generated C++ code to understand what TableGen produces.
 
 ## 9.3 TableGen Basics: Dialect Definition
 
-TableGen files (`.td` extension) use a record-based syntax where you define **records** (like classes or structs) with **fields** (properties) that the code generator reads. MLIR's TableGen provides base records for common patterns: `Dialect` for dialect definitions, `Op` for operations, `Type` for custom types, `Attr` for attributes. You define specific records by inheriting from these bases and filling in fields. Let's start with the dialect definition in [inc/NNDialect.td](../ch.9.TableGen-dialect/inc/NNDialect.td), understanding each piece.
+TableGen files (`.td` extension) use a record-based syntax where you define **records**—instances of structured data, analogous to classes or structs—with **fields** (properties) that the code generator reads. MLIR's TableGen provides base records for common patterns: `Dialect` for dialect definitions, `Op` for operations, `Type` for custom types, `Attr` for attributes. You define specific records by inheriting from these bases and filling in fields. Let's start with the dialect definition in [inc/NNDialect.td](../ch.9.TableGen-dialect/inc/NNDialect.td), understanding each piece.
 
 **File Structure and Includes**. TableGen files begin with includes bringing in base definitions:
 
@@ -161,7 +142,7 @@ Let's examine each field:
 
 **`let useDefaultAttributePrinterParser = 0;`** - Disables automatic generation of attribute printing/parsing code. For simple dialects without custom attributes, we can skip this complexity. If your dialect has custom attributes (e.g., neural network configuration like `#nn.conv_config<stride=2>`), you'd enable this and implement printing/parsing methods manually.
 
-**`let useDefaultTypePrinterParser = 0;`** - Similarly disables custom type printing/parsing. Our `nn` dialect uses only standard MLIR types (`memref`, `tensor`), so we don't need custom type syntax. Production dialects often define types (e.g., TensorFlow's `!tf.string`, PyTorch's `!torch.vtensor`), requiring custom parsing logic.
+**`let useDefaultTypePrinterParser = 0;`** - Disables automatic generation of custom type printing/parsing hooks. Our `nn` dialect exclusively reuses types from the Builtin, MemRef, and Tensor dialects (`memref<4xf32>`, `tensor<2x3xf32>`), so we don't define any types of our own. Production dialects often introduce domain-specific types—TensorFlow's `!tf.string` and `!tf.control`, PyTorch's `!torch.vtensor` and `!torch.optional`, StableHLO's `!stablehlo.token`, IREE's `!hal.buffer_view`—which require custom parsing logic to handle their internal structure and attributes.
 
 **Base Operation Definition**. After the dialect, we define a base class for our operations:
 
@@ -215,8 +196,6 @@ The generated dialect class handles:
 - Providing the dialect namespace to the framework
 
 Your hand-written `NNDialect.cpp` includes this generated code and adds any custom initialization logic (none needed for our simple dialect, but complex dialects might register custom types, attributes, or canonicalization patterns here).
-
-**Comparison with Chapter 8**. Chapter 8 had no dialect definition—operations were just strings we generated. There was no central registry, no namespace management, no documentation structure. TableGen formalizes these concepts, making them explicit and enforceable. The dialect definition says "the nn dialect exists, lives in mlir::nn namespace, and provides these operations." This formalization enables tool support: IDEs can autocomplete `nn.`, documentation generators can list all operations, and the compiler can verify you're only using defined operations.
 
 This dialect foundation supports all operation definitions we'll write next. The `NN_Op` base class provides a consistent starting point for `AddOp`, `MatMulOp`, `ReLUOp`, and others, ensuring they share common infrastructure while customizing their specific semantics. Before diving into specific operations, let's understand TableGen's core syntax—the language constructs you'll use to write all dialect definitions.
 
@@ -294,9 +273,7 @@ let description = [{
   It's similar to numpy's `+` operator.
   
   Example:
-  ```mlir
-  nn.add %a, %b, %out : memref<4xf32>, memref<4xf32>, memref<4xf32>
-  ```
+      nn.add %a, %b, %out : memref<4xf32>, memref<4xf32>, memref<4xf32>
 }];
 ```
 
@@ -378,7 +355,7 @@ def NN_AddOp : NN_Op<"add"> {
 
 The `[{...}]` syntax for multi-line strings is TableGen-specific. Inside these delimiters, you can write multi-paragraph text with embedded code blocks, markdown formatting, and examples. The code example showing `nn.add %lhs, %rhs, %output : ...` demonstrates the operation's syntax, providing a template for users. When writing descriptions, include typical use cases, constraints (e.g., "shapes must match"), and semantic details (e.g., "uses IEEE 754 addition").
 
-**Arguments Specification**. The `let arguments = (ins AnyMemRef:$lhs, AnyMemRef:$rhs, AnyMemRef:$output);` line defines the operation's operands. This uses TableGen's `dag` (directed acyclic graph) syntax, which looks like function call syntax but represents structured data. The breakdown:
+**Arguments Specification**. The `let arguments = (ins AnyMemRef:$lhs, AnyMemRef:$rhs, AnyMemRef:$output);` line defines the operation's operands. This uses TableGen's `DAG` syntax, which looks like function call syntax but represents structured data. The breakdown:
 
 - **`ins`** - Keyword indicating these are input operands (as opposed to attributes, which use `attr`).
 - **`AnyMemRef`** - A type constraint from MLIR's OpBase.td. This constraint accepts any memref type (`memref<4xf32>`, `memref<2x3xi32>`, etc.) but rejects other types (tensors, integers, etc.). Type constraints enable compile-time verification: if you try to pass a `tensor<4xf32>` to an operation expecting `AnyMemRef`, C++ compilation fails with a clear error.
@@ -401,8 +378,6 @@ Each element in the format string has specific meaning:
 - **`type($lhs)`, `type($rhs)`, `type($output)`** - Print the type of each operand. This produces output like `memref<4xf32>, memref<4xf32>, memref<4xf32>`.
 
 The generated parser reads text matching this pattern and constructs an `AddOp` instance. The generated printer writes text in this format. This bidirectional generation is powerful: one format specification ensures parsing and printing are consistent (no "I print X but parse Y" bugs).
-
-**Comparison with Chapter 8**. In Chapter 8, our add operation had no formal definition—it was just whatever text the Python `lower_add()` function emitted. There was no syntax specification, no type constraints, no parser. You couldn't write `nn.add` in MLIR text and parse it; you could only generate lowered linalg operations. With TableGen, `nn.add` is a first-class MLIR operation: you can write it in .mlir files, parse it with mlir-opt, optimize it with passes, and lower it with rewrite patterns. The operation exists independently of its lowering.
 
 **Generated C++ Class**. From this 10-line TableGen definition, mlir-tblgen generates approximately 200 lines of C++ in `NNOps.h.inc` and `NNOps.cpp.inc`. The generated `AddOp` class includes:
 
@@ -441,25 +416,7 @@ public:
 
 We'll examine this generated code in detail in the next section. For now, understand that the TableGen definition—10 lines of declarative specification—produces all boilerplate code needed for a fully functional MLIR operation. You don't write parsers, you don't write printers, you don't write accessor methods. You declare **what** the operation is, TableGen generates **how** it works.
 
-**Additional Type Constraints**. Our add operation uses `AnyMemRef`, accepting any memref type. More specific constraints are available:
-
-- **`F32MemRef`** - Only memrefs with f32 elements
-- **`MemRefOf<[F32, F64]>`** - Memrefs with either f32 or f64 elements
-- **`1DTensorOf<[F32]>`** - One-dimensional f32 tensors
-- **`AnyTypeOf<[AnyMemRef, AnyTensor]>`** - Either memref or tensor
-
-These constraints combine with verification logic to enforce semantic correctness. For an operation requiring matching shapes (like element-wise add), you'd implement a custom verifier checking that `lhs`, `rhs`, and `output` have identical shapes. TableGen's type constraints handle structural checks (is this a memref?), custom verifiers handle semantic checks (do shapes match?).
-
-**Operation Traits**. Operations can specify traits affecting code generation and optimization. Common traits include:
-
-- **`Pure`** - Operation has no side effects, can be eliminated if result unused
-- **`Commutative`** - Operands can be reordered (e.g., `a + b == b + a`)
-- **`SameOperandsAndResultType`** - All operands and results share the same type
-- **`AttrSizedOperandSegments`** - Variable number of operands with attributes controlling counts
-
-Traits are specified in the operation definition's base class: `NN_Op<"add", [Pure, Commutative]>`. For our add operation, we could specify `Commutative` (addition is commutative), but we haven't because the out-parameter pattern (`%output` is third operand) breaks commutativity in the typical sense. Trait specification requires understanding MLIR's optimization framework deeply—when in doubt, omit traits and add them when needed for specific optimizations.
-
-This operation definition pattern—`def` record, documentation, arguments, assembly format—repeats for every operation in the dialect. Let's examine the matmul operation next to see how it handles different operand types and more complex constraints.
+This operation definition pattern—`def` record, documentation, arguments, assembly format—repeats for every operation in the dialect.
 
 ## 9.5 Matrix Multiplication: Handling Complex Operations
 
@@ -471,7 +428,7 @@ The `matmul` operation demonstrates how TableGen handles operations with richer 
 def NN_MatMulOp : NN_Op<"matmul"> {
   let summary = "matrix multiplication";
   let description = [{
-    Performs matrix multiplication: `C = A \u00d7 B`
+    Performs matrix multiplication: `C = A @ B`
 
     Supports 2D matrices with compatible shapes:
     - A: [M, K]
@@ -606,7 +563,7 @@ def NN_LinearOp : NN_Op<"linear", [Pure]> {
   let summary = "Linear layer (fully connected)";
   let description = [{
     Performs a linear transformation with optional bias:
-    `output = input \u00d7 weight^T + bias`
+    `output = input @ weight^T + bias`
 
     Arguments:
     - input: [batch_size, in_features]
@@ -752,7 +709,7 @@ static void build(OpBuilder &builder, OperationState &state,
 }
 ```
 
-This builder takes all operands explicitly. You use it as:
+This `OpBuilder` parameter is the same builder we've used throughout earlier chapters—MLIR's standard IR construction API. It takes all operands explicitly. You use it as:
 
 ```cpp
 builder.create<AddOp>(loc, lhs, rhs, output);
@@ -878,40 +835,12 @@ Builders are optional. If omitted, the default builder works fine. Add them when
 
 TableGen defines structure. Generated code implements structure. Your code uses structure. Builders sit in layer 2 but are used in layer 3—they bridge specification and usage.
 
-### 9.6.2 File Organization: The Standard MLIR Pattern
+### 9.6.2 File Organization and Build Process
 
-MLIR dialects follow a consistent file organization pattern that separates declaration, generation, and implementation. Understanding this pattern helps you navigate any MLIR codebase, from our tutorial dialect to production systems like Torch-MLIR.
+MLIR dialects follow a standard three-layer structure separating specification, generation, and implementation:
 
-**The Three-File Core**:
-
-```
-┌────────────────────────────────────────────────────────────┐
-│ 1. Ops.td (TableGen source)                                │
-│    → DECLARE operations, types, attributes                 │
-│    → Specify structure, syntax, traits                     │
-│    Location: inc/NNOps.td                                  │
-└──────────────────────┬─────────────────────────────────────┘
-                       ↓ mlir-tblgen (build step)
-┌────────────────────────────────────────────────────────────┐
-│ 2. Ops.h.inc + Ops.cpp.inc (Generated C++)                 │
-│    → Operation classes                                     │
-│    → Generated builders, accessors, parsers                │
-│    Location: build/ch.9.TableGen-dialect/inc/NNOps.*.inc   │
-└──────────────────────┬─────────────────────────────────────┘
-                       ↓ you implement
-┌────────────────────────────────────────────────────────────┐
-│ 3. Dialect.cpp (Hand-written C++)                          │
-│    → Custom verification logic                             │
-│    → Complex builder implementations                       │
-│    → Dialect registration                                  │
-│    Location: src/NNDialect.cpp, src/NNOps.cpp              │
-└────────────────────────────────────────────────────────────┘
-```
-
-**File 1: Ops.td - The Contract**. This is your source of truth. Everything about operations is declared here:
-
+**1. TableGen Source (.td files)**: The authoritative specification in `inc/NNOps.td`:
 ```tablegen
-// inc/NNOps.td
 def NN_AddOp : NN_Op<"add"> {
   let summary = "element-wise addition";
   let arguments = (ins AnyMemRef:$lhs, AnyMemRef:$rhs, AnyMemRef:$output);
@@ -919,72 +848,20 @@ def NN_AddOp : NN_Op<"add"> {
 }
 ```
 
-Purpose: Define what operations exist and their structure. No implementation—just specification.
+**2. Generated Code (.inc files)**: CMake runs `mlir-tblgen` during build to generate ~200 lines of C++ per operation in `build/.../NNOps.h.inc` and `NNOps.cpp.inc`—operation classes, accessors, builders, parsers, and printers. Never edit these files manually.
 
-**File 2: Ops.*.inc - Generated Boilerplate**. During the build, CMake runs mlir-tblgen to generate C++ from TableGen:
-
-```cmake
-mlir_tablegen(NNOps.h.inc -gen-op-decls)      # Generate declarations
-mlir_tablegen(NNOps.cpp.inc -gen-op-defs)     # Generate implementations
-```
-
-These `.inc` files contain ~200 lines of C++ per operation: class declarations, accessor methods, default builders, parsers, printers, and basic verification. You never edit these files manually—they're regenerated on every build.
-
-**File 3: Dialect.cpp - Custom Logic**. You write this file to add behavior that can't be auto-generated:
-
+**3. Hand-Written Implementation (.cpp files)**: Custom logic in `src/NNOps.cpp` for semantics TableGen can't express:
 ```cpp
-// src/NNOps.cpp
 LogicalResult AddOp::verify() {
-  // Custom semantic verification
   auto lhsType = getLhs().getType().cast<MemRefType>();
   auto rhsType = getRhs().getType().cast<MemRefType>();
-  
   if (lhsType.getShape() != rhsType.getShape())
     return emitOpError("operand shapes must match");
-  
   return success();
 }
 ```
 
-Purpose: Implement semantics TableGen can't express—shape checking, attribute validation, complex builder logic.
-
-**Additional Files in Production**:
-
-```
-MyDialect/
-├── IR/                          # Core definitions
-│   ├── MyDialect.td            # Dialect definition
-│   ├── MyOps.td                # Operation definitions
-│   ├── MyDialect.cpp           # Dialect implementation
-│   └── MyOps.cpp               # Operation implementations
-│
-├── Transforms/                  # Optimization passes
-│   ├── Canonicalize.cpp        # Canonicalization patterns
-│   └── MyPass.cpp              # Custom transformation passes
-│
-└── Conversion/                  # Lowering to other dialects
-    └── MyToStandard.cpp        # Lower to standard MLIR
-```
-
-Our ch.9.TableGen-dialect follows this pattern: `inc/` has `.td` files, `src/` has `.cpp` implementations, `build/` has generated `.inc` files.
-
-**Why This Separation?** It provides clear separation of concerns:
-
-1. **Ops.td**: High-level specification (easy to read, concise)
-2. **Generated .inc**: Mechanical boilerplate (perfect consistency)
-3. **Dialect.cpp**: Complex semantics (flexible, testable)
-
-Changes to operation signatures (in .td) automatically propagate to all generated code. You focus on semantics (verification, lowering, optimization), not boilerplate (accessors, parsers, builders).
-
-**Navigating MLIR Codebases**. When exploring production MLIR projects:
-
-1. Start with `.td` files to understand operation structure
-2. Check `.cpp` files for custom verification and lowering
-3. Ignore `.inc` files (generated code, not for human reading)
-
-This pattern is universal: TensorFlow's TF dialect, PyTorch's Torch dialect, Flang's FIR dialect—all follow it. Learn it once, navigate any MLIR project confidently.
-
-Let's see how we use these generated classes to implement lowering passes.
+**Why This Matters**: Changes to .td files automatically propagate to all generated code. You focus on semantics (verification, lowering), not boilerplate (accessors, parsers). When exploring production MLIR projects (TensorFlow, PyTorch, Flang), start with .td files for operation structure, check .cpp for custom logic, and skip .inc files (generated code).
 
 ## 9.7 C++ Pattern Rewriters: Implementing Lowering
 
@@ -1087,16 +964,6 @@ rewriter.inlineRegionBefore(region, insertPoint);
 
 The rewriter tracks all changes, enabling rollback if verification fails. Use it for all IR modifications in patterns—never modify IR directly.
 
-**Why This Infrastructure?** Manual IR transformation is error-prone: you must update uses, maintain SSA form, handle control flow correctly. The pattern framework automates:
-
-- **Worklist management**: Revisit operations when operands change
-- **Use-def updates**: Automatically redirect uses when replacing operations
-- **Verification**: Check IR validity after each transformation
-- **Rollback**: Undo changes if verification fails
-- **Fixed-point iteration**: Apply patterns until convergence
-
-You focus on transformation logic; the framework handles infrastructure.
-
 ### 9.7.2 The OpInterface System: Polymorphism for IR
 
 The pattern rewriting we've seen uses `OpRewritePattern<AddOp>` to match specific operations. But notice something: `OpRewritePattern<T>` itself is a form of **interface**—it declares "any operation that wants custom lowering must implement `matchAndRewrite()`." MLIR generalizes this concept through its **interface system**, enabling polymorphism across operations and dialects. Understanding interfaces is crucial because many MLIR features—including the pattern system we just used—rely on them.
@@ -1117,11 +984,7 @@ void inferShapes(Operation *op) {
 }
 ```
 
-**Problems**:
-- Not extensible: adding operations requires modifying the pass
-- Doesn't work across dialects: hardcoded to NN dialect
-- Duplicated code: many operations have identical logic
-- Tight coupling: pass must know every specific operation
+This approach fails on multiple fronts: it's not extensible (adding operations requires modifying the pass), doesn't work across dialects (hardcoded to NN dialect), contains duplicated code for similar operations, and creates tight coupling between the pass and specific operation types.
 
 **The Interface Solution**. With interfaces:
 
@@ -1133,7 +996,7 @@ void inferShapes(Operation *op) {
 }
 ```
 
-The interface provides **polymorphism**: different operations implement the same method differently, but the pass treats them uniformly.
+The interface provides **polymorphism**: different operations implement the same method differently, but the pass treats them uniformly. Note: `dyn_cast` is LLVM's type-casting utility that returns null on failure (unlike C++'s `dynamic_cast` which throws exceptions), making it safer and more efficient for compiler code that frequently tests types.
 
 **Interfaces vs. Traits**. Recall traits from Chapter 9's operation definitions (like `Pure`). How do interfaces differ?
 
@@ -1162,13 +1025,7 @@ You're implementing the **RewritePattern interface**. The framework calls your `
 
 Each enables generic algorithms working across operations and dialects. Passes use interfaces to remain dialect-agnostic.
 
-**When to Use Interfaces**. Create interfaces when:
-
-- Multiple operations need the same capability (shape inference, auto-differentiation)
-- You want generic passes working across dialects
-- Operations need polymorphic behavior (dynamic dispatch based on operation type)
-
-Don't create interfaces for operation-specific behavior—use regular methods. Interfaces are for **shared contracts** across multiple operations.
+**When to Use Interfaces**. Create interfaces when multiple operations need the same capability (like shape inference or auto-differentiation), you want generic passes working across dialects, or operations need polymorphic behavior with dynamic dispatch based on operation type. Don't create interfaces for operation-specific behavior—use regular methods instead. Interfaces are for **shared contracts** across multiple operations.
 
 The next subsection shows how to define custom interfaces in TableGen, but understanding that `OpRewritePattern` itself uses interfaces helps explain why MLIR's pattern system is so flexible. Let's continue with lowering patterns, then we'll return to custom interfaces in section 9.8.5.
 
@@ -1208,7 +1065,7 @@ LogicalResult matchAndRewrite(AddOp op, PatternRewriter &rewriter) const overrid
       outputType.getRank(),
       utils::IteratorType::parallel);
 
-  rewriter.create<linalg::GenericOp>(
+rewriter.create<linalg::GenericOp>(
       loc, 
       ValueRange{op.getLhs(), op.getRhs()},  // inputs
       ValueRange{op.getOutput()},             // outputs
@@ -1242,6 +1099,8 @@ LogicalResult matchAndRewrite(AddOp op, PatternRewriter &rewriter) const overrid
    - **Iterator Types**: Our parallel iterator vector
    - **Body Builder Lambda**: A C++ lambda constructing the region body
 
+  Note: We use `SmallVector` (LLVM's optimized vector container) instead of `std::vector` because it stores small arrays inline without heap allocation, improving performance for the common case where vectors contain few elements—critical in compiler code that creates millions of temporary vectors.
+
 4. **Body Construction**: The lambda receives an `OpBuilder` (for building IR inside the region) and `ValueRange args` (scalar arguments extracted from input/output memrefs). We create `arith.addf %arg0, %arg1` and yield the result.
 
 5. **Erase Original**: `rewriter.eraseOp(op)` removes the `nn.add` operation from IR. The rewriter tracks this replacement, updating all uses of the operation automatically.
@@ -1258,13 +1117,7 @@ Chapter 9's C++ lowering builds IR directly using OpBuilder:
 rewriter.create<linalg::GenericOp>(loc, inputs, outputs, maps, iterators, bodyBuilder);
 ```
 
-The C++ approach:
-- Type-checks arguments at compile time
-- Verifies operations as they're built
-- Integrates with the pattern rewriting framework
-- Handles value mapping and operation replacement automatically
-
-No string formatting, no parse-time errors, no debugging text generation code. You build IR using typed C++ APIs.
+The C++ approach type-checks arguments at compile time, verifies operations as they're built, integrates with the pattern rewriting framework, and handles value mapping and operation replacement automatically. No string formatting, no parse-time errors, no debugging text generation code—you build IR using typed C++ APIs.
 
 **Matrix Multiplication Lowering**:
 
@@ -1383,9 +1236,9 @@ This C++ pattern rewriting approach—type-safe, composable, integrated with MLI
 
 ### 9.7.5 TypeConverter: Managing Type Transformations in Dialect Lowering
 
-The pattern rewriters we've implemented (Add, MatMul, ReLU) share a subtle assumption: **input and output types remain unchanged during lowering**. An `nn.add` operating on `memref<128x128xf32>` lowers to `linalg.generic` operating on the same memref type. But many real-world dialect lowerings require **type conversions**—transforming not just operations but the types they work with. This section explores MLIR's `TypeConverter` mechanism, explaining how to handle type changes systematically during dialect lowering.
+The pattern rewriters we've implemented (Add, MatMul, ReLU) share a subtle assumption: **input and output types remain unchanged during lowering**. An `nn.add` operating on `memref<128x128xf32>` lowers to `linalg.generic` operating on the same memref type. But many real-world dialect lowerings require **type conversions**—transforming not just operations but the types they work with. A prime example is **bufferization** (covered in Chapter 4), which converts immutable tensor types to mutable memref types, fundamentally changing how data is represented in memory. This section explores MLIR's `TypeConverter` mechanism, showing how to handle such type changes systematically during dialect lowering.
 
-**When Type Conversion Matters**. Consider lowering from high-level tensor types to low-level memref types (a common pattern):
+**When Type Conversion Matters**. Consider lowering from high-level tensor types to low-level memref types:
 
 ```mlir
 // High-level: tensor dialect (immutable, value semantics)
@@ -1634,23 +1487,9 @@ if (!getTypeConverter()->isLegal(type)) {
 module.dump();  // See where materializations were inserted
 ```
 
-Common errors:
-- **Missing conversion rule**: TypeConverter returns `Type()` (nullptr), causing conversion failure
-- **Unconverted operand**: Pattern uses original operands instead of `adaptor.getOperands()`
-- **Mismatched materialization**: Target materialization doesn't match source materialization (type system inconsistency)
+Common errors include missing conversion rules (TypeConverter returns null), using original operands instead of `adaptor.getOperands()`, and mismatched materializations causing type system inconsistencies.
 
-**Summary**. TypeConverter is MLIR's systematic answer to type transformations:
-
-- **Declare conversion rules** via `addConversion()` lambdas
-- **Use OpConversionPattern** instead of OpRewritePattern when types change
-- **Access converted operands** via `OpAdaptor` (framework-provided)
-- **Define materializations** for type boundaries (tensor↔memref bridges)
-- **Choose full vs partial conversion** based on whether illegal ops can coexist
-- **Convert function signatures** using `SignatureConversion` and `convertRegionTypes()`
-
-For simple dialect lowering (like Chapter 9's `nn` to Linalg), TypeConverter isn't needed—types stay consistent. But for production compilers with multiple lowering stages (HLO → Linalg → Affine → SCF → CF → LLVM), each stage involves type conversions. TypeConverter makes these conversions composable and maintainable. Understanding it now prepares you for advanced MLIR usage in Chapters 14-16 and real-world compiler development.
-
-Let's examine how Python code uses these C++ components to provide a clean user API.
+TypeConverter handles type transformations systematically through conversion rules, OpConversionPattern for type-changing lowerings, and materializations for type boundaries. For simple dialect lowering like our `nn` to Linalg, TypeConverter isn't needed since types stay consistent. But production compilers with multiple lowering stages (HLO → Linalg → Affine → SCF → LLVM) rely on TypeConverter to make type conversions composable and maintainable across stages.
 
 ## 9.8 OpBuilder and Python Integration
 
@@ -1728,13 +1567,7 @@ py::array_t<float> forward(const Tensor& output_tensor) {
     valueMap[id] = entryBlock->getArgument(i);
   }
   
-  // Build operations using OpBuilder
-  // Note: graph.nodes must be in topological order—each operation's inputs
-  // must be computed before the operation itself. This ordering (where
-  // dependencies precede dependents) is fundamental to compiler IR construction
-  // and execution. We'll explore topological traversal algorithms in depth in
-  // Chapter 10, Section 10.8, showing how to sort arbitrary computation graphs
-  // into valid execution order. For now, assume the graph is already sorted.
+  // Build operations in topological order
   for (auto& node : graph.nodes) {
     Value lhs = valueMap[node.inputs[0]];
     Value rhs = valueMap[node.inputs[1]];
@@ -1765,16 +1598,7 @@ py::array_t<float> forward(const Tensor& output_tensor) {
 }
 ```
 
-**Key Differences from Chapter 8**:
-
-| Aspect | Chapter 8 | Chapter 9 |
-|--------|-----------|-----------|
-| **IR Generation** | Python strings | C++ OpBuilder |
-| **Operations** | Text patterns | TableGen-generated classes |
-| **Type Checking** | At parse time | At build time |
-| **Error Location** | When parsing MLIR text | When calling `create<AddOp>()` |
-| **IDE Support** | None (strings) | Full (C++ APIs) |
-| **Integration** | Text → Parser | Direct IR construction |
+**Topological Ordering Requirement**. The code above assumes `graph.nodes` is in topological order, meaning each operation's inputs are computed before the operation itself. This dependency ordering is fundamental to IR construction—you can't use a value before it's defined. Chapter 10 covers topological traversal algorithms in depth, showing how to sort arbitrary computation graphs into valid execution order.
 
 **OpBuilder Methods**. Key OpBuilder APIs:
 
@@ -1809,13 +1633,7 @@ py::def("forward", &forward);
 
 Python's `a + b` calls `Tensor.__add__()`, which calls the C++ `add()` method, which records an add node. This provides PyTorch-like syntax while building MLIR IR underneath.
 
-**Comparison with Production Systems**. Our simplified implementation demonstrates patterns used in:
-
-- **Torch-MLIR**: PyTorch operations become Torch dialect operations via OpBuilder
-- **JAX**: JAX arrays lower to StableHLO operations using C++ builders
-- **IREE**: Python VM model definitions compile to IREE VM dialect via bindings
-
-The pattern is universal: Python for user APIs and dynamic behavior, C++ for IR construction and optimization, pybind11 for integration. Our Chapter 9 implementation, while pedagogical, follows these production patterns faithfully.
+The pattern is universal: Python for user APIs and dynamic behavior, C++ for IR construction and optimization, pybind11 for integration. Our Chapter 9 implementation, while pedagogical, follows real production patterns faithfully.
 
 This architecture—TableGen-defined operations, C++ pattern rewriters, OpBuilder-based Python API—represents industrial MLIR dialect development. It's more complex than Chapter 8's string approach, but it scales to thousands of operations, enables sophisticated optimizations, and integrates with the broader MLIR ecosystem.
 
@@ -1946,14 +1764,7 @@ void MyPass::runOnOperation() {
 
 The `dyn_cast<ShapeInference>(op)` checks if `op` implements the interface. If yes, returns a handle to the interface; if no, returns `nullptr`. This works across **any dialect**—the pass doesn't know about specific operations, only the interface contract.
 
-**Why Interfaces Matter**. Interfaces enable:
-
-1. **Extensibility**: New operations integrate by implementing interfaces; passes need no modification
-2. **Dialect Independence**: Passes work on any dialect implementing the interface
-3. **Code Reuse**: One shape inference pass instead of N operation-specific implementations
-4. **Loose Coupling**: Passes depend on contracts (interfaces), not implementations (specific operations)
-
-**Chapter 14's Advanced Interfaces**. This introduction covers interface basics—defining, implementing, using. Chapter 14 explores advanced patterns: multiple interfaces per operation, interface inheritance, type and attribute interfaces (not just operation interfaces), and custom interfaces for optimization passes. For Chapter 9, understanding that interfaces provide polymorphism suffices; production compilers use them extensively for extensible infrastructure.
+Interfaces enable extensibility (new operations integrate without modifying passes), dialect independence (passes work on any dialect implementing the interface), and code reuse (one shape inference pass instead of N operation-specific implementations). Chapter 14 explores advanced patterns including multiple interfaces per operation, interface inheritance, and type/attribute interfaces.
 
 ### 9.8.6 Advanced TableGen Features for Production Dialects
 
@@ -1981,20 +1792,8 @@ def FoldAddZero : Pat<
 
 These TableGen patterns generate C++ code automatically—the same `OpRewritePattern` classes we wrote manually in section 9.7, but generated from concise declarative specifications.
 
-**Why Defer to Chapter 14?** DRR is primarily an **optimization tool**, not a lowering tool:
-
-- **Chapter 9 focus**: Dialect definition, lowering patterns (high-level → low-level transformations)
-- **Chapter 14 focus**: Production optimizations, canonicalization, algebraic simplification (same-level transformations)
-
+**Why Defer to Chapter 14?** DRR is primarily an **optimization tool**, not a lowering tool.
 DRR shines for patterns like "remove redundant operations," "fold constants," "simplify expressions"—optimizations that don't change abstraction levels. Chapter 9's lowering patterns (transforming `nn.add` to `linalg.generic`) require C++ flexibility for constructing complex target IR.
-
-**What You Need Now**. Understanding that DRR exists and complements C++ patterns suffices for Chapter 9. When you reach Chapter 14, you'll learn:
-- DRR pattern syntax (matchers, rewriters, constraints)
-- Constraint predicates (type checks, attribute validation)
-- Multi-result patterns (one operation → several operations)
-- Benefit-based pattern selection
-- Integration with canonicalization passes
-
 For now, focus on C++ `OpRewritePattern`—it's the workhorse for dialect lowering and gives you complete control over IR transformation.
 
 #### Trait Composition: Declaring Operation Properties
@@ -2161,15 +1960,7 @@ Generates:
 nn.matmul <false, true> (%A, %B) -> %C : memref<128x256xf32>, memref<256x512xf32> -> memref<128x512xf32>
 ```
 
-Boolean attributes (`transposeA`) appear inline, types are explicit, syntax resembles mathematical notation.
-
-**Why Custom Formats Matter**:
-1. **Debugging**: Readable IR accelerates understanding
-2. **Familiarity**: Match user expectations (mathematical notation for ML ops)
-3. **Compactness**: Reduce visual clutter in IR dumps
-4. **Consistency**: Enforce project-wide IR style
-
-Without custom formats, complex operations become unreadable multi-line messes. With them, IR reads almost like source code.
+Boolean attributes (`transposeA`) appear inline, types are explicit, syntax resembles mathematical notation. Custom formats improve debugging through readable IR, match user expectations (mathematical notation for ML ops), reduce visual clutter, and enforce consistent IR style—transforming complex operations from unreadable multi-line messes into source-code-like clarity.
 
 #### Putting It Together: Production Dialect Checklist
 
@@ -2219,54 +2010,14 @@ This 25-line TableGen spec:
 
 The generated C++ (~500 lines) handles parsing, printing, verification, type inference, and pattern matching—all from declarative specifications.
 
-#### When to Use Advanced Features
-
-- **Starting out (Chapters 8-9)**: Basic TableGen + explicit C++ patterns. Learn fundamentals.
-- **Production dialects (Chapter 14+)**: Add traits for optimization integration, custom formats for readability, DRR for canonicalization.
-- **Research prototypes**: Skip advanced features initially. Add them when complexity justifies automation.
-
-The progression mirrors software engineering: write it manually first (understand the problem), then automate (TableGen, DRR) once patterns emerge.
-
-**Further Learning**:
-- **MLIR ODS Documentation**: [`DefiningDialects/Operations.md`](https://mlir.llvm.org/docs/DefiningDialects/Operations/) - complete TableGen reference
-- **Real Dialects**: Study `mlir/include/mlir/Dialect/*/IR/*.td` files (Linalg, Vector, Tensor) - production examples
-- **Custom Assembly**: [`OpDefinitions.md`](https://mlir.llvm.org/docs/DefiningDialects/Operations/#custom-assembly-format) - assembly format directives
-- **DRR (Chapter 14)**: Declarative rewrite rules for optimization patterns—deferred to Chapter 14 where we explore production optimization infrastructure
-
-**Looking Ahead to Chapter 14**. Just as we forward-referenced advanced interfaces to Chapter 14, we also defer **Declarative Rewrite Rules (DRR)** to that chapter. DRR is TableGen's optimization pattern language—expressing transformations like "fold transpose(transpose(x)) → x" or "remove dead code" declaratively. Chapter 14 shows how DRR integrates with canonicalization passes, trait-based pattern selection, and production optimization pipelines. The C++ `OpRewritePattern` skills from section 9.7 prepare you perfectly—DRR generates the same C++ patterns, but from concise TableGen specifications.
-
-Chapter 10 builds optimization passes using the patterns you've learned here. The trait composition, interface integration, and type constraints from this section directly enable the optimizations there.
-
 ## 9.9 Conclusion: Declarative Specifications for Production
 
-This chapter demonstrated production-quality dialect implementation using TableGen, OpRewritePattern, and OpBuilder. These tools illustrate MLIR's philosophy: make common patterns easy to express correctly. TableGen automates boilerplate, C++ type systems prevent errors, and pattern rewriting provides composable transformations.
+This chapter demonstrated production-quality dialect implementation using TableGen, OpRewritePattern, and OpBuilder—MLIR's approach to making common patterns easy to express correctly.
 
-**Core Concepts Mastered**:
+**Core Concepts**: TableGen's ~10 lines defining AddOp generate ~200 lines of correct C++ (builders, accessors, parsers, printers, verifiers), eliminating maintenance burden. OpRewritePattern provides type-safe lowering through template matching, with the framework handling pattern ordering, value remapping, and rollback. OpBuilder enables direct IR construction with compile-time type checking and IDE autocomplete.
 
-TableGen's declarative operation specifications replace hundreds of lines of handwritten C++ with concise, readable definitions. The ~10 lines defining AddOp generate ~200 lines of correct, idiomatic C++ code—builders, accessors, parsers, printers, and verifiers. This automation eliminates maintenance burden: change the TableGen spec, and generated code updates automatically. Bugs in generated code (rare, as TableGen is well-tested) affect all MLIR dialects identically, not just yours.
+**Production Usage**: Industrial projects use these techniques universally—Torch-MLIR defines 1000+ operations in TableGen, JAX uses StableHLO dialect operations, TensorFlow uses MHLO/CHLO dialects, and IREE's VM/Flow/HAL dialects all rely on TableGen. The pattern is consistent: declarative specifications for operations, generated C++ for classes, OpRewritePattern for transformations, OpBuilder for IR construction.
 
-OpRewritePattern provides type-safe lowering through C++ template matching. Each pattern matches specific operation types, receives typed operation references (not generic `Operation*`), and uses PatternRewriter to construct replacement IR. The framework handles pattern application order, value remapping when operations change, and rollback on verification failures.
+**Chapter 10: Optimization Patterns**. Next, we introduce **Declarative Rewrite Rules (DRR)**, extending TableGen's declarative approach to optimizations. Instead of writing C++ pattern matchers, you'll express transformations directly in TableGen: "if you see pattern X, replace it with pattern Y." This reduces 30-line C++ patterns to 3-line TableGen declarations, making optimizations composable and maintainable.
 
-OpBuilder enables direct IR construction through C++ methods: `builder.create<AddOp>(loc, lhs, rhs, output)`. This approach catches type errors at compile time, provides IDE autocomplete for operation names and argument types, and integrates seamlessly with MLIR's operation verification. The builder tracks insertion points, handles operation placement, and enforces block/region invariants automatically.
-
-**Production Patterns**:
-
-Industrial MLIR projects use these techniques universally. Torch-MLIR defines 1000+ operations in TableGen, generating operation classes, documentation, and Python bindings. JAX uses StableHLO dialect operations defined in ODS (Operation Definition Specification, TableGen's dialect layer). TensorFlow defines MHLO and CHLO dialect operations similarly. IREE's VM dialect, Flow dialect, and HAL dialect all use TableGen.
-
-The pattern is consistent: declarative specifications for operations, generated C++ for operation classes, OpRewritePattern for transformations, OpBuilder for IR construction. Python bindings (via pybind11) provide user-facing APIs, while C++ implements optimization and lowering. This architecture balances Python's ease of use with C++'s performance and type safety.
-
-**Performance Considerations**:
-
-Generated C++ code compiles to efficient machine code. Operation creation is a handful of pointer operations—allocate storage, initialize fields, insert into parent block. Type checking happens once at C++ compile time, not repeatedly at runtime. Pattern matching uses hash tables on operation names, making lookup efficient even with hundreds of patterns.
-
-The compilation overhead (C++ compilation time) amortizes across development: compile once, run many times. For deployment, only the final executable matters—no Python interpreter, no runtime parsing.
-
-**Looking Ahead**:
-
-**Chapter 10: Optimization Patterns**. You now have production-quality dialect definitions using TableGen. But as your models grow, you'll notice repeated patterns in your lowering code—the same transformations applied again and again. Chapter 10 introduces **Declarative Rewrite Rules (DRR)**, which extend TableGen's declarative approach to optimizations. Instead of writing C++ pattern matchers, you'll express transformations in TableGen itself: "if you see pattern X, replace it with pattern Y." This makes optimizations composable, readable, and maintainable. The techniques we've learned (TableGen syntax, pattern matching, OpRewritePattern structure) directly transfer to DRR—you already know most of what you need.
-
-**Why This Matters**. Manual pattern writing becomes tedious at scale. Torch-MLIR has hundreds of patterns; writing each in C++ means thousands of lines of boilerplate. DRR reduces 30-line C++ patterns to 3-line TableGen declarations. Chapter 10 shows how to write these patterns, apply them in passes, and debug when they don't match. You'll also learn about **canonicalization** and **operation interfaces**—advanced features deferred from this chapter that enable dialect-independent optimization.
-
-Chapter 11 explores attention mechanisms, demonstrating complex operations with multiple operands, optional inputs, and stateful computations. TableGen's expressiveness shines here: complex operation signatures that would require hundreds of lines of C++ boilerplate reduce to tens of lines of declarative specifications.
-
-Chapter 12 builds complete transformer models, combining attention, feed-forward networks, and layer normalization into cohesive dialect operations. The composability we've established—TableGen for definitions, OpRewritePattern for lowering, OpBuilder for construction—scales to arbitrarily complex models.
+**Chapter 11-12**: Chapter 11 explores attention mechanisms with complex operation signatures, and Chapter 12 builds complete transformer models. The composability we've established—TableGen for definitions, OpRewritePattern for lowering, OpBuilder for construction—scales to arbitrarily complex models.
