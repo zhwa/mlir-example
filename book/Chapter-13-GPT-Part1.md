@@ -121,102 +121,101 @@ For vocabulary size `V = 50,000` and `d_model = 768`, the embedding table contai
 
 ```tablegen
 // inc/TransformerOps.td
-def Transformer_EmbeddingOp : Transformer_Op<"embedding", [Pure]> {
-  let summary = "Token embedding lookup operation";
+def Transformer_EmbeddingOp : Transformer_Op<"embedding"> {
+  let summary = "Token embedding lookup";
   let description = [{
     Performs embedding lookup for token IDs.
     
-    Given token IDs [seq_len] (int32) and embedding table [vocab_size, d_model],
-    retrieves embedding vectors for each token:
+    For each token ID in the input sequence, retrieves the corresponding
+    embedding vector from the embedding table.
     
-      output[i, :] = embedding_table[token_ids[i], :]
+    Example:
+    ```mlir
+    transformer.embedding %indices, %table, %output
+      : memref<?xi32>, memref<?x?xf32>, memref<?x?xf32>
+    ```
     
-    This is equivalent to one-hot encoding followed by matrix multiplication,
-    but implemented efficiently as direct indexing.
+    Indices shape: [seq_len] (int32)
+    Table shape: [vocab_size, d_model] (float32)
+    Output shape: [seq_len, d_model] (float32)
+    
+    Equivalent to:
+    for i in 0..seq_len:
+      token_id = indices[i]
+      for j in 0..d_model:
+        output[i][j] = table[token_id][j]
   }];
   
-  let arguments = (ins
-    AnyRankedTensor:$token_ids,       // [seq_len], int32
-    AnyRankedTensor:$embedding_table  // [vocab_size, d_model], float32
+  let arguments = (ins 
+    AnyMemRef:$indices,  // Token IDs [seq_len]
+    AnyMemRef:$table,    // Embedding table [vocab_size, d_model]
+    AnyMemRef:$output    // Output embeddings [seq_len, d_model]
   );
   
-  let results = (outs AnyRankedTensor:$output);  // [seq_len, d_model], float32
-  
   let assemblyFormat = [{
-    $token_ids `,` $embedding_table attr-dict `:` 
-    type($token_ids) `,` type($embedding_table) `->` type($output)
+    $indices `,` $table `,` $output
+    attr-dict `:` type($indices) `,` type($table) `,` type($output)
   }];
 }
 ```
 
-The operation takes integer token IDs and the embedding table, returning embedded vectors. Note the type mismatch: input is `int32`, output is `float32`. The operation performs both indexing and implicit type promotion.
+Consistent with Chapter 12's memref-based design, the embedding operation uses out-parameter pattern: the output memref is passed as an argument rather than returned as a result. Input indices are `int32`, table and output are `float32`.
 
-**Lowering to Standard Dialects**. Embedding lookup lowers to nested loops with memory access:
+**Lowering to Standard Dialects**. Embedding lookup lowers to nested SCF loops with memref loads/stores:
 
 ```cpp
-// src/TransformerToStandard.cpp
+// src/TransformerPasses.cpp
 struct EmbeddingOpLowering : public OpRewritePattern<EmbeddingOp> {
   using OpRewritePattern::OpRewritePattern;
   
   LogicalResult matchAndRewrite(EmbeddingOp op, PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
-    Value tokenIds = op.getTokenIds();
-    Value embeddingTable = op.getEmbeddingTable();
+    Value indices = op.getIndices();
+    Value table = op.getTable();
+    Value output = op.getOutput();
     
-    auto tokenIdsType = tokenIds.getType().cast<RankedTensorType>();
-    auto tableType = embeddingTable.getType().cast<RankedTensorType>();
-    auto outputType = op.getOutput().getType().cast<RankedTensorType>();
+    auto indicesType = cast<MemRefType>(indices.getType());
+    auto tableType = cast<MemRefType>(table.getType());
     
-    int64_t seqLen = tokenIdsType.getShape()[0];
-    int64_t vocabSize = tableType.getShape()[0];
+    int64_t seqLen = indicesType.getShape()[0];
     int64_t dModel = tableType.getShape()[1];
     
-    // Allocate output tensor
-    Value output = rewriter.create<tensor::EmptyOp>(
-      loc, outputType.getShape(), rewriter.getF32Type()
-    );
+    Value seqLenVal = createConstantIndex(rewriter, loc, seqLen);
+    Value dModelVal = createConstantIndex(rewriter, loc, dModel);
+    Value zeroIdx = createConstantIndex(rewriter, loc, 0);
+    Value oneIdx = createConstantIndex(rewriter, loc, 1);
     
-    // Generate nested loops: for i in seq_len, for j in d_model
-    AffineMap outputMap = AffineMap::get(2, 0, {
-      rewriter.getAffineDimExpr(0),  // i
-      rewriter.getAffineDimExpr(1)   // j
-    });
-    
-    Value result = rewriter.create<linalg::GenericOp>(
-      loc, outputType, ValueRange{tokenIds, embeddingTable}, ValueRange{output},
-      ArrayRef<AffineMap>{
-        AffineMap::get(2, 0, {rewriter.getAffineDimExpr(0)}),  // token_ids[i]
-        AffineMap::get(2, 0, {rewriter.getAffineDimExpr(0), rewriter.getAffineDimExpr(1)}),  // table[?, :]
-        outputMap  // output[i, j]
-      },
-      ArrayRef<StringRef>{"parallel", "parallel"},
-      [&](OpBuilder &b, Location loc, ValueRange args) {
-        // args[0]: token_ids[i] (int32)
-        // args[1]: embedding_table[?, j] (float32)
-        // output: args[2]
+    // For each position in sequence
+    rewriter.create<scf::ForOp>(
+      loc, zeroIdx, seqLenVal, oneIdx, ValueRange{},
+      [&](OpBuilder &builder, Location loc, Value i, ValueRange iterArgs) {
+        // Load token ID (int32)
+        Value tokenId32 = builder.create<memref::LoadOp>(loc, indices, ValueRange{i});
         
-        // Convert token ID to index
-        Value tokenId = args[0];
-        Value tokenIdIndex = b.create<arith::IndexCastOp>(
-          loc, b.getIndexType(), tokenId
+        // Convert int32 token ID to index type
+        Value tokenIdx = builder.create<arith::IndexCastOp>(
+          loc, builder.getIndexType(), tokenId32
         );
         
-        // Extract embedding: embedding_table[token_id, j]
-        Value embedding = b.create<tensor::ExtractOp>(
-          loc, embeddingTable, ValueRange{tokenIdIndex, args[1]}
-        );
+        // Copy embedding vector from table to output
+        builder.create<scf::ForOp>(
+          loc, zeroIdx, dModelVal, oneIdx, ValueRange{},
+          [&](OpBuilder &builder, Location loc, Value j, ValueRange iterArgs) {
+            Value embVal = builder.create<memref::LoadOp>(loc, table, ValueRange{tokenIdx, j});
+            builder.create<memref::StoreOp>(loc, embVal, output, ValueRange{i, j});
+            builder.create<scf::YieldOp>(loc);
+          });
         
-        b.create<linalg::YieldOp>(loc, embedding);
-      }
-    );
+        builder.create<scf::YieldOp>(loc);
+      });
     
-    rewriter.replaceOp(op, result);
+    rewriter.eraseOp(op);
     return success();
   }
 };
 ```
 
-This lowering generates efficient code: the outer loop iterates over sequence positions, the inner loop over embedding dimensions, and each iteration performs a single memory load from the embedding table. The generated loops are parallel (no dependencies between iterations), enabling vectorization and multi-threading.
+This lowering generates nested SCF loops: the outer loop iterates over sequence positions, the inner loop copies each embedding dimension from the table to output. The implementation uses explicit memref operations (load/store) rather than structured linalg operations, since embedding lookup is random-access (indexed by token ID) rather than strided iteration.
 
 **Implementation Challenges**. Several subtleties arise:
 
@@ -358,31 +357,39 @@ Softmax exponentiates scores: `softmax(x)_i = exp(x_i) / sum(exp(x_j))`. Setting
 
 ```tablegen
 // inc/TransformerOps.td
-def Transformer_MaskedSoftmaxOp : Transformer_Op<"masked_softmax", [Pure]> {
-  let summary = "Softmax with causal mask";
+def Transformer_MaskedSoftmaxOp : Transformer_Op<"masked_softmax"> {
+  let summary = "Softmax with causal mask applied";
   let description = [{
-    Computes softmax with causal masking:
+    Applies softmax along the last dimension with an additive mask.
+    The mask is added to logits before exponential:
     
-      mask[i, j] = 0 if j <= i else -inf
-      masked_input[i, j] = input[i, j] + mask[i, j]
-      output[i, :] = softmax(masked_input[i, :])
+    masked_logits = logits + mask
+    softmax(masked_logits)[i] = exp(masked_logits[i]) / sum(exp(masked_logits))
     
-    The mask prevents position i from attending to positions j > i.
+    For causal attention:
+    - mask[i][j] = 0.0 for allowed positions
+    - mask[i][j] = -inf for masked positions
+    - After softmax, masked positions have probability 0
+    
+    Broadcasting: mask shape [seq_len, seq_len] broadcasts to logits [batch, seq_len, seq_len]
+    
+    Example:
+    ```mlir
+    transformer.masked_softmax %logits, %mask, %output 
+      : memref<2x4x4xf32>, memref<4x4xf32>, memref<2x4x4xf32>
+    ```
   }];
   
-  let arguments = (ins
-    AnyRankedTensor:$input  // [seq_len, seq_len], typically attention scores
-  );
-  
-  let results = (outs AnyRankedTensor:$output);  // [seq_len, seq_len]
+  let arguments = (ins AnyMemRef:$input, AnyMemRef:$mask, AnyMemRef:$output);
   
   let assemblyFormat = [{
-    $input attr-dict `:` type($input) `->` type($output)
+    $input `,` $mask `,` $output
+    attr-dict `:` type($input) `,` type($mask) `,` type($output)
   }];
 }
 ```
 
-This operation combines mask application and softmax into a single primitive, simplifying usage and enabling optimization opportunities (fusing mask application into softmax computation).
+Unlike the conceptual description earlier, the actual operation takes the mask as an explicit parameter. This design separates mask creation (via `create_causal_mask`) from application, allowing flexibility: the same mask can be reused across multiple attention heads or layers.
 
 **Lowering Masked Softmax**. The lowering generates mask on-the-fly rather than storing it:
 
@@ -548,83 +555,52 @@ In production models, these parameters are learned during training. Chapter 13 u
 
 This hierarchical representation emerges during training. The model learns to extract progressively abstract features—lower layers handle "how words combine," upper layers handle "what the text means."
 
-**Implementing the Stack in MLIR**. We define a GPT operation that encapsulates the entire stack:
+**Implementing the Stack - Python API Composition**. Like Chapter 12's `ffn()` and `transformer_block()`, the multi-layer transformer stack is implemented as a **Python API composition function** rather than a dialect operation. This follows the architectural pattern established in Chapter 12: primitive operations in the dialect, higher-level compositions in the bindings.
 
-```tablegen
-// inc/TransformerOps.td
-def Transformer_GPTOp : Transformer_Op<"gpt", [Pure]> {
-  let summary = "Complete GPT forward pass through transformer blocks";
-  let description = [{
-    Processes input through multiple transformer blocks sequentially:
-    
-      x = embeddings
-      for block_weights in all_blocks:
-        x = transformer_block(x, block_weights)
-      return x
-    
-    Each block applies causal self-attention and feedforward network.
-  }];
+```cpp
+// src/bindings.cpp - Multi-layer transformer composition
+Tensor gpt_forward(py::array_t<int32_t> indices,
+                   py::array_t<float> embedding_table,
+                   const std::vector<py::array_t<float>>& all_weights,
+                   py::array_t<float> final_gamma,
+                   py::array_t<float> final_beta) {
+  if (all_weights.size() % 16 != 0) {
+    throw std::runtime_error("Expected 16 weights per layer");
+  }
   
-  let arguments = (ins
-    AnyRankedTensor:$input,          // [seq_len, d_model]
-    Variadic<AnyRankedTensor>:$weights,  // All block weights flattened
-    I64Attr:$num_blocks
-  );
+  int num_layers = all_weights.size() / 16;
   
-  let results = (outs AnyRankedTensor:$output);  // [seq_len, d_model]
+  // Token embeddings
+  Tensor hidden = embedding(indices, embedding_table);
+  
+  // Apply transformer blocks
+  for (int layer = 0; layer < num_layers; layer++) {
+    int base = layer * 16;
+    hidden = gpt_block(
+        hidden,
+        all_weights[base + 0],  all_weights[base + 1],   // Q
+        all_weights[base + 2],  all_weights[base + 3],   // K
+        all_weights[base + 4],  all_weights[base + 5],   // V
+        all_weights[base + 6],  all_weights[base + 7],   // O
+        all_weights[base + 8],  all_weights[base + 9],   // FFN W1
+        all_weights[base + 10], all_weights[base + 11],  // FFN W2
+        all_weights[base + 12], all_weights[base + 13],  // LN1
+        all_weights[base + 14], all_weights[base + 15]   // LN2
+    );
+  }
+  
+  // Final layer norm
+  return layer_norm(hidden, final_gamma, final_beta);
 }
 ```
 
-The operation takes input and all weights as a flat list, with `num_blocks` specifying how many blocks to instantiate. The lowering expands this into explicit block calls.
+**Why Composition Functions Instead of Dialect Operations?** As discussed in Chapter 12, this design offers several advantages:
 
-**Lowering GPT Operation**. The lowering generates a loop over blocks:
+1. **Flexibility**: The Python layer can easily adjust control flow (number of layers, conditional blocks) without modifying the dialect
+2. **Simplicity**: The dialect remains focused on primitive operations that benefit from custom lowering
+3. **Optimization**: MLIR's optimizer sees the expanded graph of primitive operations, enabling cross-operation optimization
 
-```cpp
-struct GPTOpLowering : public OpRewritePattern<GPTOp> {
-  using OpRewritePattern::OpRewritePattern;
-  
-  LogicalResult matchAndRewrite(GPTOp op, PatternRewriter &rewriter) const override {
-    Location loc = op.getLoc();
-    Value input = op.getInput();
-    int64_t numBlocks = op.getNumBlocks();
-    auto weights = op.getWeights();
-    
-    // Process through each transformer block
-    Value current = input;
-    size_t weightIdx = 0;
-    
-    for (int64_t blockIdx = 0; blockIdx < numBlocks; ++blockIdx) {
-      // Extract weights for this block
-      Value ln1_gamma = weights[weightIdx++];
-      Value ln1_beta = weights[weightIdx++];
-      Value attn_wq = weights[weightIdx++];
-      Value attn_wk = weights[weightIdx++];
-      Value attn_wv = weights[weightIdx++];
-      Value attn_wo = weights[weightIdx++];
-      Value ln2_gamma = weights[weightIdx++];
-      Value ln2_beta = weights[weightIdx++];
-      Value ffn_w1 = weights[weightIdx++];
-      Value ffn_b1 = weights[weightIdx++];
-      Value ffn_w2 = weights[weightIdx++];
-      Value ffn_b2 = weights[weightIdx++];
-      
-      // Apply transformer block
-      current = rewriter.create<TransformerBlockOp>(
-        loc, current.getType(), current,
-        ln1_gamma, ln1_beta,
-        attn_wq, attn_wk, attn_wv, attn_wo,
-        ln2_gamma, ln2_beta,
-        ffn_w1, ffn_b1, ffn_w2, ffn_b2
-      );
-    }
-    
-    rewriter.replaceOp(op, current);
-    return success();
-  }
-};
-```
-
-This generates IR with explicit block operations chained sequentially. MLIR's optimization passes can then optimize across blocks (e.g., fusing layer norm from one block with attention from the next).
+The `gpt_forward()` function builds a computation graph by calling primitive operations (`embedding`, `gpt_block`, `layer_norm`), then compiles and executes the entire graph as a single MLIR module.
 
 **Gradient Flow in Deep Stacks**. Why don't gradients vanish in 96-layer GPT-3? Residual connections (Chapter 12.4) provide direct paths for gradients to flow backward:
 
@@ -737,46 +713,48 @@ Each position in the sequence receives a vocabulary-sized logit vector. For trai
 
 Not all models tie weights (GPT-3 uses separate output projection), but it's common and effective for smaller models.
 
-**MLIR Implementation**. We encapsulate the full forward pass:
+**Python API Implementation**. The complete forward pass is exposed through the `gpt_forward()` function:
+
+```python
+# Python usage
+import ch13
+
+# Model parameters
+token_ids = np.array([72, 101, 108, 108, 111], dtype=np.int32)  # "Hello"
+embedding_table = np.random.randn(vocab_size, d_model).astype(np.float32)
+all_weights = [layer_weights for layer in range(num_layers)]  # 16 weights per layer
+final_gamma = np.ones(d_model, dtype=np.float32)
+final_beta = np.zeros(d_model, dtype=np.float32)
+
+# Forward pass
+hidden_states = ch13.forward(
+    ch13.gpt_forward(token_ids, embedding_table, all_weights, final_gamma, final_beta)
+)
+
+# Add output projection for next-token prediction
+logits = ch13.forward(ch13.matmul(hidden_states, ch13.transpose(embedding_table)))
+```
+
+The implementation follows Chapter 12's pattern: `gpt_forward()` is a composition function (not a dialect operation) that builds a computation graph from primitive operations. The graph builder API allows operations to be composed before compilation:
 
 ```cpp
-// bindings.cpp
-py::array_t<float> gpt_forward(
-    py::array_t<int32_t> token_ids,
-    py::array_t<float> embedding_table,
-    py::list block_weights,
-    py::array_t<float> final_gamma,
-    py::array_t<float> final_beta)
-{
-    // Build computation graph
-    GraphBuilder graph;
-    
-    // Stage 1: Embedding lookup
-    auto tokens = graph.input(token_ids);
-    auto embed_table = graph.parameter(embedding_table);
-    auto embeddings = graph.embedding(tokens, embed_table);
-    
-    // Stage 2: Transformer blocks
-    auto hidden = embeddings;
-    for (size_t i = 0; i < block_weights.size(); ++i) {
-        auto block_params = block_weights[i].cast<py::dict>();
-        hidden = graph.transformer_block(hidden, extract_block_params(block_params));
-    }
-    
-    // Stage 3: Final layer norm
-    auto gamma = graph.parameter(final_gamma);
-    auto beta = graph.parameter(final_beta);
-    hidden = graph.layernorm(hidden, gamma, beta);
-    
-    // Stage 4: Output projection (tied embeddings)
-    auto logits = graph.matmul(hidden, graph.transpose(embed_table));
-    
-    // Compile and execute
-    return graph.compile_and_run();
+// Simplified internal flow
+Tensor gpt_forward(...) {
+  // Create computation graph nodes
+  Tensor hidden = embedding(indices, embedding_table);  // Graph node 1
+  
+  for (int layer = 0; layer < num_layers; layer++) {
+    hidden = gpt_block(hidden, layer_weights);  // Graph nodes 2, 3, ...
+  }
+  
+  hidden = layer_norm(hidden, final_gamma, final_beta);  // Final graph node
+  
+  // Graph is compiled when forward() is called
+  return hidden;  // Returns Tensor handle containing the graph
 }
 ```
 
-The Python binding exposes a clean interface—users pass token IDs and parameters, receive logits. All MLIR compilation (graph → IR → LLVM → machine code) happens transparently.
+The `ch13.forward()` call triggers compilation: the computation graph is converted to MLIR IR, lowered to LLVM, and executed. This lazy compilation approach allows building complex graphs without immediate execution overhead.
 
 **Testing End-to-End Forward Pass**. Comprehensive validation:
 

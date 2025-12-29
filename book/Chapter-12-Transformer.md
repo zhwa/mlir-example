@@ -184,7 +184,7 @@ In practice, `gamma` typically initializes to all 1s (identity scale) and `beta`
 
 ```tablegen
 // inc/TransformerOps.td
-def Transformer_LayerNormOp : Transformer_Op<"layernorm", [Pure]> {
+def Transformer_LayerNormOp : Transformer_Op<"layer_norm"> {
   let summary = "Layer normalization operation";
   let description = [{
     Computes layer normalization over the last dimension:
@@ -195,19 +195,19 @@ def Transformer_LayerNormOp : Transformer_Op<"layernorm", [Pure]> {
       output = gamma * normalized + beta
 
     For input shape [seq_len, d_model], computes seq_len independent normalizations.
+    Epsilon (1e-5) is hardcoded in the lowering pattern for numerical stability.
   }];
 
   let arguments = (ins
-    AnyRankedTensor:$input,
-    AnyRankedTensor:$gamma,  // [d_model]
-    AnyRankedTensor:$beta,   // [d_model]
-    F32Attr:$epsilon
+    AnyMemRef:$input,
+    AnyMemRef:$gamma,  // [d_model]
+    AnyMemRef:$beta,   // [d_model]
+    AnyMemRef:$output  // [seq_len, d_model] - out-parameter
   );
 
-  let results = (outs AnyRankedTensor:$output);
-
   let assemblyFormat = [{
-    $input `,` $gamma `,` $beta attr-dict `:` type($input) `->` type($output)
+    $input `,` $gamma `,` $beta `,` $output attr-dict `:` 
+    type($input) `,` type($gamma) `,` type($beta) `,` type($output)
   }];
 }
 ```
@@ -413,6 +413,8 @@ The first linear layer expands dimensionality from `d_model` to `d_ff` (typicall
 
 Modern variants explore different architectures: **Mixture-of-Experts (MoE)** expands `d_ff` dramatically but routes each token to only a subset of parameters, reducing per-token computation while increasing total parameters. **SwiGLU** replaces GELU with a gated linear unit, requiring an expanded intermediate dimension but providing better performance. Chapter 12 implements the standard 4× GELU feedforward, establishing the foundation for exploring variants in future work.
 
+**Implementation Note**: The feedforward network is implemented as a **Python API function** (`ffn`) that composes primitive operations (`linear`, `gelu`) rather than a single dialect operation. This compositional approach enables operation reuse and independent optimization of each component.
+
 **GELU Activation**. The **Gaussian Error Linear Unit** is a smooth approximation of ReLU:
 
 ```
@@ -434,42 +436,38 @@ def gelu_approx(x):
 
 This approximation, proposed in the original GELU paper, provides excellent accuracy while using only multiplication, addition, and tanh (which hardware and libraries optimize heavily). MLIR's Math dialect includes `math.erf` and `math.tanh`, allowing us to choose between exact and approximate implementations.
 
-**Operation Definition**. We define a feedforward operation in the Transformer dialect:
+**Primitive Operations**. Rather than defining a monolithic FFN dialect operation, Chapter 12 provides primitive operations that compose to implement feedforward networks:
 
 ```tablegen
-// inc/TransformerOps.td
-def Transformer_FFNOp : Transformer_Op<"ffn", [Pure]> {
-  let summary = "Feedforward network with GELU activation";
-  let description = [{
-    Applies a two-layer MLP with GELU activation:
+// inc/TransformerOps.td - Individual building blocks
+def Transformer_LinearOp : Transformer_Op<"linear"> {
+  let summary = "Linear transformation with bias";
+  let description = [{ Computes: output = input @ weight^T + bias }];
+  let arguments = (ins AnyMemRef:$input, AnyMemRef:$weight, 
+                       AnyMemRef:$bias, AnyMemRef:$output);
+}
 
-      hidden = input @ W_1 + b_1
-      activated = GELU(hidden)
-      output = activated @ W_2 + b_2
-
-    Typically d_ff = 4 * d_model for the intermediate dimension.
-  }];
-
-  let arguments = (ins
-    AnyRankedTensor:$input,   // [seq_len, d_model]
-    AnyRankedTensor:$w1,      // [d_model, d_ff]
-    AnyRankedTensor:$b1,      // [d_ff]
-    AnyRankedTensor:$w2,      // [d_ff, d_model]
-    AnyRankedTensor:$b2       // [d_model]
-  );
-
-  let results = (outs AnyRankedTensor:$output);  // [seq_len, d_model]
-
-  let assemblyFormat = [{
-    $input `,` $w1 `,` $b1 `,` $w2 `,` $b2 attr-dict `:` 
-    type($input) `->` type($output)
-  }];
+def Transformer_GeluOp : Transformer_Op<"gelu"> {
+  let summary = "Gaussian Error Linear Unit activation";
+  let arguments = (ins AnyMemRef:$input, AnyMemRef:$output);
 }
 ```
 
-The operation encapsulates both linear layers and activation, providing a single high-level primitive for the entire feedforward sub-layer.
+The Python API provides a composite `ffn()` function:
 
-**Lowering to Linalg**. The feedforward network implements a standard two-layer MLP. Chapter 12 provides a higher-level `LinearOp` that encapsulates `input @ weight^T + bias`, which itself lowers to Linalg operations. The complete FFN lowering chain demonstrates MLIR's compositional design:
+```python
+# Python API (bindings.cpp)
+def ffn(input, w1, b1, w2, b2):
+    """Feedforward network: Linear -> GELU -> Linear"""
+    hidden = linear(input, w1, b1)      # [seq_len, d_ff]
+    activated = gelu(hidden)            # [seq_len, d_ff]
+    output = linear(activated, w2, b2)  # [seq_len, d_model]
+    return output
+```
+
+This compositional design enables operation reuse—`LinearOp` is used in both FFN layers and in attention projections.
+
+**Lowering to Linalg**. Each primitive operation lowers independently. The `LinearOp` that encapsulates `input @ weight^T + bias` lowers to Linalg operations. The complete FFN lowering chain demonstrates MLIR's compositional design:
 
 ```cpp
 // src/TransformerPasses.cpp
@@ -478,10 +476,10 @@ struct LinearOpLowering : public OpRewritePattern<LinearOp> {
 
   LogicalResult matchAndRewrite(LinearOp op, PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
-    Value input = op.getInput();   // [seq_len, in_features]
-    Value weight = op.getWeight(); // [out_features, in_features]
-    Value bias = op.getBias();     // [out_features]
-    Value output = op.getOutput(); // [seq_len, out_features]
+    Value input = op.getInput();   // [seq_len, in_features] - memref
+    Value weight = op.getWeight(); // [out_features, in_features] - memref
+    Value bias = op.getBias();     // [out_features] - memref
+    Value output = op.getOutput(); // [seq_len, out_features] - memref (out-parameter)
 
     // Step 1: Transpose weight for matmul compatibility
     // Need (in_features, out_features) for input @ weight
@@ -721,6 +719,8 @@ def transformer_block(x, params):
 
 This structure follows the pre-normalization pattern: normalize before each sub-layer, then add the sub-layer output to the original input via residual connection. The ordering is critical—post-norm (normalizing after residual addition) has different training dynamics and is less stable for deep networks.
 
+**Implementation Details**. The `transformer_block()` function builds a computation graph from primitive operations. During JIT compilation, this graph is traversed to generate MLIR IR, with each Python operation (layer_norm, attention, etc.) emitting corresponding dialect operations. The compilation happens once; subsequent forward passes reuse the compiled code.
+
 **Parameter Dimensions**. For a transformer block with:
 - `d_model = 512` (embedding dimension)
 - `d_ff = 2048` (feedforward expansion, 4× d_model)
@@ -803,51 +803,44 @@ Residuals require that the sub-layer output has the same shape as the input—th
 
 The `+1` term is the identity path—even if `∂sub_layer/∂x` vanishes (gradients become very small), `∂Loss/∂x` remains non-zero due to the residual connection. This prevents the **vanishing gradient problem** that plagued pre-ResNet deep networks. In 100-layer transformers, residuals are essential; without them, gradients would shrink exponentially through layers.
 
-**Putting It All Together**. The complete transformer block operation:
+**Putting It All Together**. The complete transformer block is implemented as a **Python API function** that composes primitive operations:
 
-```tablegen
-// inc/TransformerOps.td
-def Transformer_BlockOp : Transformer_Op<"block", [Pure]> {
-  let summary = "Complete transformer block with pre-norm architecture";
-  let description = [{
-    Applies a full transformer block:
-
-      attn_out = MultiHeadAttention(LayerNorm(x))
+```python
+# Python API (bindings.cpp)
+def transformer_block(input, 
+                      w_q, b_q, w_k, b_k, w_v, b_v, w_o, b_o,  # Attention
+                      ln1_gamma, ln1_beta,                     # LayerNorm 1
+                      w1, b1, w2, b2,                          # FFN
+                      ln2_gamma, ln2_beta):                    # LayerNorm 2
+    """Complete transformer block with pre-normalization.
+    
+    Composes:
+      attn_out = attention(layer_norm(x, ln1_gamma, ln1_beta), ...)
       x = x + attn_out
-      ffn_out = FFN(LayerNorm(x))
+      ffn_out = ffn(layer_norm(x, ln2_gamma, ln2_beta), ...)
       x = x + ffn_out
-
-    Returns the transformed input with same shape.
-  }];
-
-  let arguments = (ins
-    AnyRankedTensor:$input,
-    // Layer norm 1
-    AnyRankedTensor:$ln1_gamma,
-    AnyRankedTensor:$ln1_beta,
-    // Attention weights
-    AnyRankedTensor:$attn_wq,
-    AnyRankedTensor:$attn_wk,
-    AnyRankedTensor:$attn_wv,
-    AnyRankedTensor:$attn_wo,
-    // Layer norm 2
-    AnyRankedTensor:$ln2_gamma,
-    AnyRankedTensor:$ln2_beta,
-    // FFN weights
-    AnyRankedTensor:$ffn_w1,
-    AnyRankedTensor:$ffn_b1,
-    AnyRankedTensor:$ffn_w2,
-    AnyRankedTensor:$ffn_b2,
-    // Attributes
-    I64Attr:$num_heads,
-    F32Attr:$epsilon
-  );
-
-  let results = (outs AnyRankedTensor:$output);
-}
+    """
+    # Sub-layer 1: Attention with pre-norm and residual
+    normed1 = layer_norm(input, ln1_gamma, ln1_beta)
+    attn_out = attention(normed1, w_q, b_q, w_k, b_k, w_v, b_v, w_o, b_o)
+    residual1 = input + attn_out
+    
+    # Sub-layer 2: FFN with pre-norm and residual
+    normed2 = layer_norm(residual1, ln2_gamma, ln2_beta)
+    ffn_out = ffn(normed2, w1, b1, w2, b2)
+    output = residual1 + ffn_out
+    
+    return output
 ```
 
-This operation encapsulates the entire transformer block, making it a single reusable component for building larger models.
+**Why Composable Functions Instead of Dialect Operations?** Rather than creating monolithic `Transformer_BlockOp` and `Transformer_FFNOp` dialect operations, Chapter 12's design composes primitive operations (`layer_norm`, `linear`, `gelu`, `add`, `attention`). This approach provides:
+
+1. **Reusability**: `linear` is used in FFN, attention projections, and output layers
+2. **Independent optimization**: Each primitive can be optimized separately before composition-level optimizations
+3. **Flexibility**: Easy to experiment with variants (SwiGLU instead of GELU, RMSNorm instead of LayerNorm) by swapping components
+4. **Maintainability**: Single source of truth for each operation type
+
+The dialect provides the **building blocks** (8 operations: layer_norm, linear, gelu, matmul, transpose, softmax, scale, add), and the Python API provides **compositions** (ffn, attention, transformer_block).
 
 **Optimization Across Components**. MLIR's optimization passes (Chapter 10) work transparently across transformer block components:
 
@@ -1134,14 +1127,15 @@ This compositional approach mirrors production AI compilers: stable foundations,
 
 ## 12.6 Summary
 
-Chapter 12 assembled complete transformer blocks by composing layer normalization, multi-head attention, and feedforward networks with residual connections. We implemented each component as high-level Transformer dialect operations, defined lowering patterns to standard MLIR dialects, and demonstrated how MLIR's optimization infrastructure applies transparently to complex compositions.
+Chapter 12 assembled complete transformer blocks by composing layer normalization, multi-head attention, and feedforward networks with residual connections. We implemented primitive operations as Transformer dialect operations with memref-based semantics, defined lowering patterns to Linalg operations for optimization, and composed these primitives into higher-level functions at the Python API level.
 
 Key insights:
 
-- **Compositional Design**: Transformer blocks compose from independent components (attention, FFN, layer norm), each optimizable separately yet working together efficiently
+- **Compositional Design**: Transformer blocks compose from 8 primitive dialect operations (layer_norm, linear, gelu, matmul, transpose, softmax, scale, add), with higher-level abstractions (ffn, attention, transformer_block) implemented as Python API functions. Each primitive is optimizable separately yet works together efficiently.
+- **Memref-Based Semantics**: Operations use memrefs with out-parameter patterns rather than tensor-based functional style, enabling in-place optimization and explicit memory management
 - **Pre-Normalization Architecture**: Modern transformers normalize before sub-layers (pre-norm) rather than after (post-norm), improving training stability for deep networks
 - **Residual Connections**: Skip connections enable gradient flow through deep architectures, preventing vanishing gradients that plagued earlier deep learning
-- **MLIR's Optimization Transparency**: Fusion, vectorization, and loop optimization apply automatically to transformer block operations without transformer-specific passes
+- **Linalg-Based Lowering**: All operations lower to structured Linalg operations (linalg.reduce, linalg.generic, linalg.matmul), enabling MLIR's optimization passes to apply fusion, vectorization, and loop tiling automatically
 
 Chapter 12 established transformer blocks as reusable, testable components with ~3 million parameters each. These blocks are the fundamental units of models like GPT-2 (12 blocks), GPT-3 (96 blocks), and LLaMA (32-80 blocks depending on variant).
 

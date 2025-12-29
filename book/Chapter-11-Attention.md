@@ -120,7 +120,7 @@ Chapter 9 taught TableGen-based dialect definition. Now we apply that knowledge 
 
 3. **Type System**: Use memrefs for in-place computation (avoid allocations in generated code). Shapes can be dynamic (runtime-determined sequence lengths).
 
-4. **Composability**: Operations compose to build higher-level primitives. Attention is `matmul` + `transpose` + `scale` + `softmax` + `matmul` again.
+4. **Composability**: Operations compose to build higher-level primitives. Attention is `matmul` + `transpose` + element-wise scaling (via `mul`) + `softmax` + `matmul` again.
 
 **The Transformer Dialect Definition**. From [inc/TransformerDialect.td](ch.11.Attention/inc/TransformerDialect.td):
 
@@ -150,7 +150,7 @@ class Transformer_Op<string mnemonic, list<Trait> traits = []>
 
 All transformer operations inherit from this, automatically inheriting the dialect and getting the `transformer.` prefix.
 
-**Core Operations**. We define five operations matching attention's needs:
+**Core Operations**. We define five operations matching attention's needs: `matmul`, `add`, `mul`, `softmax`, and `transpose`. Note that scaling (dividing by √d_k) is implemented at the Python API level by creating a constant-filled memref and using `mul` for element-wise multiplication—not as a separate dialect operation.
 
 ### 11.2.1 Matrix Multiplication
 
@@ -231,7 +231,7 @@ def Transformer_MulOp : Transformer_Op<"mul"> {
 }
 ```
 
-Addition handles residual connections (Chapter 12). Multiplication implements scaling (dividing by √d_k). Both are rank-generic: work on any-shaped memrefs with compatible shapes.
+Addition handles residual connections (Chapter 12). Multiplication enables element-wise operations, including scaling. The Python API's `scale()` function uses `mul` to implement scaling by √d_k: it creates a memref filled with the scale constant, then performs element-wise multiplication. Both operations are rank-generic: work on any-shaped memrefs with compatible shapes.
 
 
 ## 11.3 Lowering Patterns: Leveraging the Linalg Dialect
@@ -679,6 +679,8 @@ Tensor scale(const Tensor& input, float factor) {
 
 These functions follow the same pattern: create node, set inputs, infer output shape, return tensor. Shape inference is crucial—we need shapes to generate correct MLIR IR (allocating buffers, setting loop bounds).
 
+**Implementation Note**: While `matmul`, `transpose`, and `softmax` directly map to transformer dialect operations, `scale()` is implemented differently: during MLIR IR generation, it creates a constant-filled memref with the scale factor and emits a `transformer.mul` operation for element-wise multiplication. This design reuses the existing `mul` operation rather than introducing a dedicated `scale` operation.
+
 **Composing Attention**. With primitives defined, attention becomes straightforward:
 
 ```cpp
@@ -702,17 +704,14 @@ Tensor attention(const Tensor& Q, const Tensor& K, const Tensor& V) {
 }
 ```
 
-This is **compositional**: each operation returns a tensor, which feeds into the next operation. The final graph has 6 nodes:
-1. Input (Q)
-2. Input (K)  
-3. Input (V)
-4. Transpose (K)
-5. Matmul (Q, K^T)
-6. Scale (scores)
-7. Softmax (scaled scores)
-8. Matmul (weights, V)
+This is **compositional**: each operation returns a tensor, which feeds into the next operation. The final graph has these computation nodes:
+1. Transpose (K)
+2. Matmul (Q, K^T)
+3. Scale (scores) - compiles to constant fill + mul
+4. Softmax (scaled scores)
+5. Matmul (weights, V)
 
-Plus three more input nodes (Q, K, V). The graph structure encodes dependencies: matmul depends on transpose, softmax depends on scale, final matmul depends on softmax.
+Plus three input nodes (Q, K, V). The graph structure encodes dependencies: the first matmul depends on transpose, softmax depends on scale, and the final matmul depends on softmax.
 
 **Why Graphs?** You might wonder: why not compile each operation individually? Several reasons:
 
@@ -1133,10 +1132,12 @@ func.func @graph_func(%Q: memref<4x8xf32>, %K: memref<4x8xf32>,
   %scores = memref.alloc() : memref<4x4xf32>
   transformer.matmul %Q, %K_T, %scores : memref<4x8xf32>, memref<8x4xf32>, memref<4x4xf32>
   
-  // Step 3: Scale by 1/sqrt(d_k)
-  %scale_buf = memref.alloc() : memref<4x4xf32>
+  // Step 3: Scale by 1/sqrt(d_k) - implemented via constant fill + mul
+  %scale_constant = memref.alloc() : memref<4x4xf32>
   %scale_factor = arith.constant 0.353553 : f32  // 1/sqrt(8)
-  transformer.mul %scores, %scale_factor, %scale_buf : memref<4x4xf32>, f32, memref<4x4xf32>
+  // (nested scf.for loops fill %scale_constant with %scale_factor)
+  %scale_buf = memref.alloc() : memref<4x4xf32>
+  transformer.mul %scores, %scale_constant, %scale_buf : memref<4x4xf32>, memref<4x4xf32>, memref<4x4xf32>
   
   // Step 4: Apply softmax
   %attn_weights = memref.alloc() : memref<4x4xf32>
@@ -1149,7 +1150,7 @@ func.func @graph_func(%Q: memref<4x8xf32>, %K: memref<4x8xf32>,
 }
 ```
 
-Five transformer operations, four intermediate buffers. This is the **before-lowering** IR—still high-level, still compositional. 
+Four transformer dialect operations (transpose, two matmuls, softmax) plus element-wise multiplication for scaling, with several intermediate buffers. This is the **before-lowering** IR—still high-level, still compositional. Note that the scale operation expands into constant buffer allocation, filling loops, and a `transformer.mul` operation. 
 
 **Two-Stage Lowering**: Section 11.3's patterns lower transformer operations to **linalg** operations first, then MLIR's `createConvertLinalgToLoopsPass()` converts linalg to scf.for loops. The intermediate linalg representation enables optimization passes (tiling, fusion, vectorization) before final loop generation.
 
@@ -1310,14 +1311,15 @@ func.func @graph_func(%Q: memref<4x8xf32>, %K: memref<4x8xf32>,
 }
 ```
 
-**From 5 Operations to ~100 Lines of Loops**. The transformer dialect's five operations expanded into:
+**From High-Level Operations to ~100 Lines of Loops**. The transformer dialect's operations expanded into:
 - 2 nested loops (transpose)
 - 3 nested loops (matmul for scores)
-- 2 nested loops (scaling)
+- 2 nested loops (filling scale constant buffer)
+- 2 nested loops (element-wise multiplication for scaling)
 - 6 nested loops (softmax's three passes, 2 loops each)
 - 3 nested loops (matmul for output)
 
-16 loops total, plus ~20 memory allocations (intermediate buffers). This is the code actually running—explicit iteration, explicit arithmetic, explicit memory accesses.
+18 loops total, plus multiple memory allocations (intermediate buffers). This is the code actually running—explicit iteration, explicit arithmetic, explicit memory accesses.
 
 **Memory Usage**. For seq_len=4, d_k=8:
 - K_T: 8×4 = 32 floats = 128 bytes
@@ -1870,11 +1872,11 @@ For Chapter 11, focus is on correctness and clarity. The MLIR infrastructure is 
 
 ## 11.10 Conclusion
 
-This chapter built a complete attention implementation in MLIR, from high-level operations to structured linear algebra operations to executable machine code. We defined a Transformer dialect with five operations, wrote lowering patterns converting those operations to linalg operations (which then lower to SCF loops and arithmetic), designed a Python API building computation graphs, and JIT-compiled graphs to native code via LLVM.
+This chapter built a complete attention implementation in MLIR, from high-level operations to structured linear algebra operations to executable machine code. We defined a Transformer dialect with five operations (`matmul`, `add`, `mul`, `softmax`, `transpose`), wrote lowering patterns converting those operations to linalg operations (which then lower to SCF loops and arithmetic), designed a Python API building computation graphs, and JIT-compiled graphs to native code via LLVM.
 
 **Key Takeaways**:
 
-1. **Domain-Specific Dialects**: Attention is naturally expressed as transformer.matmul, transformer.softmax, etc. Custom operations capture domain semantics, simplifying user code.
+1. **Domain-Specific Dialects**: Attention is naturally expressed as transformer.matmul, transformer.softmax, transformer.mul, etc. Custom operations capture domain semantics, simplifying user code. Higher-level API functions like `scale()` compose these primitives elegantly.
 
 2. **Multi-Level IR**: The same computation exists at four levels—Python API (user-facing), transformer dialect (semantic), linalg operations (structured), SCF+arith (imperative). Each level serves a purpose: Python for ergonomics, transformer for domain semantics, linalg for optimization, SCF for execution.
 

@@ -121,43 +121,33 @@ Chapters 11-13 already use the Linalg dialect as an intermediate representation:
 **Linalg Matrix Multiplication**. Replace 40+ lines of nested loops with semantic operation:
 
 ```cpp
-// src/TransformerToLinalg.cpp
+// src/TransformerPasses.cpp
 struct MatMulOpLowering : public OpRewritePattern<transformer::MatMulOp> {
   using OpRewritePattern::OpRewritePattern;
   
   LogicalResult matchAndRewrite(transformer::MatMulOp op,
                                 PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
-    Value lhs = op.getLhs();  // [M, K]
-    Value rhs = op.getRhs();  // [K, N]
+    Value lhs = op.getLhs();    // [M, K]
+    Value rhs = op.getRhs();    // [K, N]
+    Value output = op.getOutput();  // [M, N] - out-parameter
     
-    auto lhsType = lhs.getType().cast<RankedTensorType>();
-    auto rhsType = rhs.getType().cast<RankedTensorType>();
+    auto outputType = cast<MemRefType>(output.getType());
     
-    int64_t M = lhsType.getShape()[0];
-    int64_t K = lhsType.getShape()[1];
-    int64_t N = rhsType.getShape()[1];
-    
-    // Create output tensor [M, N]
-    auto outputType = RankedTensorType::get({M, N}, lhsType.getElementType());
+    // Fill output with zeros
     Value zero = rewriter.create<arith::ConstantOp>(
-      loc, rewriter.getFloatAttr(lhsType.getElementType(), 0.0)
+      loc, rewriter.getFloatAttr(outputType.getElementType(), 0.0)
     );
-    Value output = rewriter.create<tensor::EmptyOp>(
-      loc, outputType.getShape(), outputType.getElementType()
-    );
-    Value outputFilled = rewriter.create<linalg::FillOp>(
-      loc, zero, output
-    ).result();
+    rewriter.create<linalg::FillOp>(loc, zero, output);
     
-    // Create Linalg matmul operation
-    auto matmulOp = rewriter.create<linalg::MatmulOp>(
+    // Create Linalg matmul operation (accumulates into output)
+    rewriter.create<linalg::MatmulOp>(
       loc, 
       ValueRange{lhs, rhs},        // Inputs
-      ValueRange{outputFilled}     // Output (accumulated into)
+      ValueRange{output}           // Output (accumulated into)
     );
     
-    rewriter.replaceOp(op, matmulOp.getResult(0));
+    rewriter.eraseOp(op);
     return success();
   }
 };
@@ -176,12 +166,8 @@ struct GELUOpLowering : public OpRewritePattern<transformer::GELUOp> {
                                 PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     Value input = op.getInput();
-    auto inputType = input.getType().cast<RankedTensorType>();
-    
-    // Create output tensor
-    Value output = rewriter.create<tensor::EmptyOp>(
-      loc, inputType.getShape(), inputType.getElementType()
-    );
+    Value output = op.getOutput();  // out-parameter
+    auto inputType = cast<MemRefType>(input.getType());
     
     // Constants
     Value half = createF32Constant(rewriter, loc, 0.5);
@@ -199,8 +185,10 @@ struct GELUOpLowering : public OpRewritePattern<transformer::GELUOp> {
       inputType.getRank(), utils::IteratorType::parallel
     );
     
-    auto geluOp = rewriter.create<linalg::GenericOp>(
-      loc, input.getType(), ValueRange{input}, ValueRange{output},
+    rewriter.create<linalg::GenericOp>(
+      loc, 
+      ValueRange{input},   // Inputs
+      ValueRange{output},  // Outputs
       indexingMaps, iteratorTypes,
       [&](OpBuilder &b, Location loc, ValueRange args) {
         Value x = args[0];
@@ -220,7 +208,7 @@ struct GELUOpLowering : public OpRewritePattern<transformer::GELUOp> {
       }
     );
     
-    rewriter.replaceOp(op, geluOp.getResult(0));
+    rewriter.eraseOp(op);
     return success();
   }
 };
@@ -239,6 +227,8 @@ The `iteratorTypes` attribute specifies `parallel`—all iterations are independ
 Optimized Linalg IR (with tiling, vectorization, fusion) is **semantically equivalent** to Chapters 11-13's naive loop lowering—same computation, but with transformations applied before conversion to SCF. The educational value is learning these production-grade optimization techniques, not measuring speedup on nano GPT (which is too small to show significant gains).
 
 ## 14.3 Declarative Rewrite Rules (DRR)
+
+**Note**: This section describes an important production technique that is **not implemented in ch.14.GPT-Optimized**. The chapter focuses on Transform Dialect (Section 14.6) for optimization instead. However, DRR is widely used in production MLIR compilers and worth understanding as a complementary technique.
 
 Chapter 9 introduced TableGen for defining operations but deferred **Declarative Rewrite Rules (DRR)**—a TableGen-based pattern matching system for expressing optimizations declaratively. DRR eliminates boilerplate C++ for common transformations, making optimization passes more readable and maintainable.
 
@@ -475,10 +465,10 @@ Attribute AddConstants(Attribute a, Attribute b) {
 
 This performs arithmetic at **compile time**, producing a single constant instead of runtime computation.
 
-**Transformer Dialect Canonicalization**. Complete example for transformer operations:
+**Transformer Dialect Canonicalization**. For dialects using functional-style operations with results (tensor-based), canonicalization patterns can be defined:
 
 ```tablegen
-// Arithmetic identities
+// Example patterns (for tensor-based dialects)
 def AddZero : Pat<(AddOp $x, (ConstantOp Zero)), (replaceWithValue $x)>;
 def MulOne : Pat<(MulOp $x, (ConstantOp One)), (replaceWithValue $x)>;
 def MulZero : Pat<(MulOp $x, (ConstantOp Zero)), (ConstantOp Zero)>;
@@ -504,6 +494,8 @@ def ReLUConstant : Pat<
 
 These patterns eliminate redundant operations, simplify IR, and enable subsequent optimizations to be more effective.
 
+**Note on ch.14 Implementation**: The actual ch.14.GPT-Optimized uses memref-based operations with out-parameters (like `transformer.add %lhs, %rhs, %output`), not tensor-based operations with results. For memref-based dialects, canonicalization typically happens at the Linalg level after lowering, where patterns like `linalg.generic` fusion and constant folding apply.
+
 **Why Canonicalization Matters**. Three key benefits:
 
 1. **Optimization Enablement**: Simplified IR exposes optimization opportunities (fusion, constant propagation)
@@ -513,6 +505,8 @@ These patterns eliminate redundant operations, simplify IR, and enable subsequen
 Canonicalization is **cheap** (pattern matching) and **high-value** (enables expensive optimizations).
 
 ## 14.5 Custom OpInterface
+
+**Note**: This section describes an important production technique that is **not implemented in ch.14.GPT-Optimized**. The actual implementation uses memref-based operations and relies on Linalg dialect interfaces. However, custom OpInterface is a powerful MLIR feature used extensively in production compilers for extensibility and polymorphism.
 
 Chapter 9 briefly mentioned interfaces but focused on operation definition. **OpInterface** is MLIR's mechanism for polymorphism—defining generic algorithms that work across multiple operations without knowing their specific types. This section demonstrates defining and using custom interfaces.
 
@@ -797,27 +791,27 @@ for step in range(max_new_tokens):
 
 Complexity: O(N²) → O(N). Each iteration computes only one new Q/K/V.
 
-**Implementation in MLIR**:
+**Implementation in ch.14.GPT-Optimized**:
 
-```cpp
-// inc/TransformerOps.td
-def Transformer_AttentionCachedOp : Transformer_Op<"attention_cached", [Pure]> {
-  let summary = "Attention with KV caching";
-  let arguments = (ins
-    AnyRankedTensor:$query,         // [1, d_model]
-    AnyRankedTensor:$key_cache,     // [max_seq_len, d_model]
-    AnyRankedTensor:$value_cache,   // [max_seq_len, d_model]
-    I32:$pos,                       // Current position
-    AnyRankedTensor:$wq, AnyRankedTensor:$wk,
-    AnyRankedTensor:$wv, AnyRankedTensor:$wo
-  );
-  let results = (outs
-    AnyRankedTensor:$output,
-    AnyRankedTensor:$updated_key_cache,
-    AnyRankedTensor:$updated_value_cache
-  );
-}
+KV-cached attention is implemented as a **Python API function** `gpt_attention_cached()` (not a dialect operation). This is similar to the `scale()` function from Chapter 11—a pure Python/C++ implementation that bypasses MLIR compilation for simplicity:
+
+```python
+# Python API (implemented in C++ bindings)
+def gpt_attention_cached(
+    new_token_hidden,  # [1, d_model] - single new token
+    k_cache,           # [max_seq_len, d_model] - cached keys
+    v_cache,           # [max_seq_len, d_model] - cached values
+    cache_pos,         # Position to write new K/V
+    w_q, b_q, w_k, b_k, w_v, b_v, w_o, b_o  # Weight matrices
+) -> np.ndarray:
+    # Pure CPU implementation without MLIR compilation
+    # Computes Q/K/V only for new token
+    # Uses cached K/V from previous tokens
+    # Returns attention output for new token
+    ...
 ```
+
+The function directly manipulates NumPy arrays in C++ (see `src/bindings.cpp` lines 719-820), avoiding the complexity of defining a new dialect operation for this specialized use case.
 
 **Performance Impact**. For 20-token generation:
 
@@ -826,6 +820,8 @@ def Transformer_AttentionCachedOp : Transformer_Op<"attention_cached", [Pure]> {
 - **Theoretical speedup: 20×**
 
 This speedup applies to nano GPT and production models equally—it's pure algorithmic optimization, independent of hardware.
+
+**Implementation Note**: The `gpt_attention_cached()` function is a Python API implemented in C++ (not compiled through MLIR), similar to how `scale()` works in Chapter 11. This pragmatic choice allows rapid prototyping of the KV caching algorithm without the complexity of defining new dialect operations. Production systems would typically implement this as a proper dialect operation for full compiler optimization.
 
 **Memory Cost**:
 
