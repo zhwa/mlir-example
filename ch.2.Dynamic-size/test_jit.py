@@ -87,6 +87,31 @@ except Exception as e:
     import traceback
     traceback.print_exc()
 
+# Test 3: Different matrix dimensions - verify dynamic shapes work
+print("\n=== Test 3: Different matrix sizes (dynamic shapes) ===")
+print("Computing: C = random(16,64) @ random(64,32)")
+np.random.seed(123)  # Different seed for variety
+A3 = np.random.randn(16, 64).astype(np.float32)
+B3 = np.random.randn(64, 32).astype(np.float32)
+
+print("Calling gemm(A3, B3) with different dimensions...")
+try:
+    C3_jit = gemm.gemm(A3, B3)
+    C3_numpy = A3 @ B3
+    
+    max_error = np.max(np.abs(C3_jit - C3_numpy))
+    print(f"✓ Success! Max error vs NumPy: {max_error:.2e}")
+    
+    if np.allclose(C3_jit, C3_numpy, rtol=1e-5):
+        print("✓ Different sizes work with same compiled function!")
+        print(f"  Shape: ({A3.shape[0]}×{A3.shape[1]}) @ ({B3.shape[0]}×{B3.shape[1]}) = ({C3_jit.shape[0]}×{C3_jit.shape[1]})")
+    else:
+        print(f"✗ FAILED: Errors too large! Max error: {max_error}")
+except Exception as e:
+    print(f"✗ ERROR: {e}")
+    import traceback
+    traceback.print_exc()
+
 print("\n" + "=" * 60)
 print("=== All tests complete ===")
 print("\nTry these commands to explore the MLIR IR:")

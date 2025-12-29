@@ -526,24 +526,24 @@ This loop has **loop-carried dependencies**: iteration `i` writes `data[i]`, ite
 
 **Explicit vs. Auto-Vectorization**. MLIR supports two vectorization approaches:
 
-1. **Auto-vectorization**: Analyze scalar loops, automatically convert to vector operations (LLVM's loop vectorizer does this)
+1. **Auto-vectorization**: Analyze scalar loops, automatically convert to vector operations (LLVM's loop vectorizer does this at the LLVM IR level)
 2. **Explicit vectorization**: Use high-level operations (Linalg) that express parallelism, lower to vector dialect before lowering to LLVM
 
-Chapter 10 uses explicit vectorization:
+Chapter 10 uses **auto-vectorization** via LLVM's backend:
 
 ```cpp
-// Explicitly lower linalg to vector operations
-pm.addNestedPass<func::FuncOp>(createConvertLinalgToVectorPass());
-pm.addPass(createCanonicalizerPass());
+// Lower to loops (exposes loop structure)
+pm.addNestedPass<func::FuncOp>(createConvertLinalgToLoopsPass());
 
-// Lower vector operations to SCF (handles remainder loops, etc.)
-pm.addNestedPass<func::FuncOp>(createConvertVectorToSCFPass());
+// Optimize loops
+pm.addPass(createLoopInvariantCodeMotionPass());
 
-// Finally lower vector operations to LLVM intrinsics
-pm.addPass(createConvertVectorToLLVMPass());
+// Lower to LLVM (LLVM's auto-vectorizer kicks in with -O3)
+pm.addPass(createConvertSCFToCFPass());
+// ... rest of LLVM lowering
 ```
 
-Why explicit vectorization? **Control and predictability**. Linalg operations explicitly encode parallelism through iterator types (`parallel`, `reduction`); lowering to vector dialect preserves this intent. Auto-vectorization in LLVM's middle-end (as of LLVM 20) is heuristic-based—relying on cost models and alias analysis that sometimes fail to vectorize even obviously parallel code, or vectorize inefficiently. LLVM's ongoing VPlan improvements may address some limitations, but the fundamental challenge remains: MLIR's `vector` dialect handles multi-dimensional vectors natively, while LLVM IR is inherently one-dimensional. By generating vector IR explicitly, we guarantee SIMD usage and can inspect/debug the vector-level IR.
+Why auto-vectorization? **Simplicity and maturity**. LLVM's loop vectorizer has decades of development and handles edge cases (remainder loops, alignment, cost models) robustly. While MLIR's vector dialect provides more control for advanced use cases (explicit tiling strategies, target-specific SIMD patterns), LLVM's auto-vectorizer suffices for typical ML workloads and requires no additional passes in the pipeline.
 
 **Vectorization of Reduction Loops**. Parallelizable loops (embarrassingly parallel computations like element-wise operations) vectorize straightforwardly. Reduction loops (sum, max, matrix multiplication) require more sophistication. Consider:
 
@@ -607,18 +607,19 @@ void NNCompiler::lowerToLLVM(mlir::ModuleOp module) {
   pm.addNestedPass<mlir::func::FuncOp>(mlir::createLinalgElementwiseOpFusionPass());
   pm.addPass(mlir::createCanonicalizerPass());
   
-  // Stage 3: Lower to loops
-  pm.addNestedPass<mlir::func::FuncOp>(mlir::createConvertLinalgToLoopsPass());
+  // Stage 3: Lower to explicit loops
+  pm.addPass(mlir::createConvertLinalgToLoopsPass());
   
   // Stage 4: Loop optimizations
-  pm.addNestedPass<mlir::func::FuncOp>(mlir::createLoopInvariantCodeMotionPass());
-  
-  // Stage 5: Vectorization
-  pm.addNestedPass<mlir::func::FuncOp>(mlir::createConvertLinalgToVectorPass());
+  pm.addPass(mlir::createLoopInvariantCodeMotionPass());
   pm.addPass(mlir::createCanonicalizerPass());
-  pm.addNestedPass<mlir::func::FuncOp>(mlir::createConvertVectorToSCFPass());
+  
+  // Stage 5: Handle vector operations (if any exist)
+  pm.addPass(mlir::createConvertVectorToSCFPass());
+  pm.addPass(mlir::createCanonicalizerPass());
   
   // Stage 6: Lower to LLVM
+  pm.addPass(createConvertVectorToLLVMPass());  // Vector → LLVM first
   pm.addPass(mlir::createConvertSCFToCFPass());
   pm.addPass(mlir::createFinalizeMemRefToLLVMConversionPass());
   pm.addPass(mlir::createConvertFuncToLLVMPass());
@@ -711,45 +712,45 @@ scf.for %i = ... {
 
 This stage reduces redundant computation, preparing loops for vectorization (smaller loop bodies vectorize more efficiently).
 
-**Stage 5: Vectorization** (SCF+Arith → Vector). Convert scalar loops to vector operations:
+**Stage 5: Vectorization** (Defer to LLVM). Chapter 10's pipeline prepares loops for LLVM's auto-vectorizer but doesn't explicitly generate vector dialect operations:
 
 ```mlir
-// Before: Scalar loop
+// After Stage 4: Clean scalar loops ready for LLVM
 scf.for %i = %c0 to %c128 step %c1 {
   %val = memref.load %input[%i] : memref<128xf32>
   %squared = arith.mulf %val, %val : f32
   memref.store %squared, %output[%i] : memref<128xf32>
 }
 
-// After: Vector loop
-scf.for %i = %c0 to %c128 step %c8 {
-  %vals = vector.load %input[%i] : memref<128xf32>, vector<8xf32>
-  %squared = arith.mulf %vals, %vals : vector<8xf32>
-  vector.store %squared, %output[%i] : memref<128xf32>, vector<8xf32>
-}
-// Plus remainder loop handling
+// Stage 5: Convert any existing vector ops to SCF (cleanup)
+pm.addPass(mlir::createConvertVectorToSCFPass());
+pm.addPass(mlir::createCanonicalizerPass());
+
+// After Stage 6: LLVM's auto-vectorizer (with -O3) converts to SIMD
+// This happens in the ExecutionEngine's LLVM optimization pipeline
 ```
 
-The `ConvertLinalgToVectorPass` attempts vectorization (succeeds for parallel loops, fails for irregular patterns), canonicalization cleans up, and `ConvertVectorToSCFPass` handles remainder loops and edge cases. After this stage, the IR contains SIMD operations that will map to hardware vector instructions.
+The `createConvertVectorToSCFPass()` handles any vector operations that might exist (from earlier stages or manual insertion), but the main vectorization happens through LLVM's auto-vectorizer when the ExecutionEngine compiles with optimization level 3 (`makeOptimizingTransformer(3, 0, nullptr)`). LLVM analyzes the scalar loops and automatically generates AVX2/AVX-512 instructions where profitable.
 
 **Stage 6: Lower to LLVM** (Standard Dialects → LLVM). The final stage converts all high-level dialects to LLVM IR:
 
+- **Vector → LLVM**: Convert any vector operations to LLVM vector intrinsics (first, before other conversions)
 - **SCF → CF**: Convert structured control flow (`scf.for`, `scf.if`) to unstructured control flow graph (basic blocks, branches)
 - **MemRef → LLVM**: Lower memory references to LLVM pointer operations
 - **Func → LLVM**: Convert function signatures and calls to LLVM conventions
 - **Arith → LLVM**: Map arithmetic operations to LLVM instructions
-- **Vector → LLVM**: Convert vector operations to LLVM vector intrinsics (which backend maps to AVX, NEON, etc.)
 - **Reconcile casts**: Clean up any remaining type conversions
 
-After this stage, the ModuleOp contains only LLVM dialect operations—ready for execution through MLIR's ExecutionEngine.
+After this stage, the ModuleOp contains only LLVM dialect operations—ready for execution through MLIR's ExecutionEngine, which applies LLVM's optimization pipeline (including auto-vectorization with `-O3`).
 
 **Why This Order?** The pipeline's ordering is deliberate:
 
 1. **High-level optimizations first**: Fusion works better on structured ops (Linalg) than loops; lower too early and you miss fusion opportunities
-2. **Lower gradually**: Multi-stage lowering (NN → Linalg → SCF → LLVM) allows optimizations at each level
-3. **Optimize after lowering**: LICM needs explicit loops, vectorization needs loop structure—you can't apply these to Linalg ops
+2. **Lower gradually**: Multi-stage lowering (NN → Linalg—you can't apply these to Linalg ops
 4. **Canonicalize frequently**: Each major transformation creates cleanup opportunities; running canonicalizer prevents IR bloat
+5. **Vectorization via LLVM**: Rather than explicit vector dialect IR, rely on LLVM's mature auto-vectorizer (enabled by `-O3` in ExecutionEngine)
 
+Swapping stages breaks optimizations. For example, lowering to loops before fusion prevents fusion (fusion patterns match Linalg ops, not SCF loops). Running LICM before lowering to loops would fail (LICM needs explicit loop structure)
 Swapping stages breaks optimizations. For example, lowering to loops before fusion prevents fusion (fusion patterns match Linalg ops, not SCF loops). Vectorizing before LICM might miss hoisting opportunities that would enable better vectorization. The pipeline is the result of understanding optimization interactions and MLIR's dialect abstractions.
 
 **Pipeline Invariants and Debugging**. Each stage maintains invariants:
@@ -757,8 +758,8 @@ Swapping stages breaks optimizations. For example, lowering to loops before fusi
 - After Stage 1: All NN operations converted to standard dialects
 - After Stage 2: Producer-consumer pairs fused where legal
 - After Stage 3: All Linalg operations lowered to explicit loops
-- After Stage 4: Loop-invariant computations hoisted
-- After Stage 5: Parallelizable loops converted to vector operations
+- After Stage 4: Any vector operations converted to SCF
+- After Stage 6: Only LLVM dialect remains (auto-vectorization happens during LLVM optimization in ExecutionEngine)erted to vector operations
 - After Stage 6: Only LLVM dialect remains
 
 When debugging, verify invariants at each stage using `-mlir-print-ir-after-all`:

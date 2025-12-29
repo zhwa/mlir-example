@@ -859,17 +859,6 @@ This chapter introduced advanced techniques—some show immediate benefit (KV ca
 - **Algorithmic Before Compiler**: Fix O(N²) algorithms before micro-optimizations
 - **Interface-Based Passes**: Write generic passes using interfaces, not type-specific logic
 
-**When to Apply Each Technique**:
-
-| Technique | Nano GPT | Production GPT | Reason |
-|-----------|----------|----------------|--------|
-| KV Caching | ✅ Yes | ✅ Yes | Algorithmic, scale-independent |
-| DRR Patterns | ✅ Yes | ✅ Yes | Code quality, maintainability |
-| Interfaces | ✅ Yes | ✅ Yes | Extensibility, generic algorithms |
-| Transform Dialect | ⚠️ Learn | ✅ Yes | Production standard, educational value |
-| Tiling/Fusion | ❌ No gain | ✅ Yes | Requires memory bandwidth bottleneck |
-| Vectorization | ❌ Minimal | ✅ Yes | Benefits compute-bound operations |
-
 ## 14.9 Summary
 
 Chapter 14 introduced production-grade optimization techniques spanning declarative transformations (DRR, Transform dialect), advanced dialect features (interfaces, canonicalization), and algorithmic improvements (KV caching). These techniques represent modern MLIR practice—the same approaches used in production compilers at Google, Meta, and NVIDIA.

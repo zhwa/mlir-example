@@ -66,6 +66,21 @@ class KVCachePool:
         self.num_heads = num_heads
         self.head_dim = head_dim
 
+    def pages_needed(self, num_tokens: int) -> int:
+        """Calculate pages needed for num_tokens
+        
+        With page_size=16:
+            15 tokens → 1 page
+            16 tokens → 1 page  
+            17 tokens → 2 pages
+        """
+        return (num_tokens + self.page_size - 1) // self.page_size
+
+    def can_allocate(self, num_tokens: int) -> bool:
+        """Check if allocation would succeed"""
+        pages = self.pages_needed(num_tokens)
+        return self.num_free_pages >= pages
+
     def allocate(self, num_tokens: int) -> List[int]:
         """
         Allocate pages for num_tokens
