@@ -2,7 +2,7 @@
 
 Chapters 5-10 built the foundation: operations (Chapter 7), custom dialects (Chapters 8-9), and optimization pipelines (Chapter 10). Now we apply these techniques to modern deep learning's core innovation: **attention mechanisms**. Introduced by Vaswani et al. in "Attention is All You Need" (2017), attention transformed natural language processing and became the foundation of transformers, BERT, GPT, and essentially all state-of-the-art language models. This chapter implements scaled dot-product attention—the mathematical heart of transformers—in MLIR, demonstrating how compiler infrastructure handles complex ML operations.
 
-Unlike previous chapters that explained algorithms (softmax in Chapter 6, neural operations in Chapter 7), we assume you know attention theory. If you need a refresher, consult the original Vaswani paper or any modern NLP textbook. Our focus: **MLIR implementation**—how to represent attention operations in IR, lower them efficiently, and compose them into reusable components. We'll create a `transformer` dialect containing operations like `matmul`, `softmax`, and `transpose`, then lower them to standard MLIR dialects for execution. By chapter's end, you'll have working attention that matches PyTorch's output numerically, compiled entirely through MLIR's JIT infrastructure.
+Unlike previous chapters that explained algorithms (softmax in Chapter 6, neural operations in Chapter 7), we assume you know attention theory. If you need a refresher, consult the original Vaswani paper or any modern NLP textbook. Our focus: **MLIR implementation**—how to represent attention operations in IR, lower them efficiently, and compose them into reusable components. We'll create a `transformer` dialect containing operations like `matmul`, `softmax`, and `transpose`, then lower them to standard MLIR dialects for execution. By chapter's end, you'll have working attention that matches Python's output numerically, compiled entirely through MLIR's JIT infrastructure.
 
 The chapter progresses from understanding attention's computational structure (Q, K, V matrices and their transformations) through dialect design (what operations attention needs, how to specify them in TableGen) to implementation (lowering patterns, numerical stability, debugging). We'll see attention's irregular data access patterns—unlike element-wise operations from Chapter 7, attention involves matrix transposes, reductions across different dimensions, and cascaded operations where one's output feeds another. These patterns challenge naive compilation but showcase MLIR's strength: representing complex operations at high levels while generating efficient code at low levels. Let's begin by examining what attention computes and why its structure matters for compilation.
 
@@ -175,7 +175,7 @@ def Transformer_MatmulOp : Transformer_Op<"matmul"> {
 - **AnyMemRef**: Accepts memrefs of any rank/type. Verification (if needed) happens at lowering time.
 - **Assembly format**: Custom syntax `transformer.matmul %A, %B, %C : memref<...>, memref<...>, memref<...>`. Mirrors operation semantics directly.
 
-**Why Not Use Linalg.Matmul?** We could! But a custom operation allows future optimizations specific to transformers (like fused attention kernels). Chapter 14 explores this. For Chapter 11, pedagogical clarity: operations explicitly represent attention stages.
+**Why Not Use Linalg.Matmul?** We could! This chapter uses custom operations purely for pedagogical clarity: operations explicitly represent attention stages, making the computation graph easier to understand. Chapter 14 actually switches back to `linalg.matmul` because modern optimizations (tiling, fusion, vectorization via Transform dialect) work best with standard linalg operations, not custom dialects.
 
 ### 11.2.2 Transpose
 
@@ -234,52 +234,10 @@ def Transformer_MulOp : Transformer_Op<"mul"> {
 
 Addition handles residual connections (Chapter 12). Multiplication implements scaling (dividing by √d_k). Both are rank-generic: work on any-shaped memrefs with compatible shapes.
 
-**Generated C++ Code**. TableGen generates operation classes in [inc/TransformerOps.h](ch.11.Attention/inc/TransformerOps.h):
-
-```cpp
-class MatmulOp : public Op<MatmulOp, /* traits */> {
-public:
-  static StringRef getOperationName() { return "transformer.matmul"; }
-  
-  // Accessors for operands
-  Value getLhs() { return getOperand(0); }
-  Value getRhs() { return getOperand(1); }
-  Value getOutput() { return getOperand(2); }
-  
-  // Build methods
-  static void build(OpBuilder &builder, OperationState &result,
-                    Value lhs, Value rhs, Value output);
-  
-  // Parsing/printing
-  static ParseResult parse(OpAsmParser &parser, OperationState &result);
-  void print(OpAsmPrinter &p);
-  
-  // Verification
-  LogicalResult verify();
-};
-```
-
-This is ~200 lines of C++ generated from ~10 lines of TableGen—the power of declarative specifications. We use these generated classes when building IR (Section 11.4) and lowering (Section 11.3).
-
-**Comparison with Chapter 9's NN Dialect**. The transformer dialect follows the same patterns:
-- TableGen definitions in `.td` files
-- Generated C++ code in `.h.inc` files
-- Operation implementations in `.cpp` files
-- Lowering patterns in separate compilation units
-
-The operations differ in semantics (attention-specific vs general neural ops), but the structure is identical. This consistency is MLIR's strength: once you understand the patterns, new dialects become straightforward.
 
 ## 11.3 Lowering Patterns: From Attention to Loops
 
-Operations defined, we now implement lowering—converting high-level `transformer.*` operations to standard MLIR dialects (SCF loops, arithmetic operations, memref accesses). This is where MLIR's value proposition shines: express intent at high levels, generate efficient code at low levels, with the compiler handling the middle ground.
-
-**Lowering Strategy**. Each transformer operation lowers to a combination of:
-- **SCF dialect**: Structured loops (`scf.for`) with iterator variables
-- **Arith dialect**: Floating-point arithmetic (`arith.addf`, `arith.mulf`, `arith.divf`)
-- **MemRef dialect**: Memory loads/stores (`memref.load`, `memref.store`)
-- **Math dialect**: Transcendentals (`math.exp`) for softmax
-
-The goal: generate correct, verifiable code. Optimization (fusion, vectorization) happens later (Chapter 10's techniques apply here too, but we focus on correctness first).
+Operations defined, we now implement lowering—converting high-level `transformer.*` operations to standard MLIR dialects (SCF loops, arithmetic operations, memref accesses). 
 
 ### 11.3.1 Matrix Multiplication Lowering
 
@@ -1952,48 +1910,22 @@ Total: ~4.28 ms
 
 **Key Observation**: The two matmuls dominate (93% of time). Softmax is 5%, transpose/scaling negligible. This matches theoretical expectations—matmuls are O(n³) (treating seq_len as n), while softmax is O(n²).
 
-**Comparison with Optimized Libraries**. PyTorch's attention uses highly optimized BLAS (Basic Linear Algebra Subprograms) for matmuls:
+**Performance Context**. Our implementation is **educational**, demonstrating MLIR compilation concepts. The naive nested loops execute on a single CPU core without SIMD vectorization, fusion, or threading. Production attention implementations—whether in PyTorch (using Intel MKL or OpenBLAS), TensorFlow (XLA compilation), or specialized libraries (cuDNN, FlashAttention)—are significantly faster through:
 
-```python
-import torch
-import torch.nn.functional as F
+1. **Optimized BLAS**: Hand-tuned assembly with SIMD instructions and cache blocking for matrix multiplication
+2. **Kernel Fusion**: Combining operations (scale + softmax) to reduce memory bandwidth
+3. **Multi-threading**: Parallelizing across CPU cores
+4. **GPU Acceleration**: Exploiting thousands of parallel cores for data-parallel operations
 
-def pytorch_attention(Q, K, V):
-    Q_t = torch.from_numpy(Q)
-    K_t = torch.from_numpy(K)
-    V_t = torch.from_numpy(V)
-    
-    # PyTorch's scaled_dot_product_attention (SDPA)
-    output = F.scaled_dot_product_attention(Q_t.unsqueeze(0), 
-                                              K_t.unsqueeze(0),
-                                              V_t.unsqueeze(0))
-    return output.squeeze(0).numpy()
-
-# Benchmark
-start = time.time()
-for _ in range(100):
-    _ = pytorch_attention(Q, K, V)
-elapsed = time.time() - start
-print(f"PyTorch: {elapsed/100*1000:.2f} ms")
-```
-
-PyTorch (seq_len=256, d_k=64): ~0.15 ms (28x faster!). Why?
-
-1. **Optimized BLAS**: PyTorch uses Intel MKL or OpenBLAS—hand-tuned assembly, SIMD vectorization, cache blocking.
-
-2. **Kernel Fusion**: PyTorch fuses operations (scale + softmax, for example), reducing memory bandwidth.
-
-3. **Multi-threading**: PyTorch parallelizes across CPU cores; our naive loops are single-threaded.
-
-Our implementation is **educational**, demonstrating concepts. Production systems use libraries (PyTorch, TensorFlow) or compile to optimized kernels (XLA, TensorRT).
+The performance gap can be substantial (10-100× depending on problem size and hardware). For Chapter 11, the goal is correctness and understanding MLIR's compilation pipeline, not achieving peak performance. The infrastructure is in place; optimizations come in later chapters.
 
 **Optimization Roadmap** (future chapters):
 
-- **Chapter 10**: Apply vectorization, loop fusion, parallelization.
-- **Chapter 14**: FlashAttention-style tiling, reducing memory traffic from O(n²) to O(n).
-- **GPU**: Offload to GPU where parallelism shines (thousands of cores).
+- **Chapter 10**: Apply vectorization, loop fusion, parallelization to generic operations
+- **Chapter 14**: Production-grade optimizations including advanced tiling techniques
+- **GPU**: Offload to accelerators where massive parallelism shines
 
-For Chapter 11, the goal is correctness and clarity, not peak performance. The MLIR infrastructure is in place; optimizations layer on top.
+For Chapter 11, focus is on correctness and clarity. The MLIR infrastructure is established; performance optimizations layer on top in subsequent chapters.
 
 ## 11.10 Conclusion
 
@@ -2013,7 +1945,7 @@ This chapter built a complete attention implementation in MLIR, from high-level 
 
 **Limitations of Our Approach**:
 
-- **Performance**: Naive loops without vectorization, fusion, or parallelization. 28x slower than PyTorch.
+- **Performance**: Naive loops without vectorization, fusion, or parallelization. Significantly slower than production implementations.
 - **Memory**: Explicit intermediate buffers (scores, attn_weights) consume O(seq_len²) memory. Chapter 14's tiling reduces this.
 - **Batch Size**: We handle single examples (seq_len, d_k). Production systems batch multiple examples, amortizing overhead.
 - **Recompilation**: Every `forward()` call recompiles. Caching compiled modules is straightforward but omitted for clarity.
