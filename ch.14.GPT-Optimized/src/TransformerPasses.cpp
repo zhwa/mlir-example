@@ -44,93 +44,146 @@ struct LayerNormOpLowering : public OpRewritePattern<LayerNormOp> {
     Value output = op.getOutput();
     float epsilon = 1e-5f;
 
-    // Phase 2: LayerNorm with linalg.generic
-    // Note: For full fusion, we'd split into separate ops (mean, variance, normalize)
-    // For now, keeping it as one op for simplicity, but using linalg structure
-    
     auto inputType = cast<MemRefType>(input.getType());
-    int64_t seqLen = inputType.getShape()[0];
-    int64_t dModel = inputType.getShape()[1];
+    ArrayRef<int64_t> shape = inputType.getShape();
+    int rank = shape.size();
 
-    Value epsilonVal = createConstantFloat(rewriter, loc, epsilon);
+    // Create temporary buffers for mean and variance (reduce along last dim)
+    SmallVector<int64_t> reducedShape(shape.begin(), shape.end() - 1);
+    auto reducedType = MemRefType::get(reducedShape, rewriter.getF32Type());
+    Value meanBuffer = rewriter.create<memref::AllocOp>(loc, reducedType);
+    Value varianceBuffer = rewriter.create<memref::AllocOp>(loc, reducedType);
+
     Value zero = createConstantFloat(rewriter, loc, 0.0f);
-    Value dModelFloat = createConstantFloat(rewriter, loc, static_cast<float>(dModel));
+    Value epsilonVal = createConstantFloat(rewriter, loc, epsilon);
 
-    // Still need SCF loops for reduction operations (mean, variance)
-    // Full linalg version would use linalg.reduce, but that's more complex
-    Value seqLenVal = createConstantIndex(rewriter, loc, seqLen);
-    Value dModelVal = createConstantIndex(rewriter, loc, dModel);
-    Value zeroIdx = createConstantIndex(rewriter, loc, 0);
-    Value oneIdx = createConstantIndex(rewriter, loc, 1);
+    // Step 1: Compute mean using linalg.reduce (sum along last dim)
+    rewriter.create<linalg::FillOp>(loc, zero, meanBuffer);
+    rewriter.create<linalg::ReduceOp>(
+        loc,
+        ValueRange{input},
+        ValueRange{meanBuffer},
+        SmallVector<int64_t>{rank - 1},  // reduce along last dimension
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          Value sum = b.create<arith::AddFOp>(loc, args[0], args[1]);
+          b.create<linalg::YieldOp>(loc, sum);
+        }
+    );
 
-    rewriter.create<scf::ForOp>(
-        loc, zeroIdx, seqLenVal, oneIdx, ValueRange{},
-        [&](OpBuilder &builder, Location loc, Value i, ValueRange iterArgs) {
-          // Step 1: Compute mean
-          // mean = sum(input[i, :]) / d_model
-          Value sum = zero;
-          builder.create<scf::ForOp>(
-              loc, zeroIdx, dModelVal, oneIdx, ValueRange{sum},
-              [&](OpBuilder &builder, Location loc, Value j, ValueRange iterArgs) {
-                Value currentSum = iterArgs[0];
-                Value val = builder.create<memref::LoadOp>(loc, input, ValueRange{i, j});
-                Value newSum = builder.create<arith::AddFOp>(loc, currentSum, val);
-                builder.create<scf::YieldOp>(loc, newSum);
-              });
+    // Divide by d_model to get mean
+    Value dModel = createConstantFloat(rewriter, loc, static_cast<float>(shape[rank - 1]));
+    SmallVector<AffineMap> meanNormalizeMaps;
+    auto reducedIdentityMap = AffineMap::getMultiDimIdentityMap(rank - 1, rewriter.getContext());
+    meanNormalizeMaps.push_back(reducedIdentityMap);  // meanBuffer
+    meanNormalizeMaps.push_back(reducedIdentityMap);  // output (in-place)
 
-          Value sumResult = builder.create<scf::ForOp>(
-              loc, zeroIdx, dModelVal, oneIdx, ValueRange{zero},
-              [&](OpBuilder &builder, Location loc, Value j, ValueRange iterArgs) {
-                Value currentSum = iterArgs[0];
-                Value val = builder.create<memref::LoadOp>(loc, input, ValueRange{i, j});
-                Value newSum = builder.create<arith::AddFOp>(loc, currentSum, val);
-                builder.create<scf::YieldOp>(loc, newSum);
-              }).getResult(0);
+    SmallVector<utils::IteratorType> reducedIteratorTypes(rank - 1, utils::IteratorType::parallel);
 
-          Value mean = builder.create<arith::DivFOp>(loc, sumResult, dModelFloat);
+    rewriter.create<linalg::GenericOp>(
+        loc,
+        ValueRange{meanBuffer},
+        ValueRange{meanBuffer},  // in-place
+        meanNormalizeMaps,
+        reducedIteratorTypes,
+        [dModel](OpBuilder &b, Location loc, ValueRange args) {
+          Value normalized = b.create<arith::DivFOp>(loc, args[0], dModel);
+          b.create<linalg::YieldOp>(loc, normalized);
+        }
+    );
 
-          // Step 2: Compute variance
-          // variance = sum((input[i, :] - mean)^2) / d_model
-          Value varianceSum = builder.create<scf::ForOp>(
-              loc, zeroIdx, dModelVal, oneIdx, ValueRange{zero},
-              [&](OpBuilder &builder, Location loc, Value j, ValueRange iterArgs) {
-                Value currentSum = iterArgs[0];
-                Value val = builder.create<memref::LoadOp>(loc, input, ValueRange{i, j});
-                Value diff = builder.create<arith::SubFOp>(loc, val, mean);
-                Value diffSq = builder.create<arith::MulFOp>(loc, diff, diff);
-                Value newSum = builder.create<arith::AddFOp>(loc, currentSum, diffSq);
-                builder.create<scf::YieldOp>(loc, newSum);
-              }).getResult(0);
+    // Step 2: Compute variance: sum((input - mean)^2) / d_model
+    // Create temporary buffer for centered values
+    Value centeredBuffer = rewriter.create<memref::AllocOp>(loc, inputType);
 
-          Value variance = builder.create<arith::DivFOp>(loc, varianceSum, dModelFloat);
+    // Compute centered = input - mean (broadcast mean)
+    SmallVector<AffineMap> centeringMaps;
+    auto identityMap = AffineMap::getMultiDimIdentityMap(rank, rewriter.getContext());
+    SmallVector<AffineExpr> reducedExprs;
+    for (int i = 0; i < rank - 1; i++) {
+      reducedExprs.push_back(rewriter.getAffineDimExpr(i));
+    }
+    auto broadcastMap = AffineMap::get(rank, 0, reducedExprs, rewriter.getContext());
 
-          // Step 3: Compute rsqrt(variance + epsilon)
-          Value variancePlusEps = builder.create<arith::AddFOp>(loc, variance, epsilonVal);
-          Value invStd = builder.create<math::RsqrtOp>(loc, variancePlusEps);
+    centeringMaps.push_back(identityMap);     // input
+    centeringMaps.push_back(broadcastMap);    // meanBuffer (broadcasted)
+    centeringMaps.push_back(identityMap);     // centeredBuffer
 
-          // Step 4: Normalize and apply scale/shift
-          // output[i, j] = ((input[i, j] - mean) * invStd) * gamma[j] + beta[j]
-          builder.create<scf::ForOp>(
-              loc, zeroIdx, dModelVal, oneIdx, ValueRange{},
-              [&](OpBuilder &builder, Location loc, Value j, ValueRange iterArgs) {
-                Value val = builder.create<memref::LoadOp>(loc, input, ValueRange{i, j});
-                Value gammaVal = builder.create<memref::LoadOp>(loc, gamma, ValueRange{j});
-                Value betaVal = builder.create<memref::LoadOp>(loc, beta, ValueRange{j});
+    SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
 
-                // Normalize: (val - mean) * invStd
-                Value centered = builder.create<arith::SubFOp>(loc, val, mean);
-                Value normalized = builder.create<arith::MulFOp>(loc, centered, invStd);
+    rewriter.create<linalg::GenericOp>(
+        loc,
+        ValueRange{input, meanBuffer},
+        ValueRange{centeredBuffer},
+        centeringMaps,
+        iteratorTypes,
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          Value centered = b.create<arith::SubFOp>(loc, args[0], args[1]);
+          b.create<linalg::YieldOp>(loc, centered);
+        }
+    );
 
-                // Scale and shift: normalized * gamma + beta
-                Value scaled = builder.create<arith::MulFOp>(loc, normalized, gammaVal);
-                Value result = builder.create<arith::AddFOp>(loc, scaled, betaVal);
+    // Compute variance: sum(centered^2) / d_model
+    rewriter.create<linalg::FillOp>(loc, zero, varianceBuffer);
+    rewriter.create<linalg::ReduceOp>(
+        loc,
+        ValueRange{centeredBuffer},
+        ValueRange{varianceBuffer},
+        SmallVector<int64_t>{rank - 1},
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          Value squared = b.create<arith::MulFOp>(loc, args[0], args[0]);
+          Value sum = b.create<arith::AddFOp>(loc, squared, args[1]);
+          b.create<linalg::YieldOp>(loc, sum);
+        }
+    );
 
-                builder.create<memref::StoreOp>(loc, result, output, ValueRange{i, j});
-                builder.create<scf::YieldOp>(loc);
-              });
+    // Divide by d_model and compute rsqrt(variance + epsilon)
+    rewriter.create<linalg::GenericOp>(
+        loc,
+        ValueRange{varianceBuffer},
+        ValueRange{varianceBuffer},  // in-place
+        meanNormalizeMaps,
+        reducedIteratorTypes,
+        [dModel, epsilonVal](OpBuilder &b, Location loc, ValueRange args) {
+          Value variance = b.create<arith::DivFOp>(loc, args[0], dModel);
+          Value variancePlusEps = b.create<arith::AddFOp>(loc, variance, epsilonVal);
+          Value invStd = b.create<math::RsqrtOp>(loc, variancePlusEps);
+          b.create<linalg::YieldOp>(loc, invStd);
+        }
+    );
 
-          builder.create<scf::YieldOp>(loc);
-        });
+    // Step 3: Normalize and apply scale/shift: output = ((input - mean) * invStd) * gamma + beta
+    // Using centered values, multiply by invStd, then scale by gamma and shift by beta
+    // Create broadcast map for gamma/beta (1D tensors indexing only last dimension)
+    SmallVector<AffineExpr> gammaBetaExprs;
+    gammaBetaExprs.push_back(rewriter.getAffineDimExpr(rank - 1));  // only last dimension
+    auto gammaBetaBroadcastMap = AffineMap::get(rank, 0, gammaBetaExprs, rewriter.getContext());
+
+    SmallVector<AffineMap> normalizeMaps;
+    normalizeMaps.push_back(identityMap);              // centeredBuffer
+    normalizeMaps.push_back(broadcastMap);             // varianceBuffer (invStd, broadcasted)
+    normalizeMaps.push_back(gammaBetaBroadcastMap);    // gamma (broadcasted)
+    normalizeMaps.push_back(gammaBetaBroadcastMap);    // beta (broadcasted)
+    normalizeMaps.push_back(identityMap);              // output
+
+    rewriter.create<linalg::GenericOp>(
+        loc,
+        ValueRange{centeredBuffer, varianceBuffer, gamma, beta},
+        ValueRange{output},
+        normalizeMaps,
+        iteratorTypes,
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          // args[0] = centered, args[1] = invStd, args[2] = gamma, args[3] = beta
+          Value normalized = b.create<arith::MulFOp>(loc, args[0], args[1]);
+          Value scaled = b.create<arith::MulFOp>(loc, normalized, args[2]);
+          Value result = b.create<arith::AddFOp>(loc, scaled, args[3]);
+          b.create<linalg::YieldOp>(loc, result);
+        }
+    );
+
+    // Clean up temporary buffers
+    rewriter.create<memref::DeallocOp>(loc, meanBuffer);
+    rewriter.create<memref::DeallocOp>(loc, varianceBuffer);
+    rewriter.create<memref::DeallocOp>(loc, centeredBuffer);
 
     rewriter.eraseOp(op);
     return success();
@@ -154,48 +207,56 @@ struct LinearOpLowering : public OpRewritePattern<LinearOp> {
 
     auto inputType = cast<MemRefType>(input.getType());
     auto weightType = cast<MemRefType>(weight.getType());
+    auto outputType = cast<MemRefType>(output.getType());
+
+    // Linear: output = input @ weight + bias
+    // Ch14 convention: weight is already (in_features, out_features)
+    // input: (seq_len, in_features), weight: (in_features, out_features)
 
     int64_t seqLen = inputType.getShape()[0];
     int64_t inFeatures = inputType.getShape()[1];
-    // Weight is (in_features, out_features) in numpy convention
-    int64_t outFeatures = weightType.getShape()[1];
+    int64_t outFeatures = weightType.getShape()[1];  // Ch14: weight is [in, out]
 
+    // Step 1: Initialize output to zero and perform matmul
     Value zero = createConstantFloat(rewriter, loc, 0.0f);
-    Value seqLenVal = createConstantIndex(rewriter, loc, seqLen);
-    Value outFeaturesVal = createConstantIndex(rewriter, loc, outFeatures);
-    Value inFeaturesVal = createConstantIndex(rewriter, loc, inFeatures);
-    Value zeroIdx = createConstantIndex(rewriter, loc, 0);
-    Value oneIdx = createConstantIndex(rewriter, loc, 1);
+    rewriter.create<linalg::FillOp>(loc, zero, output);
 
-    // output[i, j] = sum_k(input[i, k] * weight[k, j]) + bias[j]
-    // Weight is stored as (in_features, out_features)
-    rewriter.create<scf::ForOp>(
-        loc, zeroIdx, seqLenVal, oneIdx, ValueRange{},
-        [&](OpBuilder &builder, Location loc, Value i, ValueRange iterArgs) {
-          builder.create<scf::ForOp>(
-              loc, zeroIdx, outFeaturesVal, oneIdx, ValueRange{},
-              [&](OpBuilder &builder, Location loc, Value j, ValueRange iterArgs) {
-                // Compute matmul: sum_k(input[i, k] * weight[k, j])
-                Value sum = builder.create<scf::ForOp>(
-                    loc, zeroIdx, inFeaturesVal, oneIdx, ValueRange{zero},
-                    [&](OpBuilder &builder, Location loc, Value k, ValueRange iterArgs) {
-                      Value currentSum = iterArgs[0];
-                      Value inputVal = builder.create<memref::LoadOp>(loc, input, ValueRange{i, k});
-                      Value weightVal = builder.create<memref::LoadOp>(loc, weight, ValueRange{k, j});
-                      Value prod = builder.create<arith::MulFOp>(loc, inputVal, weightVal);
-                      Value newSum = builder.create<arith::AddFOp>(loc, currentSum, prod);
-                      builder.create<scf::YieldOp>(loc, newSum);
-                    }).getResult(0);
+    // Matmul: (seq_len, in_features) @ (in_features, out_features) -> (seq_len, out_features)
+    rewriter.create<linalg::MatmulOp>(
+        loc,
+        ValueRange{input, weight},  // No transpose needed for Ch14
+        ValueRange{output}
+    );
 
-                // Add bias
-                Value biasVal = builder.create<memref::LoadOp>(loc, bias, ValueRange{j});
-                Value result = builder.create<arith::AddFOp>(loc, sum, biasVal);
+    // Step 2: Add bias using linalg.generic (broadcast bias across seq_len)
+    int rank = 2;
+    SmallVector<AffineMap> indexingMaps;
+    auto identityMap = AffineMap::getMultiDimIdentityMap(rank, rewriter.getContext());
 
-                builder.create<memref::StoreOp>(loc, result, output, ValueRange{i, j});
-                builder.create<scf::YieldOp>(loc);
-              });
-          builder.create<scf::YieldOp>(loc);
-        });
+    // Broadcast map for bias (only last dimension)
+    SmallVector<AffineExpr> biasExprs;
+    biasExprs.push_back(rewriter.getAffineDimExpr(1));  // only use second dimension
+    AffineMap biasMap = AffineMap::get(rank, 0, biasExprs, rewriter.getContext());
+
+    indexingMaps.push_back(biasMap);       // bias input (1D)
+    indexingMaps.push_back(identityMap);   // output (2D)
+
+    SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
+
+    rewriter.create<linalg::GenericOp>(
+        loc,
+        TypeRange{},           // result types (output is updated in-place)
+        ValueRange{bias},      // inputs
+        ValueRange{output},    // outputs
+        indexingMaps,
+        iteratorTypes,
+        [&](OpBuilder &b, Location loc, ValueRange args) {
+          Value biasVal = args[0];
+          Value outputVal = args[1];
+          Value sum = b.create<arith::AddFOp>(loc, outputVal, biasVal);
+          b.create<linalg::YieldOp>(loc, sum);
+        }
+    );
 
     rewriter.eraseOp(op);
     return success();

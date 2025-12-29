@@ -33,7 +33,9 @@ GPT-3 (d_model=12288, 96 layers):
 
 The optimization techniques in this chapter are production-tested but require production-scale problems to demonstrate their value. We implement them for completeness and to prepare for real deployments.
 
-**Problem 1: Untapped Optimization Opportunities**. Chapters 11-13 already use Linalg operations for structured computation—matrix multiplications lower to `linalg.matmul`, element-wise operations to `linalg.generic`. This high-level IR provides semantic richness that enables optimization, but we haven't yet applied aggressive transformations:
+**Problem 1: Untapped Optimization Opportunities**. Chapters 11-14 all use Linalg operations for structured computation—LayerNorm uses `linalg.reduce` and `linalg.generic`, Linear uses `linalg.matmul` and `linalg.transpose`, and element-wise operations lower to `linalg.generic`. This consistency ensures that all chapters benefit from the same high-level IR and optimization infrastructure. The implementations are identical across chapters for common operations, with only the GPT-specific operations (Embedding, MaskedSoftmax, RoPE) using manual lowering for specialized logic.
+
+This high-level IR provides semantic richness that enables optimization, but we haven't yet applied aggressive transformations in Chapters 11-13:
 
 ```cpp
 // Chapters 11-13: Linalg operations (high-level, structured)

@@ -770,9 +770,6 @@ py::array_t<float> gpt_attention_cached(
     v_cache_ptr[cache_pos * d_model + j] = sum;
   }
 
-  // Apply RoPE to Q and K_cache[cache_pos] (simplified - skip for now)
-  // TODO: Add RoPE support in cached attention
-
   // Compute attention scores: Q @ K_cache[:cache_pos+1].T  [1, cache_pos+1]
   int64_t valid_len = cache_pos + 1;
   py::array_t<float> scores(std::vector<ssize_t>{1, valid_len});
