@@ -355,7 +355,7 @@ pm.addPass(createTransformerToStandardPass());
 pm.addNestedPass<func::FuncOp>(createConvertLinalgToLoopsPass());
 
 // 3. Standard dialects → LLVM IR
-pm.addPass(createConvertSCFToCFPass());
+pm.addPass(createSCFToControlFlowPass());
 pm.addPass(createFinalizeMemRefToLLVMConversionPass());
 pm.addPass(createConvertFuncToLLVMPass());
 pm.addPass(createReconcileUnrealizedCastsPass());

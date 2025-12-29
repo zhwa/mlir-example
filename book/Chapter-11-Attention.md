@@ -497,7 +497,7 @@ Linalg operations don't execute directly—they lower to loops. The pass pipelin
 ```cpp
 pm.addPass(createLowerTransformerToStandardPass());  // transformer -> linalg
 pm.addPass(createConvertLinalgToLoopsPass());        // linalg -> scf.for
-pm.addPass(createConvertSCFToCFPass());              // scf -> control flow
+pm.addPass(createSCFToControlFlowPass());            // scf -> control flow
 // ... remaining passes to LLVM IR
 ```
 
@@ -919,7 +919,7 @@ bool TransformerCompiler::lowerToLLVM(ModuleOp module) {
   // Lower standard dialects to LLVM
   pm.addPass(createConvertMathToLLVMPass());
   pm.addPass(createConvertMathToLibmPass());
-  pm.addPass(createConvertSCFToCFPass());
+  pm.addPass(createSCFToControlFlowPass());
   pm.addPass(createArithToLLVMConversionPass());
   pm.addPass(createConvertControlFlowToLLVMPass());
   pm.addPass(createFinalizeMemRefToLLVMConversionPass());

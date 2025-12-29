@@ -448,7 +448,7 @@ Canonicalization is a general cleanup pass that runs multiple times throughout c
 Next, we convert structured control flow to unstructured control flow:
 
 ```cpp
-pm.addPass(createConvertSCFToCFPass());
+pm.addPass(createSCFToControlFlowPass());
 ```
 
 This pass eliminates all `scf.for` operations, replacing them with basic blocks and branches. After this pass, the IR contains only CF dialect operations. The loop structure is implicit in the control flow graph rather than explicit in the operation types.

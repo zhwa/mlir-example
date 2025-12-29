@@ -698,7 +698,7 @@ void applyOptimizationPasses(ModuleOp module) {
   
   pm.addPass(createCanonicalizerPass());
   pm.addNestedPass<func::FuncOp>(createConvertLinalgToLoopsPass());
-  pm.addPass(createConvertSCFToCFPass());
+  pm.addPass(createSCFToControlFlowPass());
   pm.addPass(createFinalizeMemRefToLLVMConversionPass());
   pm.addPass(createConvertFuncToLLVMPass());
   pm.addPass(createConvertArithToLLVMPass());

@@ -443,7 +443,7 @@ func.func @gemm(%arg0: memref<?x?xf32>, %arg1: memref<?x?xf32>, %arg2: memref<?x
 
 ```cpp
 // Lower remaining bufferization operations to memref  
-pm.addPass(createBufferizationToMemRefPass());
+pm.addPass(createConvertBufferizationToMemRefPass());
 pm.addPass(createCanonicalizerPass());  // Clean up
 ```
 
@@ -537,7 +537,7 @@ pm.addPass(bufferization::createOneShotBufferizePass());
 
 ```cpp
 // WRONG: Trying to lower bufferization ops before creating them
-pm.addPass(createBufferizationToMemRefPass());
+pm.addPass(createConvertBufferizationToMemRefPass());
 pm.addPass(bufferization::createOneShotBufferizePass());
 ```
 
@@ -633,7 +633,7 @@ pm.addPass(bufferization::createOneShotBufferizePass(options));
 pm.addPass(bufferization::createBufferResultsToOutParamsPass());
 
 // 4. Lower bufferization ops (CLEANUP)
-pm.addPass(createBufferizationToMemRefPass());
+pm.addPass(createConvertBufferizationToMemRefPass());
 pm.addPass(createCanonicalizerPass());
 ```
 
@@ -708,7 +708,7 @@ Solutions:
 **Problem: `failed to legalize operation 'bufferization.to_memref'`**
 
 - **Cause:** `bufferizeFunctionBoundaries` not enabled, or missing `bufferization-to-memref` pass
-- **Solution:** Set `options.bufferizeFunctionBoundaries = true` and add `createBufferizationToMemRefPass()`
+- **Solution:** Set `options.bufferizeFunctionBoundaries = true` and add `createConvertBufferizationToMemRefPass()`
 
 ### Runtime Issues
 
@@ -759,7 +759,7 @@ module.dump();  // Should see memref args/results
 pm.addPass(bufferization::createBufferResultsToOutParamsPass());
 module.dump();  // Should see out-parameter signature
 
-pm.addPass(createBufferizationToMemRefPass());
+pm.addPass(createConvertBufferizationToMemRefPass());
 module.dump();  // Should see no bufferization.* ops
 ```
 

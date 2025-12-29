@@ -1,6 +1,6 @@
 # Chapter 3: Compilation Infrastructure: AOT, JIT, and the Pass Pipeline
 
-In Chapters 1 and 2, we generated MLIR IR for matrix multiplication operations and compiled it to executable code using MLIR's `ExecutionEngine`. We used passes like `createConvertLinalgToLoopsPass()` and `createConvertSCFToCFPass()` to progressively lower our IR, treating compilation as a black box—feed it IR, get back a callable function. This simplicity was intentional for learning, but now we need to understand what's happening inside that black box.
+In Chapters 1 and 2, we generated MLIR IR for matrix multiplication operations and compiled it to executable code using MLIR's `ExecutionEngine`. We used passes like `createConvertLinalgToLoopsPass()` and `createSCFToControlFlowPass()` to progressively lower our IR, treating compilation as a black box—feed it IR, get back a callable function. This simplicity was intentional for learning, but now we need to understand what's happening inside that black box.
 
 This chapter addresses fundamental questions about compilation infrastructure: **What is the difference between ahead-of-time (AOT) and just-in-time (JIT) compilation? Why does MLIR provide an ExecutionEngine, and when should you use it? How does MLIR's pass infrastructure orchestrate transformations? And critically for production systems, how do you compile MLIR to standalone executables or libraries?**
 
@@ -118,7 +118,7 @@ PassManager pm(context);
 // Add passes in sequence
 pm.addPass(createCanonicalizerPass());           // Simplify IR
 pm.addPass(createConvertLinalgToLoopsPass());    // Linalg → Loops
-pm.addPass(createConvertSCFToCFPass());          // SCF → CF
+pm.addPass(createSCFToControlFlowPass());        // SCF → CF
 pm.addPass(createFinalizeMemRefToLLVMPass());    // MemRef → LLVM
 
 // Run all passes on the module

@@ -566,7 +566,7 @@ LogicalResult applyOptimizationPasses(ModuleOp module) {
   pm.addPass(createConvertLinalgToLoopsPass());
   
   // 3. Mid-level → low-level (structured control flow → branches)
-  pm.addPass(createConvertSCFToCFPass());
+  pm.addPass(createSCFToControlFlowPass());
   
   // 4. Memory abstractions → LLVM (memref → pointers)
   pm.addPass(memref::createExpandStridedMetadataPass());
@@ -591,7 +591,7 @@ LogicalResult applyOptimizationPasses(ModuleOp module) {
 High-level:   linalg.matmul
     ↓ createConvertLinalgToLoopsPass()
 Mid-level:    scf.for loops with body computations
-    ↓ createConvertSCFToCFPass()
+    ↓ createSCFToControlFlowPass()
 Control-flow: cf.br (basic blocks and branches)
     ↓ createFinalizeMemRefToLLVMConversionPass()
 Low-level:    llvm.load, llvm.fadd, llvm.store

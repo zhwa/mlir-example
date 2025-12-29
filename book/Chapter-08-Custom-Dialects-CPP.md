@@ -542,7 +542,7 @@ void runPasses(ModuleOp module) {
     pm.addNestedPass<func::FuncOp>(createConvertLinalgToLoopsPass());
     
     // Lower SCF to Control Flow
-    pm.addPass(createConvertSCFToCFPass());
+    pm.addPass(createSCFToControlFlowPass());
     
     // Lower everything to LLVM dialect
     pm.addPass(createConvertMathToLibmPass());

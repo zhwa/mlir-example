@@ -539,7 +539,7 @@ pm.addNestedPass<func::FuncOp>(createConvertLinalgToLoopsPass());
 pm.addPass(createLoopInvariantCodeMotionPass());
 
 // Lower to LLVM (LLVM's auto-vectorizer kicks in with -O3)
-pm.addPass(createConvertSCFToCFPass());
+pm.addPass(createSCFToControlFlowPass());
 // ... rest of LLVM lowering
 ```
 
@@ -628,7 +628,7 @@ void NNCompiler::lowerToLLVM(mlir::ModuleOp module) {
   
   // Stage 6: Lower to LLVM
   pm.addPass(createConvertVectorToLLVMPass());  // Vector → LLVM first
-  pm.addPass(mlir::createConvertSCFToCFPass());
+  pm.addPass(mlir::createSCFToControlFlowPass());
   pm.addPass(mlir::createFinalizeMemRefToLLVMConversionPass());
   pm.addPass(mlir::createConvertFuncToLLVMPass());
   pm.addPass(mlir::createArithToLLVMConversionPass());

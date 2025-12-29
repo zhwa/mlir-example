@@ -683,12 +683,12 @@ LogicalResult applyOptimizationPasses(ModuleOp module) {
       bufferization::LayoutMapOption::IdentityLayoutMap);
   pm.addPass(bufferization::createOneShotBufferizePass(options));
   pm.addPass(bufferization::createBufferResultsToOutParamsPass());
-  pm.addPass(createBufferizationToMemRefPass());
+  pm.addPass(createConvertBufferizationToMemRefPass());
   pm.addPass(createCanonicalizerPass());
 
   // Phase 3: Progressive lowering (Linalg → Loops → CF → LLVM)
   pm.addPass(createConvertLinalgToLoopsPass());
-  pm.addPass(createConvertSCFToCFPass());
+  pm.addPass(createSCFToControlFlowPass());
   pm.addPass(memref::createExpandStridedMetadataPass());
   pm.addPass(createFinalizeMemRefToLLVMConversionPass());
   pm.addPass(createArithToLLVMConversionPass());

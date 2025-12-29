@@ -932,7 +932,7 @@ These patterns prevent 80% of beginner MLIR crashes. When you encounter a segfau
 
 Now let's continue with the lowering phases.
 
-In this phase, the `createConvertSCFToCFPass()` transforms our structured loops:
+In this phase, the `createSCFToControlFlowPass()` transforms our structured loops:
 
 ```mlir
 // Before: Structured loop (SCF dialect)
