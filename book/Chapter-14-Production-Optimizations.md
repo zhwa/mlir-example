@@ -33,30 +33,29 @@ GPT-3 (d_model=12288, 96 layers):
 
 The optimization techniques in this chapter are production-tested but require production-scale problems to demonstrate their value. We implement them for completeness and to prepare for real deployments.
 
-**Problem 1: Low-Level IR Prevents Recognition**. Chapter 13 lowers operations directly to SCF loops and Arith operations:
+**Problem 1: Untapped Optimization Opportunities**. Chapters 11-13 already use Linalg operations for structured computation—matrix multiplications lower to `linalg.matmul`, element-wise operations to `linalg.generic`. This high-level IR provides semantic richness that enables optimization, but we haven't yet applied aggressive transformations:
 
 ```cpp
-// Matrix multiplication: C = A @ B
-// Lowered to three nested loops with scalar operations
+// Chapters 11-13: Linalg operations (high-level, structured)
+auto matmulOp = rewriter.create<linalg::MatmulOp>(
+  loc, 
+  ValueRange{lhs, rhs},        // Inputs
+  ValueRange{output}           // Output (accumulated into)
+);
+
+// After createConvertLinalgToLoopsPass():
+// Linalg → naive SCF loops (no tiling, no vectorization, no fusion)
 auto iLoop = rewriter.create<scf::ForOp>(loc, zero, M, one);
-Builder iBuilder = iLoop.getBodyBuilder();
-  auto jLoop = iBuilder.create<scf::ForOp>(loc, zero, N, one);
-  Builder jBuilder = jLoop.getBodyBuilder();
-    auto accum = jBuilder.create<memref::LoadOp>(loc, C, ValueRange{i, j});
-    auto kLoop = jBuilder.create<scf::ForOp>(loc, zero, K, one);
-    Builder kBuilder = kLoop.getBodyBuilder();
-      Value aVal = kBuilder.create<memref::LoadOp>(loc, A, ValueRange{i, k});
-      Value bVal = kBuilder.create<memref::LoadOp>(loc, B, ValueRange{k, j});
-      Value prod = kBuilder.create<arith::MulFOp>(loc, aVal, bVal);
-      accum = kBuilder.create<arith::AddFOp>(loc, accum, prod);
-    jBuilder.create<memref::StoreOp>(loc, accum, C, ValueRange{i, j});
+  auto jLoop = rewriter.create<scf::ForOp>(loc, zero, N, one);
+    auto kLoop = rewriter.create<scf::ForOp>(loc, zero, K, one);
+      // Scalar operations...
 ```
 
-The compiler sees three nested loops, loads, multiplies, adds, and stores. It doesn't know "this is matrix multiplication"—that semantic information is lost. Consequently:
+The Linalg operations carry semantic information ("this is matrix multiplication"), but the default lowering to loops is naive—it doesn't apply transformations. Consequently:
 
-- **No automatic tiling**: Compiler can't insert cache-friendly blocking without understanding the operation's structure
-- **No vectorization**: Processes one float32 at a time, leaving SIMD units (AVX2: 8-wide, AVX-512: 16-wide) idle
-- **No fusion opportunities**: Each operation has independent loop structure, preventing producer-consumer fusion
+- **No tiling**: Default lowering generates monolithic loops without cache-friendly blocking
+- **No vectorization**: Loops lower to scalar operations (one float32 per cycle instead of 8-16 with SIMD)
+- **No fusion**: Each Linalg operation lowers independently, preventing producer-consumer fusion
 
 **Problem 2: Sequential Operations Waste Memory Bandwidth**. Operations execute independently:
 
@@ -115,7 +114,7 @@ LLVM dialect: llvm.fadd, llvm.fmul
 Low Level (Mechanical)
 ```
 
-Chapter 13 jumped from Transformer dialect directly to SCF loops. We lost semantic information. Chapter 14 inserts Linalg as an intermediate step: Transformer → Linalg → (optimizations) → SCF → Arith → LLVM.
+Chapters 11-13 already use the Linalg dialect as an intermediate representation: Transformer → Linalg → SCF → Arith → LLVM. However, the default `createConvertLinalgToLoopsPass()` performs naive lowering without optimization. Chapter 14 applies advanced transformations before lowering: Transformer → Linalg → **(Transform Dialect optimizations)** → SCF → Arith → LLVM.
 
 **Linalg Matrix Multiplication**. Replace 40+ lines of nested loops with semantic operation:
 
@@ -235,7 +234,7 @@ The `iteratorTypes` attribute specifies `parallel`—all iterations are independ
 
 3. **Iterator Types**: `parallel` vs `reduction` semantics enable aggressive transformations (parallel iterations vectorize, reorder freely)
 
-Linalg IR is **semantically equivalent** to Chapter 13's SCF IR—same computation, higher abstraction. The educational value is learning the transformation, not measuring speedup on nano GPT.
+Optimized Linalg IR (with tiling, vectorization, fusion) is **semantically equivalent** to Chapters 11-13's naive loop lowering—same computation, but with transformations applied before conversion to SCF. The educational value is learning these production-grade optimization techniques, not measuring speedup on nano GPT (which is too small to show significant gains).
 
 ## 14.3 Declarative Rewrite Rules (DRR)
 

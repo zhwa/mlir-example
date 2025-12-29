@@ -3,9 +3,11 @@
 #include "TransformerOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Utils/StructuredOpsUtils.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -148,46 +150,56 @@ struct LinearOpLowering : public OpRewritePattern<LinearOp> {
 
     auto inputType = cast<MemRefType>(input.getType());
     auto weightType = cast<MemRefType>(weight.getType());
+    auto outputType = cast<MemRefType>(output.getType());
+
+    // Linear: output = input @ weight + bias
+    // Ch13 convention: weight is already (in_features, out_features)
+    // input: (seq_len, in_features), weight: (in_features, out_features)
 
     int64_t seqLen = inputType.getShape()[0];
     int64_t inFeatures = inputType.getShape()[1];
-    int64_t outFeatures = weightType.getShape()[0];
+    int64_t outFeatures = weightType.getShape()[1];  // Ch13: weight is [in, out]
 
+    // Step 1: Initialize output to zero and perform matmul
     Value zero = createConstantFloat(rewriter, loc, 0.0f);
-    Value seqLenVal = createConstantIndex(rewriter, loc, seqLen);
-    Value outFeaturesVal = createConstantIndex(rewriter, loc, outFeatures);
-    Value inFeaturesVal = createConstantIndex(rewriter, loc, inFeatures);
-    Value zeroIdx = createConstantIndex(rewriter, loc, 0);
-    Value oneIdx = createConstantIndex(rewriter, loc, 1);
+    rewriter.create<linalg::FillOp>(loc, zero, output);
 
-    // output[i, j] = sum_k(input[i, k] * weight[j, k]) + bias[j]
-    rewriter.create<scf::ForOp>(
-        loc, zeroIdx, seqLenVal, oneIdx, ValueRange{},
-        [&](OpBuilder &builder, Location loc, Value i, ValueRange iterArgs) {
-          builder.create<scf::ForOp>(
-              loc, zeroIdx, outFeaturesVal, oneIdx, ValueRange{},
-              [&](OpBuilder &builder, Location loc, Value j, ValueRange iterArgs) {
-                // Compute matmul: sum_k(input[i, k] * weight[j, k])
-                Value sum = builder.create<scf::ForOp>(
-                    loc, zeroIdx, inFeaturesVal, oneIdx, ValueRange{zero},
-                    [&](OpBuilder &builder, Location loc, Value k, ValueRange iterArgs) {
-                      Value currentSum = iterArgs[0];
-                      Value inputVal = builder.create<memref::LoadOp>(loc, input, ValueRange{i, k});
-                      Value weightVal = builder.create<memref::LoadOp>(loc, weight, ValueRange{j, k});
-                      Value prod = builder.create<arith::MulFOp>(loc, inputVal, weightVal);
-                      Value newSum = builder.create<arith::AddFOp>(loc, currentSum, prod);
-                      builder.create<scf::YieldOp>(loc, newSum);
-                    }).getResult(0);
+    // Matmul: (seq_len, in_features) @ (in_features, out_features) -> (seq_len, out_features)
+    rewriter.create<linalg::MatmulOp>(
+        loc,
+        ValueRange{input, weight},  // No transpose needed for Ch13
+        ValueRange{output}
+    );
 
-                // Add bias
-                Value biasVal = builder.create<memref::LoadOp>(loc, bias, ValueRange{j});
-                Value result = builder.create<arith::AddFOp>(loc, sum, biasVal);
+    // Step 2: Add bias using linalg.generic (broadcast bias across seq_len)
+    int rank = 2;
+    SmallVector<AffineMap> indexingMaps;
+    auto identityMap = AffineMap::getMultiDimIdentityMap(rank, rewriter.getContext());
 
-                builder.create<memref::StoreOp>(loc, result, output, ValueRange{i, j});
-                builder.create<scf::YieldOp>(loc);
-              });
-          builder.create<scf::YieldOp>(loc);
-        });
+    // Broadcast map for bias (only last dimension)
+    SmallVector<AffineExpr> biasExprs;
+    biasExprs.push_back(rewriter.getAffineDimExpr(1));  // only use second dimension
+    AffineMap biasMap = AffineMap::get(rank, 0, biasExprs, rewriter.getContext());
+
+    indexingMaps.push_back(biasMap);       // bias input (1D)
+    indexingMaps.push_back(identityMap);   // output (2D)
+
+    SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
+
+    rewriter.create<linalg::GenericOp>(
+        loc,
+        TypeRange{},           // result types (output is updated in-place)
+        ValueRange{bias},      // inputs
+        ValueRange{output},    // outputs
+        indexingMaps,
+        iteratorTypes,
+        [&](OpBuilder &b, Location loc, ValueRange args) {
+          Value biasVal = args[0];
+          Value outputVal = args[1];
+          Value sum = b.create<arith::AddFOp>(loc, outputVal, biasVal);
+          b.create<linalg::YieldOp>(loc, sum);
+        }
+    );
 
     rewriter.eraseOp(op);
     return success();

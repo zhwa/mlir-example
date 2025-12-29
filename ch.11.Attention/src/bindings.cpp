@@ -5,6 +5,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -27,6 +28,7 @@
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
+#include "mlir/Dialect/Linalg/Passes.h"
 
 #include <llvm/Support/TargetSelect.h>
 
@@ -66,6 +68,7 @@ public:
     context_.getOrLoadDialect<TransformerDialect>();
     context_.getOrLoadDialect<func::FuncDialect>();
     context_.getOrLoadDialect<arith::ArithDialect>();
+    context_.getOrLoadDialect<linalg::LinalgDialect>();
     context_.getOrLoadDialect<memref::MemRefDialect>();
     context_.getOrLoadDialect<scf::SCFDialect>();
     context_.getOrLoadDialect<math::MathDialect>();
@@ -77,10 +80,14 @@ public:
   bool lowerToLLVM(ModuleOp module) {
     PassManager pm(&context_);
 
-    // Lower transformer dialect to standard dialects
+    // Lower transformer dialect to linalg and standard dialects
     pm.addNestedPass<func::FuncOp>(createLowerTransformerToStandardPass());
     pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
     pm.addNestedPass<func::FuncOp>(createCSEPass());
+
+    // Lower linalg: convert named ops to loops
+    pm.addPass(createConvertLinalgToLoopsPass());
+    pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
 
     // Lower to LLVM
     pm.addPass(createConvertMathToLLVMPass());

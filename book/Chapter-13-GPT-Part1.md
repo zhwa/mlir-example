@@ -101,6 +101,10 @@ This roughly matches GPT-2 small's actual parameter count (~117M, which includes
 
 Part 2 will cover Rotary Position Embeddings (RoPE), autoregressive generation, sampling strategies, and text generation pipelines.
 
+**Implementation Architecture**. Chapter 13 inherits Chapter 12's linalg-based lowering patterns for the 8 common transformer operations (LayerNorm, Linear, GELU, Add, Matmul, Transpose, Softmax, Scale). These operations lower to structured `linalg` dialect operations, enabling optimization passes and portable compilation. Chapter 13 adds 4 GPT-specific operations (Embedding, CreateCausalMask, MaskedSoftmax, RoPE) that use manual loop lowering for domain-specific logic not expressible in linalg's structured iteration model. This hybrid approach—linalg for regular computations, manual loops for specialized operations—balances optimization opportunities with implementation flexibility.
+
+The common operations work identically in Chapters 11, 12, and 13, providing architectural consistency. Changes to these operations (e.g., adding tiling optimizations or vectorization) propagate automatically across all three chapters. The GPT-specific operations remain independent, allowing Chapter 13 to implement unique functionality (integer token indexing, conditional masking, pairwise dimension rotation) without constraining Chapter 12's design.
+
 ## 13.2 Token Embeddings: From IDs to Vectors
 
 Language models operate on continuous vector spaces, but text consists of discrete tokens (words, subwords, or characters). Token embeddings bridge this gap by mapping each token ID to a learned vector representation. This section implements embedding lookup as an MLIR operation, demonstrates efficient lowering to memory access, and explores the role of embeddings in the model.

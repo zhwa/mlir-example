@@ -175,7 +175,6 @@ def Transformer_MatmulOp : Transformer_Op<"matmul"> {
 - **AnyMemRef**: Accepts memrefs of any rank/type. Verification (if needed) happens at lowering time.
 - **Assembly format**: Custom syntax `transformer.matmul %A, %B, %C : memref<...>, memref<...>, memref<...>`. Mirrors operation semantics directly.
 
-**Why Not Use Linalg.Matmul?** We could! This chapter uses custom operations purely for pedagogical clarity: operations explicitly represent attention stages, making the computation graph easier to understand. Chapter 14 actually switches back to `linalg.matmul` because modern optimizations (tiling, fusion, vectorization via Transform dialect) work best with standard linalg operations, not custom dialects.
 
 ### 11.2.2 Transpose
 
@@ -235,67 +234,27 @@ def Transformer_MulOp : Transformer_Op<"mul"> {
 Addition handles residual connections (Chapter 12). Multiplication implements scaling (dividing by √d_k). Both are rank-generic: work on any-shaped memrefs with compatible shapes.
 
 
-## 11.3 Lowering Patterns: From Attention to Loops
+## 11.3 Lowering Patterns: Leveraging the Linalg Dialect
 
-Operations defined, we now implement lowering—converting high-level `transformer.*` operations to standard MLIR dialects (SCF loops, arithmetic operations, memref accesses). 
+Operations defined, we now implement lowering—converting high-level `transformer.*` operations to MLIR's **Linalg dialect**. Linalg provides structured operations for linear algebra that MLIR's optimization passes understand deeply. By lowering to linalg instead of raw loops, we get free optimizations: tiling, fusion, vectorization, parallelization.
+
+**Design Philosophy**: The transformer dialect is a **thin wrapper** around linalg. Operations provide domain-specific names (`transformer.matmul` is clearer than `linalg.matmul` in attention code), but immediately lower to linalg for optimization. This combines usability with performance.
 
 ### 11.3.1 Matrix Multiplication Lowering
 
-Matrix multiplication C = A @ B requires nested loops. The naive triple-nested loop:
-
-```cpp
-for i in 0..M:
-  for j in 0..N:
-    sum = 0.0
-    for k in 0..K:
-      sum += A[i, k] * B[k, j]
-    C[i, j] = sum
-```
-
-In MLIR IR (after lowering `transformer.matmul`):
+Matrix multiplication C = A @ B lowers to two linalg operations:
 
 ```mlir
-%c0 = arith.constant 0 : index
-%c1 = arith.constant 1 : index
-%dim0 = memref.dim %A, %c0 : memref<?x?xf32>  // M
-%dim1 = memref.dim %B, %c1 : memref<?x?xf32>  // N
-%dim2 = memref.dim %A, %c1 : memref<?x?xf32>  // K
-
-// Zero-initialize output
-scf.for %i = %c0 to %dim0 step %c1 {
-  scf.for %j = %c0 to %dim1 step %c1 {
-    %zero = arith.constant 0.0 : f32
-    memref.store %zero, %C[%i, %j] : memref<?x?xf32>
-  }
-}
-
-// Compute matmul
-scf.for %i = %c0 to %dim0 step %c1 {
-  scf.for %j = %c0 to %dim1 step %c1 {
-    %sum = scf.for %k = %c0 to %dim2 step %c1
-           iter_args(%acc = %zero_f32) -> (f32) {
-      %a = memref.load %A[%i, %k] : memref<?x?xf32>
-      %b = memref.load %B[%k, %j] : memref<?x?xf32>
-      %prod = arith.mulf %a, %b : f32
-      %new_acc = arith.addf %acc, %prod : f32
-      scf.yield %new_acc : f32
-    }
-    memref.store %sum, %C[%i, %j] : memref<?x?xf32>
-  }
-}
+linalg.fill ins(%zero : f32) outs(%C : memref<?x?xf32>)
+linalg.matmul ins(%A, %B : memref<?x?xf32>, memref<?x?xf32>)
+              outs(%C : memref<?x?xf32>)
 ```
 
-**Key Patterns**:
+**Zero Initialization**: `linalg.fill` sets all elements of C to zero before accumulation. Skipping this produces undefined behavior.
 
-1. **Dynamic Dimensions**: `memref.dim` queries dimensions at runtime. Attention handles variable sequence lengths; hardcoding dimensions fails.
+**Structured Operation**: `linalg.matmul` is a **named operation**—MLIR knows its semantics (`C[i,j] += A[i,k] * B[k,j]`). Optimization passes can tile it, fuse it with consumers, vectorize it, or parallelize it automatically.
 
-2. **Zero Initialization**: Before accumulating, ensure C contains zeros. Skipping this produces undefined behavior (loading from uninitialized memory).
-
-3. **Loop-Carried Variables**: The `%k` loop uses `iter_args` to accumulate the sum. Each iteration updates `%acc`, final value stored in C.
-
-4. **SSA Form**: Every value has exactly one definition. `%sum` is the result of the innermost loop, then stored.
-
-**The Lowering Pattern Implementation**. From [src/TransformerToStandard.cpp](ch.11.Attention/src/TransformerToStandard.cpp):
+**The Lowering Pattern**. From [src/TransformerToStandard.cpp](ch.11.Attention/src/TransformerToStandard.cpp):
 
 ```cpp
 struct MatmulOpLowering : public OpRewritePattern<MatmulOp> {
@@ -308,64 +267,14 @@ struct MatmulOpLowering : public OpRewritePattern<MatmulOp> {
     Value rhs = op.getRhs();
     Value output = op.getOutput();
 
-    auto outputType = cast<MemRefType>(output.getType());
-    if (outputType.getRank() != 2) {
-      return op.emitError("Only 2D matmul supported currently");
-    }
-
-    // Constants for loop bounds
-    Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-    Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
-    
-    // Dimensions: M = lhs.dim(0), K = lhs.dim(1), N = rhs.dim(1)
-    Value M = rewriter.create<memref::DimOp>(loc, lhs, c0);
-    Value K = rewriter.create<memref::DimOp>(loc, lhs, c1);
-    Value N = rewriter.create<memref::DimOp>(loc, rhs, c1);
-
-    // Zero constant for initialization
-    Value zero_f32 = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getF32FloatAttr(0.0));
-
     // Zero-initialize output
-    rewriter.create<scf::ForOp>(loc, c0, M, c1, std::nullopt,
-        [&](OpBuilder &b, Location loc, Value i, ValueRange) {
-      b.create<scf::ForOp>(loc, c0, N, c1, std::nullopt,
-          [&](OpBuilder &b, Location loc, Value j, ValueRange) {
-        b.create<memref::StoreOp>(loc, zero_f32, output,
-                                   ValueRange{i, j});
-      });
-    });
+    Value zero = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getF32FloatAttr(0.0));
+    rewriter.create<linalg::FillOp>(loc, zero, output);
 
-    // Main computation: C[i,j] += A[i,k] * B[k,j]
-    rewriter.create<scf::ForOp>(loc, c0, M, c1, std::nullopt,
-        [&](OpBuilder &b, Location loc, Value i, ValueRange) {
-      b.create<scf::ForOp>(loc, c0, N, c1, std::nullopt,
-          [&](OpBuilder &b, Location loc, Value j, ValueRange) {
-        // Inner reduction loop
-        auto loop = b.create<scf::ForOp>(loc, c0, K, c1,
-                                          ValueRange{zero_f32});
-        Block &loopBody = loop.getRegion().front();
-        OpBuilder::InsertionGuard guard(b);
-        b.setInsertionPointToStart(&loopBody);
-        
-        Value k = loopBody.getArgument(0);
-        Value acc = loopBody.getArgument(1);
-        
-        Value a_val = b.create<memref::LoadOp>(loc, lhs,
-                                                ValueRange{i, k});
-        Value b_val = b.create<memref::LoadOp>(loc, rhs,
-                                                ValueRange{k, j});
-        Value prod = b.create<arith::MulFOp>(loc, a_val, b_val);
-        Value new_acc = b.create<arith::AddFOp>(loc, acc, prod);
-        b.create<scf::YieldOp>(loc, new_acc);
-        
-        // Store result
-        b.setInsertionPointAfter(loop);
-        Value sum = loop.getResult(0);
-        b.create<memref::StoreOp>(loc, sum, output,
-                                   ValueRange{i, j});
-      });
-    });
+    // Matrix multiplication
+    rewriter.create<linalg::MatmulOp>(
+        loc, ValueRange{lhs, rhs}, ValueRange{output});
 
     rewriter.eraseOp(op);
     return success();
@@ -373,61 +282,21 @@ struct MatmulOpLowering : public OpRewritePattern<MatmulOp> {
 };
 ```
 
-**Breaking Down the Pattern**:
+Compare to manual loop lowering: ~115 lines of nested `scf.for` loops with index management, load/store operations, and accumulation logic—now 11 lines. The linalg operation encapsulates all that complexity.
 
-1. **OpRewritePattern<MatmulOp>**: Type-safe pattern matching. Framework calls this when encountering `transformer.matmul`.
-
-2. **OpBuilder Lambdas**: The lambdas `[&](OpBuilder &b, ...)` are C++ callbacks for building loop bodies. They capture variables by reference (`&`), allowing access to surrounding scope.
-
-3. **Nested Loop Construction**: Each `scf.ForOp` creates a loop. Nesting them creates the triple-nested structure. The innermost loop has `iter_args` for the accumulator.
-
-4. **InsertionGuard**: Manages where new operations appear. Without it, operations could insert in wrong places (outside loops, after returns, etc.).
-
-5. **eraseOp**: Removes the original `transformer.matmul`. The rewriter automatically updates uses (though matmul has no results—it writes to `output` in-place).
-
-This pattern is ~80 lines of C++ (including error handling, comments). Compare to writing the loop nest manually every time: 80 lines written once beats duplicating logic everywhere.
+**Execution**: Later passes convert `linalg.matmul` to loops (via `createConvertLinalgToLoopsPass()`), generating the same nested structure—but optimization passes run **before** that conversion, applying transformations impossible with raw loops.
 
 ### 11.3.2 Transpose Lowering
 
-Transpose swaps dimensions. For 2D matrix A (M×N) to B (N×M):
-
-```cpp
-for i in 0..M:
-  for j in 0..N:
-    B[j, i] = A[i, j]
-```
-
-Notice the swapped indices in the store: reading A with `[i, j]`, storing in B with `[j, i]`. That's the transpose.
-
-**The Critical Bug**. A common mistake:
+Transpose swaps the last two dimensions. Linalg provides `linalg.transpose` with a permutation map:
 
 ```mlir
-// WRONG: iterates over input dimensions
-scf.for %i = %c0 to %input_dim0 step %c1 {
-  scf.for %j = %c0 to %input_dim1 step %c1 {
-    %val = memref.load %input[%i, %j]
-    memref.store %val, %output[%j, %i]  // Out-of-bounds if dimensions differ!
-  }
-}
+linalg.transpose ins(%input : memref<?x?xf32>)
+                  outs(%output : memref<?x?xf32>)
+                  permutation = [1, 0]
 ```
 
-If input is 4×8, output is 8×4. Loop iterates `i=0..4, j=0..8`, storing at `[j, i]` = `[0..8, 0..4]`. But output's second dimension is 4, not 8—writing at `[7, 3]` is out-of-bounds!
-
-**Correct Implementation**: Iterate over **output** dimensions:
-
-```mlir
-%out_dim0 = memref.dim %output, %c0  // N
-%out_dim1 = memref.dim %output, %c1  // M
-
-scf.for %i = %c0 to %out_dim0 step %c1 {
-  scf.for %j = %c0 to %out_dim1 step %c1 {
-    %val = memref.load %input[%j, %i]  // Read with swapped indices
-    memref.store %val, %output[%i, %j] // Write with normal indices
-  }
-}
-```
-
-Now iterating `i=0..N, j=0..M` (output dimensions), reading from input with swapped indices `[j, i]` (always in bounds for M×N input), writing to output with normal indices `[i, j]` (always in bounds for N×M output).
+The permutation `[1, 0]` means "dimension 0 of output comes from dimension 1 of input, dimension 1 of output comes from dimension 0 of input"—swapping them.
 
 **The Lowering Pattern**:
 
@@ -441,25 +310,17 @@ struct TransposeOpLowering : public OpRewritePattern<TransposeOp> {
     Value input = op.getInput();
     Value output = op.getOutput();
 
-    Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-    Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    auto inputType = cast<MemRefType>(input.getType());
+    int64_t rank = inputType.getRank();
 
-    // CRITICAL: Use OUTPUT dimensions for loop bounds!
-    Value out_dim0 = rewriter.create<memref::DimOp>(loc, output, c0);
-    Value out_dim1 = rewriter.create<memref::DimOp>(loc, output, c1);
+    // Permutation: swap last two dimensions
+    SmallVector<int64_t> perm(rank);
+    for (int64_t i = 0; i < rank; ++i)
+      perm[i] = i;
+    std::swap(perm[rank - 2], perm[rank - 1]);
 
-    rewriter.create<scf::ForOp>(loc, c0, out_dim0, c1, std::nullopt,
-        [&](OpBuilder &b, Location loc, Value i, ValueRange) {
-      b.create<scf::ForOp>(loc, c0, out_dim1, c1, std::nullopt,
-          [&](OpBuilder &b, Location loc, Value j, ValueRange) {
-        // Read from input with SWAPPED indices
-        Value val = b.create<memref::LoadOp>(loc, input,
-                                              ValueRange{j, i});
-        // Write to output with NORMAL indices
-        b.create<memref::StoreOp>(loc, val, output,
-                                   ValueRange{i, j});
-      });
-    });
+    rewriter.create<linalg::TransposeOp>(
+        loc, input, output, perm);
 
     rewriter.eraseOp(op);
     return success();
@@ -467,172 +328,195 @@ struct TransposeOpLowering : public OpRewritePattern<TransposeOp> {
 };
 ```
 
-This pattern is simpler than matmul (no accumulation), but the index-swapping subtlety has burned many developers. Test thoroughly!
+This pattern constructs a permutation vector `[0, 1, ..., rank-3, rank-1, rank-2]` (identity except swapping the last two dimensions). Works for 2D (rank 2) and 3D (rank 3, batched attention) tensors uniformly.
 
-### 11.3.3 Softmax Lowering: Three-Pass Numerical Stability
+Compare to manual lowering: ~50 lines of nested loops with careful index swapping—now 20 lines generating a declarative operation.
 
-Chapter 6 covered softmax for 1D vectors. Attention uses 2D softmax: apply softmax independently to each row. For scores matrix (seq_len × seq_len), each row becomes attention weights for one query position.
+### 11.3.3 Softmax Lowering: Reductions and Broadcasting
 
-**The Stable Softmax Algorithm** (per row):
+Softmax combines reductions (finding max, summing) with element-wise operations (exp, division). Linalg handles both via `linalg.reduce` and `linalg.generic`.
+
+**The Algorithm** (per row):
 
 ```
-Pass 1: Find maximum
-  max_val = max(scores[i, :])
-
-Pass 2: Compute exponentials and sum
-  sum = 0
-  for j in 0..seq_len:
-    exp_vals[j] = exp(scores[i, j] - max_val)
-    sum += exp_vals[j]
-
-Pass 3: Normalize
-  for j in 0..seq_len:
-    output[i, j] = exp_vals[j] / sum
+1. max_val = reduce_max(input along last dimension)
+2. shifted = input - max_val  (broadcast max_val)
+3. exp_vals = exp(shifted)
+4. sum_exp = reduce_sum(exp_vals along last dimension)
+5. output = exp_vals / sum_exp  (broadcast sum_exp)
 ```
 
-**Why Three Passes?** Cannot fuse passes 2 and 3: you need the full sum before normalizing. Fusing passes 1 and 2 is possible but complicates code. Three clear passes make verification straightforward.
-
-**MLIR Implementation**. The pattern creates three nested loop structures:
+**Step 1: Find Maximum**
 
 ```mlir
-// Pass 1: Find max per row
-scf.for %i = %c0 to %rows step %c1 {
-  %neg_inf = arith.constant -inf : f32
-  %row_max = scf.for %j = %c0 to %cols step %c1
-              iter_args(%max = %neg_inf) -> (f32) {
-    %val = memref.load %input[%i, %j]
-    %new_max = arith.maximumf %max, %val : f32
-    scf.yield %new_max : f32
-  }
-  memref.store %row_max, %max_buffer[%i] : memref<?xf32>
-}
+linalg.reduce { arith.maximumf }
+  ins(%input : memref<?x?xf32>)
+  outs(%max_vals : memref<?xf32>)
+  dimensions = [1]
+```
 
-// Pass 2: Compute exp(val - max) and accumulate sum
-scf.for %i = %c0 to %rows step %c1 {
-  %max_val = memref.load %max_buffer[%i] : memref<?xf32>
-  %sum = scf.for %j = %c0 to %cols step %c1
-         iter_args(%acc = %zero_f32) -> (f32) {
-    %val = memref.load %input[%i, %j]
-    %shifted = arith.subf %val, %max_val : f32
-    %exp_val = math.exp %shifted : f32
-    memref.store %exp_val, %exp_buffer[%i, %j]
-    %new_acc = arith.addf %acc, %exp_val : f32
-    scf.yield %new_acc : f32
-  }
-  memref.store %sum, %sum_buffer[%i] : memref<?xf32>
-}
+Reduces along dimension 1 (last dimension for 2D), applying `arith.maximumf` to accumulate. Result: one max per row.
 
-// Pass 3: Normalize by sum
-scf.for %i = %c0 to %rows step %c1 {
-  %sum = memref.load %sum_buffer[%i] : memref<?xf32>
-  scf.for %j = %c0 to %cols step %c1 {
-    %exp_val = memref.load %exp_buffer[%i, %j]
-    %normalized = arith.divf %exp_val, %sum : f32
-    memref.store %normalized, %output[%i, %j]
-  }
+**Step 2: Subtract Max (Broadcasting)**
+
+```mlir
+linalg.generic {
+  indexing_maps = [
+    affine_map<(d0, d1) -> (d0)>,      // max_vals: broadcast d0
+    affine_map<(d0, d1) -> (d0, d1)>,  // input: full tensor
+    affine_map<(d0, d1) -> (d0, d1)>   // output: full tensor
+  ],
+  iterator_types = ["parallel", "parallel"]
+}
+ins(%max_vals, %input : memref<?xf32>, memref<?x?xf32>)
+outs(%shifted : memref<?x?xf32>) {
+^bb0(%max: f32, %inp: f32, %out: f32):
+  %sub = arith.subf %inp, %max : f32
+  linalg.yield %sub : f32
 }
 ```
 
-**Memory Management**: This requires temporary buffers (`max_buffer`, `exp_buffer`, `sum_buffer`). The lowering pattern allocates them:
+The affine map `(d0, d1) -> (d0)` **broadcasts** `max_vals`: for each `(i, j)`, `max_vals[i]` repeats across all `j`. This implements `shifted[i, j] = input[i, j] - max_vals[i]`.
+
+**Steps 3-5**: Follow the same pattern—reduce for sum, generic for exp and division with broadcasting.
+
+**The Lowering Pattern** (abbreviated):
 
 ```cpp
-// Allocate buffers for intermediate values
-auto max_buffer_type = MemRefType::get({ShapedType::kDynamic},
-                                        rewriter.getF32Type());
-Value max_buffer = rewriter.create<memref::AllocOp>(loc, max_buffer_type,
-                                                      ValueRange{rows});
-
-auto exp_buffer_type = outputType;  // Same shape as output
-Value exp_buffer = rewriter.create<memref::AllocOp>(loc, exp_buffer_type,
-                                                      ValueRange{rows, cols});
-
-auto sum_buffer_type = max_buffer_type;  // One value per row
-Value sum_buffer = rewriter.create<memref::AllocOp>(loc, sum_buffer_type,
-                                                      ValueRange{rows});
+struct SoftmaxOpLowering : public OpRewritePattern<SoftmaxOp> {
+  LogicalResult matchAndRewrite(SoftmaxOp op,
+                                  PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    Value input = op.getInput();
+    Value output = op.getOutput();
+    
+    auto inputType = cast<MemRefType>(input.getType());
+    auto shape = inputType.getShape();
+    int64_t rank = inputType.getRank();
+    
+    // Allocate temporaries for max and sum
+    auto reducedShape = SmallVector<int64_t>(shape.begin(), shape.end() - 1);
+    auto maxType = MemRefType::get(reducedShape, rewriter.getF32Type());
+    Value maxVals = rewriter.create<memref::AllocOp>(loc, maxType);
+    
+    // Step 1: Reduce max along last dimension
+    rewriter.create<linalg::ReduceOp>(
+        loc, ValueRange{input}, ValueRange{maxVals},
+        ArrayRef<int64_t>{rank - 1},
+        [&](OpBuilder &b, Location loc, ValueRange args) {
+          Value max = b.create<arith::MaximumFOp>(loc, args[0], args[1]);
+          b.create<linalg::YieldOp>(loc, max);
+        });
+    
+    // Step 2: Subtract max (broadcasting) and compute exp
+    // ... (linalg.generic with affine maps for broadcasting)
+    
+    // Step 3: Reduce sum
+    // ... (linalg.reduce with addf)
+    
+    // Step 4: Divide by sum (broadcasting)
+    // ... (linalg.generic with broadcasting)
+    
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
 ```
 
-These allocations happen **once per softmax operation** at runtime (when executing JIT-compiled code). For typical attention (seq_len=512), that's:
-- max_buffer: 512 floats (2KB)
-- exp_buffer: 512×512 floats (1MB)
-- sum_buffer: 512 floats (2KB)
-
-The exp_buffer dominates. Future optimizations (Chapter 14) can eliminate it through fusion—compute exp and immediately divide, avoiding the intermediate storage. But for correctness-first implementation, explicit buffers clarify the algorithm.
+Compare to manual lowering: ~105 lines of three-pass nested loops with temporary buffers—now 75 lines of declarative linalg operations. More importantly, linalg's structured form enables **fusion**: later passes can merge operations, eliminating intermediate buffers.
 
 ### 11.3.4 Element-Wise Operations
 
-Element-wise addition and multiplication are straightforward. For any-ranked tensors with matching shapes:
+Addition and multiplication are element-wise: `output[i, j] = lhs[i, j] + rhs[i, j]`. Linalg generic handles these:
 
 ```mlir
-scf.for %i0 = %c0 to %dim0 step %c1 {
-  scf.for %i1 = %c0 to %dim1 step %c1 {
-    // ... nested loops for all dimensions ...
-    %lhs_val = memref.load %lhs[%i0, %i1, ...]
-    %rhs_val = memref.load %rhs[%i0, %i1, ...]
-    %result = arith.addf %lhs_val, %rhs_val : f32  // or arith.mulf
-    memref.store %result, %output[%i0, %i1, ...]
-  }
+linalg.generic {
+  indexing_maps = [
+    affine_map<(d0, d1) -> (d0, d1)>,  // lhs
+    affine_map<(d0, d1) -> (d0, d1)>,  // rhs
+    affine_map<(d0, d1) -> (d0, d1)>   // output
+  ],
+  iterator_types = ["parallel", "parallel"]
+}
+ins(%lhs, %rhs : memref<?x?xf32>, memref<?x?xf32>)
+outs(%output : memref<?x?xf32>) {
+^bb0(%l: f32, %r: f32, %out: f32):
+  %sum = arith.addf %l, %r : f32
+  linalg.yield %sum : f32
 }
 ```
 
-The pattern needs to handle arbitrary ranks—2D, 3D, etc. Use dynamic loop construction:
+**Identity Maps**: All three operands use `(d0, d1) -> (d0, d1)`—no broadcasting, direct element correspondence.
+
+**Parallel Iteration**: Both dimensions are `"parallel"`, meaning iterations are independent (no carried dependencies). MLIR can parallelize this automatically.
+
+**The Lowering Patterns**:
 
 ```cpp
 struct AddOpLowering : public OpRewritePattern<AddOp> {
-  using OpRewritePattern<AddOp>::OpRewritePattern;
-
   LogicalResult matchAndRewrite(AddOp op,
                                   PatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
     Value lhs = op.getLhs();
     Value rhs = op.getRhs();
     Value output = op.getOutput();
-
+    
     auto outputType = cast<MemRefType>(output.getType());
     int64_t rank = outputType.getRank();
-
-    Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-    Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
-
-    // Build nested loops for each dimension
-    SmallVector<Value, 4> dims;
-    for (int64_t i = 0; i < rank; ++i) {
-      Value dim = rewriter.create<memref::DimOp>(
-          loc, output, rewriter.create<arith::ConstantIndexOp>(loc, i));
-      dims.push_back(dim);
-    }
-
-    // Recursive function to build nested loops
-    std::function<void(OpBuilder&, Location, int64_t, SmallVector<Value, 4>&)>
-        buildLoops = [&](OpBuilder &b, Location loc, int64_t depth,
-                          SmallVector<Value, 4> &indices) {
-      if (depth == rank) {
-        // Innermost: perform the add operation
-        Value lhs_val = b.create<memref::LoadOp>(loc, lhs, indices);
-        Value rhs_val = b.create<memref::LoadOp>(loc, rhs, indices);
-        Value sum = b.create<arith::AddFOp>(loc, lhs_val, rhs_val);
-        b.create<memref::StoreOp>(loc, sum, output, indices);
-        return;
-      }
-
-      // Create loop for this dimension
-      b.create<scf::ForOp>(loc, c0, dims[depth], c1, std::nullopt,
-          [&](OpBuilder &b, Location loc, Value idx, ValueRange) {
-        SmallVector<Value, 4> new_indices = indices;
-        new_indices.push_back(idx);
-        buildLoops(b, loc, depth + 1, new_indices);
-      });
-    };
-
-    SmallVector<Value, 4> indices;
-    buildLoops(rewriter, loc, 0, indices);
-
+    
+    // Build identity affine maps for all operands
+    SmallVector<AffineMap> indexingMaps;
+    for (int i = 0; i < 3; ++i)
+      indexingMaps.push_back(rewriter.getMultiDimIdentityMap(rank));
+    
+    SmallVector<utils::IteratorType> iterators(
+        rank, utils::IteratorType::parallel);
+    
+    rewriter.create<linalg::GenericOp>(
+        loc, TypeRange{}, ValueRange{lhs, rhs}, ValueRange{output},
+        indexingMaps, iterators,
+        [&](OpBuilder &b, Location loc, ValueRange args) {
+          Value sum = b.create<arith::AddFOp>(loc, args[0], args[1]);
+          b.create<linalg::YieldOp>(loc, sum);
+        });
+    
     rewriter.eraseOp(op);
     return success();
   }
 };
 ```
 
-This pattern works for 1D, 2D, 3D, or any rank—the recursive `buildLoops` function constructs the right number of nested loops. Mul follows the same pattern, substituting `arith.MulFOp` for `arith.AddFOp`.
+Multiplication follows identically, replacing `arith.AddFOp` with `arith.MulFOp`.
+
+Compare to manual lowering: ~50 lines of recursive loop generation for arbitrary ranks—now 25 lines of generic operation. Rank-polymorphism comes naturally with linalg.
+
+### 11.3.5 From Linalg to Loops: The Pass Pipeline
+
+Linalg operations don't execute directly—they lower to loops. The pass pipeline:
+
+```cpp
+pm.addPass(createLowerTransformerToStandardPass());  // transformer -> linalg
+pm.addPass(createConvertLinalgToLoopsPass());        // linalg -> scf.for
+pm.addPass(createConvertSCFToCFPass());              // scf -> control flow
+// ... remaining passes to LLVM IR
+```
+
+**Key Insight**: Optimization passes run **between** transformer→linalg and linalg→loops. Linalg's structured form enables:
+
+- **Tiling**: Break operations into cache-friendly blocks
+- **Fusion**: Merge producer-consumer operations, eliminating loads/stores
+- **Vectorization**: Generate SIMD instructions (AVX, NEON)
+- **Parallelization**: Distribute across threads
+
+Manual loop lowering bypasses these. By lowering to linalg, we get these optimizations **for free** as MLIR evolves.
+
+**Registering the Linalg Dialect**. From [src/bindings.cpp](ch.11.Attention/src/bindings.cpp):
+
+```cpp
+context_.getOrLoadDialect<linalg::LinalgDialect>();
+```
+
+The linalg dialect must be registered before lowering patterns can emit linalg operations. Forgetting this produces "unknown dialect" errors at runtime.
 
 **Lowering Pass Organization**. All patterns register in a single pass:
 
@@ -1024,8 +908,12 @@ High-level transformer operations, explicit buffer allocations, correct dependen
 bool TransformerCompiler::lowerToLLVM(ModuleOp module) {
   PassManager pm(&context_);
 
-  // Lower transformer dialect to standard dialects
+  // Lower transformer dialect to linalg
   pm.addNestedPass<func::FuncOp>(createLowerTransformerToStandardPass());
+  
+  // Lower linalg to loops
+  pm.addPass(createConvertLinalgToLoopsPass());
+  
   pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
   pm.addNestedPass<func::FuncOp>(createCSEPass());
 
@@ -1043,7 +931,7 @@ bool TransformerCompiler::lowerToLLVM(ModuleOp module) {
 }
 ```
 
-First, transformer ops → loops (Section 11.3's patterns). Then, loops → LLVM IR (standard MLIR passes). Canonicalization and CSE (common subexpression elimination) clean up between major transformations. After this pipeline, the module contains only LLVM dialect operations—pointers, branches, arithmetic instructions.
+First, transformer ops → linalg (Section 11.3's patterns). Then, linalg → scf.for loops (via `createConvertLinalgToLoopsPass()`). Finally, loops → LLVM IR (standard MLIR passes). Canonicalization and CSE (common subexpression elimination) clean up between major transformations. After this pipeline, the module contains only LLVM dialect operations—pointers, branches, arithmetic instructions.
 
 **Stage 3: LLVM IR to Native Code**. MLIR's ExecutionEngine compiles LLVM dialect to machine code:
 
@@ -1261,9 +1149,62 @@ func.func @graph_func(%Q: memref<4x8xf32>, %K: memref<4x8xf32>,
 }
 ```
 
-Five transformer operations, four intermediate buffers. This is the **before-lowering** IR—still high-level, still compositional. Now apply Section 11.3's lowering patterns:
+Five transformer operations, four intermediate buffers. This is the **before-lowering** IR—still high-level, still compositional. 
 
-**After Lowering** (abbreviated—full IR is hundreds of lines):
+**Two-Stage Lowering**: Section 11.3's patterns lower transformer operations to **linalg** operations first, then MLIR's `createConvertLinalgToLoopsPass()` converts linalg to scf.for loops. The intermediate linalg representation enables optimization passes (tiling, fusion, vectorization) before final loop generation.
+
+**After First Lowering** (transformer → linalg, abbreviated):
+
+```mlir
+func.func @graph_func(%Q: memref<4x8xf32>, %K: memref<4x8xf32>,
+                       %V: memref<4x8xf32>, %output: memref<4x8xf32>) {
+  %K_T = memref.alloc() : memref<8x4xf32>
+  
+  // Transpose: structured operation with permutation
+  linalg.transpose ins(%K : memref<4x8xf32>)
+                   outs(%K_T : memref<8x4xf32>)
+                   permutation = [1, 0]
+  
+  // Matmul: Q @ K_T -> scores
+  %scores = memref.alloc() : memref<4x4xf32>
+  %zero = arith.constant 0.0 : f32
+  linalg.fill ins(%zero : f32) outs(%scores : memref<4x4xf32>)
+  linalg.matmul ins(%Q, %K_T : memref<4x8xf32>, memref<8x4xf32>)
+                outs(%scores : memref<4x4xf32>)
+  
+  // Scale: element-wise multiply via linalg.generic
+  %scale_buf = memref.alloc() : memref<4x4xf32>
+  %scale_factor = arith.constant 0.353553 : f32
+  linalg.generic { /* identity maps, parallel iterators */ }
+    ins(%scores, %scale_factor : memref<4x4xf32>, f32)
+    outs(%scale_buf : memref<4x4xf32>) {
+    ^bb0(%score: f32, %factor: f32, %out: f32):
+      %scaled = arith.mulf %score, %factor : f32
+      linalg.yield %scaled : f32
+  }
+  
+  // Softmax: reduce max, generic exp, reduce sum, generic divide
+  %attn_weights = memref.alloc() : memref<4x4xf32>
+  %max_vals = memref.alloc() : memref<4xf32>
+  linalg.reduce { arith.maximumf }
+    ins(%scale_buf : memref<4x4xf32>)
+    outs(%max_vals : memref<4xf32>)
+    dimensions = [1]
+  
+  // ... (exp, sum, divide steps via linalg.generic)
+  
+  // Final matmul: attn_weights @ V -> output
+  linalg.fill ins(%zero : f32) outs(%output : memref<4x8xf32>)
+  linalg.matmul ins(%attn_weights, %V : memref<4x4xf32>, memref<4x8xf32>)
+                outs(%output : memref<4x8xf32>)
+  
+  func.return
+}
+```
+
+This linalg representation is **semantically meaningful** to MLIR's optimizer—it knows `linalg.matmul` performs matrix multiplication, enabling transformations like tiling or fusion that raw loops wouldn't support.
+
+**After Second Lowering** (linalg → scf.for loops, abbreviated):
 
 ```mlir
 func.func @graph_func(%Q: memref<4x8xf32>, %K: memref<4x8xf32>,
@@ -1929,19 +1870,21 @@ For Chapter 11, focus is on correctness and clarity. The MLIR infrastructure is 
 
 ## 11.10 Conclusion
 
-This chapter built a complete attention implementation in MLIR, from high-level operations to low-level loops to executable machine code. We defined a Transformer dialect with five operations, wrote lowering patterns converting those operations to SCF loops and arithmetic, designed a Python API building computation graphs, and JIT-compiled graphs to native code via LLVM.
+This chapter built a complete attention implementation in MLIR, from high-level operations to structured linear algebra operations to executable machine code. We defined a Transformer dialect with five operations, wrote lowering patterns converting those operations to linalg operations (which then lower to SCF loops and arithmetic), designed a Python API building computation graphs, and JIT-compiled graphs to native code via LLVM.
 
 **Key Takeaways**:
 
 1. **Domain-Specific Dialects**: Attention is naturally expressed as transformer.matmul, transformer.softmax, etc. Custom operations capture domain semantics, simplifying user code.
 
-2. **Multi-Level IR**: The same computation exists at three levels—Python API (user-facing), transformer dialect (semantic), SCF+arith (imperative). Each level serves a purpose: Python for ergonomics, transformer for optimization, SCF for lowering.
+2. **Multi-Level IR**: The same computation exists at four levels—Python API (user-facing), transformer dialect (semantic), linalg operations (structured), SCF+arith (imperative). Each level serves a purpose: Python for ergonomics, transformer for domain semantics, linalg for optimization, SCF for execution.
 
-3. **Pattern Rewriting**: Lowering patterns are modular—each operation lowers independently. MLIR's rewrite infrastructure handles orchestration. Adding new operations means adding new patterns; existing patterns remain unchanged.
+3. **Linalg as Optimization Layer**: By lowering to linalg operations instead of raw loops, we enable MLIR's optimization passes (tiling, fusion, vectorization) to transform our code automatically. The transformer dialect becomes a thin wrapper providing ergonomic names while leveraging linalg's powerful infrastructure.
 
-4. **Numerical Correctness**: Attention involves transcendental functions (exp), accumulation (matmul), and normalization (softmax). Numerical stability (max subtraction) and initialization (zero accumulators) are critical. Testing against references catches errors.
+4. **Pattern Rewriting**: Lowering patterns are modular—each operation lowers independently. MLIR's rewrite infrastructure handles orchestration. Adding new operations means adding new patterns; existing patterns remain unchanged.
 
-5. **Compilation Pipeline**: Computation graph → MLIR IR → LLVM IR → machine code → execution. Each stage is well-defined, with clear inputs/outputs. This modularity enables experimentation—swap lowering patterns, change targets, insert optimization passes.
+5. **Numerical Correctness**: Attention involves transcendental functions (exp), accumulation (matmul), and normalization (softmax). Numerical stability (max subtraction) and initialization (zero accumulators) are critical. Testing against references catches errors.
+
+6. **Compilation Pipeline**: Computation graph → transformer dialect → linalg operations → SCF loops → LLVM IR → machine code → execution. Each stage is well-defined, with clear inputs/outputs. This modularity enables experimentation—swap lowering patterns, change targets, insert optimization passes.
 
 **Limitations of Our Approach**:
 

@@ -118,20 +118,260 @@ print(output_text)
 
 ## Operations
 
-### New Operations (Chapter 13)
-- `transformer.embedding` - Token lookup
-- `transformer.rope` - Rotary position embeddings
-- `transformer.masked_softmax` - Softmax with causal mask
+Chapter 13 uses 12 operations: **8 common operations with linalg-based lowering** (shared architectural foundation with Chapters 11-12), and **4 GPT-specific operations with manual loop lowering** (domain-specific implementations).
 
-### Reused from Chapter 12
-- `transformer.layer_norm` - Layer normalization
-- `transformer.linear` - Linear transformation
-- `transformer.gelu` - GELU activation
-- `transformer.add` - Element-wise addition
-- `transformer.matmul` - Matrix multiplication
-- `transformer.transpose` - Transpose
-- `transformer.softmax` - Softmax
-- `transformer.scale` - Scalar multiplication
+### Common Operations (Linalg-based)
+These 8 operations use `linalg` dialect operations for structured computation:
+
+- **`transformer.layer_norm`** - Layer normalization using `linalg.reduce`, `linalg.fill`, `linalg.generic`
+- **`transformer.linear`** - Linear transformation using `linalg.matmul`, `linalg.generic` (bias broadcast)
+  - Note: Ch13 convention: weights are `(in_features, out_features)` (no transpose needed)
+- **`transformer.gelu`** - GELU activation using `linalg.generic` (element-wise polynomial approximation)
+- **`transformer.add`** - Element-wise addition using `linalg.generic`
+- **`transformer.matmul`** - Matrix multiplication using `linalg.matmul`
+- **`transformer.transpose`** - Matrix transpose using `linalg.transpose`
+- **`transformer.softmax`** - Softmax using `linalg.reduce`, `linalg.fill`, `linalg.generic`
+- **`transformer.scale`** - Scalar multiplication using `linalg.generic`
+
+### GPT-Specific Operations (Manual loops)
+These 4 operations use nested `scf.for` loops for domain-specific logic:
+
+- **`transformer.embedding`** - Token lookup (integer indexing, not suitable for linalg)
+- **`transformer.create_causal_mask`** - Generate lower-triangular mask (conditional logic)
+- **`transformer.masked_softmax`** - Softmax with mask addition (supports 2D/3D tensors)
+- **`transformer.rope`** - Rotary position embeddings (pairwise dimension rotation)
+
+---
+
+## Lowering Implementation
+
+Chapter 13's lowering strategy achieves architectural consistency with Chapters 11-12 by using **linalg-based patterns** for the 8 common operations, while preserving **manual loop implementations** for the 4 GPT-specific operations that require specialized logic.
+
+### Linalg-Based Lowering Patterns
+
+The 8 common operations lower to structured `linalg` operations, which then convert to loops via `createConvertLinalgToLoopsPass()`:
+
+#### 1. LayerNorm → linalg.reduce + linalg.generic
+```cpp
+// Step 1: Compute mean using linalg.reduce (parallel across batch, reduce across d_model)
+linalg::ReduceOp meanReduce = rewriter.create<linalg::ReduceOp>(
+    loc, ValueRange{input}, ValueRange{meanBuffer}, dimensions,
+    [&](OpBuilder &b, Location loc, ValueRange args) {
+      Value sum = b.create<arith::AddFOp>(loc, args[0], args[1]);
+      b.create<linalg::YieldOp>(loc, sum);
+    }
+);
+
+// Step 2: Compute variance using linalg.reduce (sum of squared differences)
+// Step 3: Normalize using linalg.generic (element-wise: (x - mean) * rsqrt(variance + eps))
+// Step 4: Apply scale/shift using linalg.generic (element-wise: normalized * gamma + beta)
+```
+
+#### 2. Linear → linalg.matmul + linalg.generic
+```cpp
+// Ch13 convention: weight is already (in_features, out_features), no transpose needed
+// Step 1: Initialize output and perform matmul
+rewriter.create<linalg::FillOp>(loc, zero, output);
+rewriter.create<linalg::MatmulOp>(loc, ValueRange{input, weight}, ValueRange{output});
+
+// Step 2: Broadcast bias across batch dimension
+SmallVector<AffineExpr> biasExprs;
+biasExprs.push_back(rewriter.getAffineDimExpr(1));  // Only use second dimension
+AffineMap biasMap = AffineMap::get(rank, 0, biasExprs, rewriter.getContext());
+
+rewriter.create<linalg::GenericOp>(
+    loc, TypeRange{}, ValueRange{bias}, ValueRange{output},
+    indexingMaps, iteratorTypes,
+    [&](OpBuilder &b, Location loc, ValueRange args) {
+      Value sum = b.create<arith::AddFOp>(loc, args[1], args[0]);
+      b.create<linalg::YieldOp>(loc, sum);
+    }
+);
+```
+
+**Note**: Chapter 13's `LinearOp` differs from Chapter 12's implementation:
+- **Ch12**: Weights are `(out_features, in_features)`, requires `linalg.transpose` before matmul
+- **Ch13**: Weights are `(in_features, out_features)`, used directly in matmul
+- This reflects different weight storage conventions in the test data
+
+#### 3. GELU → linalg.generic (element-wise)
+```cpp
+// GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+rewriter.create<linalg::GenericOp>(
+    loc, TypeRange{}, ValueRange{input}, ValueRange{output},
+    indexingMaps, iteratorTypes,
+    [&](OpBuilder &b, Location loc, ValueRange args) {
+      Value x = args[0];
+      // Compute x^3
+      Value x2 = b.create<arith::MulFOp>(loc, x, x);
+      Value x3 = b.create<arith::MulFOp>(loc, x2, x);
+      // ... (polynomial approximation)
+      Value result = /* computed result */;
+      b.create<linalg::YieldOp>(loc, result);
+    }
+);
+```
+
+#### 4. Matmul → linalg.matmul
+```cpp
+// Initialize output to zero, then perform matmul
+rewriter.create<linalg::FillOp>(loc, zero, output);
+rewriter.create<linalg::MatmulOp>(loc, ValueRange{lhs, rhs}, ValueRange{output});
+```
+
+#### 5. Transpose → linalg.transpose
+```cpp
+// Swap dimensions 0 and 1
+rewriter.create<linalg::TransposeOp>(
+    loc, input, output,
+    SmallVector<int64_t>{1, 0}  // permutation
+);
+```
+
+#### 6. Softmax → linalg.reduce + linalg.generic
+```cpp
+// Step 1: Find max using linalg.reduce (for numerical stability)
+linalg::ReduceOp maxReduce = rewriter.create<linalg::ReduceOp>(
+    loc, ValueRange{input}, ValueRange{maxBuffer}, dimensions,
+    [&](OpBuilder &b, Location loc, ValueRange args) {
+      Value max = b.create<arith::MaximumFOp>(loc, args[0], args[1]);
+      b.create<linalg::YieldOp>(loc, max);
+    }
+);
+
+// Step 2: Compute exp(x - max) and sum using linalg.generic + linalg.reduce
+// Step 3: Normalize: exp(x - max) / sum
+```
+
+#### 7. Add → linalg.generic
+```cpp
+// Element-wise addition with broadcasting support
+rewriter.create<linalg::GenericOp>(
+    loc, TypeRange{}, ValueRange{lhs, rhs}, ValueRange{output},
+    indexingMaps, iteratorTypes,
+    [&](OpBuilder &b, Location loc, ValueRange args) {
+      Value sum = b.create<arith::AddFOp>(loc, args[0], args[1]);
+      b.create<linalg::YieldOp>(loc, sum);
+    }
+);
+```
+
+#### 8. Scale → linalg.generic
+```cpp
+// Scalar multiplication: output[i,j] = input[i,j] * scalar
+rewriter.create<linalg::GenericOp>(
+    loc, TypeRange{}, ValueRange{input, scalar}, ValueRange{output},
+    indexingMaps, iteratorTypes,
+    [&](OpBuilder &b, Location loc, ValueRange args) {
+      Value product = b.create<arith::MulFOp>(loc, args[0], args[1]);
+      b.create<linalg::YieldOp>(loc, product);
+    }
+);
+```
+
+### Manual Loop Lowering (GPT-Specific Operations)
+
+The 4 GPT-specific operations use nested `scf.for` loops because they require logic not expressible in linalg's structured iteration model:
+
+#### 1. Embedding → scf.for (integer indexing)
+```cpp
+// Token lookup requires integer index → memref access
+rewriter.create<scf::ForOp>(
+    loc, zeroIdx, seqLenVal, oneIdx, ValueRange{},
+    [&](OpBuilder &builder, Location loc, Value i, ValueRange iterArgs) {
+      // Load token ID, convert int32 → index
+      Value tokenId = builder.create<memref::LoadOp>(loc, indices, ValueRange{i});
+      Value tokenIdx = builder.create<arith::IndexCastOp>(loc, indexType, tokenId);
+      
+      // Copy embedding vector: output[i,:] = table[tokenIdx,:]
+      builder.create<scf::ForOp>(/* nested loop for d_model dimension */);
+    }
+);
+```
+
+#### 2. CreateCausalMask → scf.for (conditional logic)
+```cpp
+// Lower triangular mask: mask[i,j] = (j > i) ? -inf : 0.0
+rewriter.create<scf::ForOp>(
+    loc, zeroIdx, seqLenVal, oneIdx, ValueRange{},
+    [&](OpBuilder &builder, Location loc, Value i, ValueRange iterArgs) {
+      builder.create<scf::ForOp>(
+          loc, zeroIdx, seqLenVal, oneIdx, ValueRange{},
+          [&](OpBuilder &builder, Location loc, Value j, ValueRange iterArgs) {
+            Value iIndex = builder.create<arith::IndexCastOp>(loc, i64Type, i);
+            Value jIndex = builder.create<arith::IndexCastOp>(loc, i64Type, j);
+            Value isUpperTri = builder.create<arith::CmpIOp>(
+                loc, arith::CmpIPredicate::sgt, jIndex, iIndex);
+            Value maskVal = builder.create<arith::SelectOp>(
+                loc, isUpperTri, negInf, zero);
+            builder.create<memref::StoreOp>(loc, maskVal, output, ValueRange{i, j});
+          });
+    });
+```
+
+#### 3. MaskedSoftmax → scf.for (2D/3D flexibility)
+```cpp
+// Softmax with mask addition, supports both 2D and 3D inputs
+size_t ndim = shape.size();
+bool is2D = (ndim == 2);
+
+// Step 1: Find max(logits + mask) for numerical stability
+// Step 2: Compute sum of exp(logits[i] + mask[i] - max)
+// Step 3: Normalize: output[i] = exp(logits[i] + mask[i] - max) / sum
+
+// Conditional indexing for 2D vs 3D:
+Value logit = is2D 
+    ? builder.create<memref::LoadOp>(loc, input, ValueRange{j, k})
+    : builder.create<memref::LoadOp>(loc, input, ValueRange{i, j, k});
+```
+
+#### 4. RoPE → scf.for (pairwise rotation)
+```cpp
+// Rotary position embeddings: rotate each pair of dimensions
+// For position i, dimension pair (2j, 2j+1):
+//   θ = 10000^(-2j/d) * i
+//   output[i, 2j]   = input[i, 2j]   * cos(θ) - input[i, 2j+1] * sin(θ)
+//   output[i, 2j+1] = input[i, 2j+1] * cos(θ) + input[i, 2j]   * sin(θ)
+
+rewriter.create<scf::ForOp>(
+    loc, zeroIdx, seqLenVal, oneIdx, ValueRange{},
+    [&](OpBuilder &builder, Location loc, Value i, ValueRange iterArgs) {
+      Value posFloat = builder.create<arith::IndexCastOp>(loc, f32Type, i);
+      
+      builder.create<scf::ForOp>(/* loop over dimension pairs, apply rotation */);
+    }
+);
+```
+
+### Lowering Pipeline
+
+The complete lowering pipeline in `bindings.cpp`:
+
+```cpp
+// 1. Custom dialect → Standard + Linalg dialects
+pm.addPass(createTransformerToStandardPass());
+
+// 2. Linalg → Loops (converts all 8 linalg operations to scf.for)
+pm.addNestedPass<func::FuncOp>(createConvertLinalgToLoopsPass());
+
+// 3. Standard dialects → LLVM IR
+pm.addPass(createConvertSCFToCFPass());
+pm.addPass(createFinalizeMemRefToLLVMConversionPass());
+pm.addPass(createConvertFuncToLLVMPass());
+pm.addPass(createReconcileUnrealizedCastsPass());
+```
+
+After lowering, all operations (both linalg-based and manual loops) exist as `scf.for` loops, which then convert uniformly to LLVM IR.
+
+### Benefits of Hybrid Approach
+
+This hybrid lowering strategy provides:
+
+1. **Architectural Consistency**: 8 common operations share implementation across Chapters 11-13
+2. **Expressiveness**: 4 GPT-specific operations retain manual control for complex logic
+3. **Optimization Opportunities**: Linalg operations benefit from structured transformation passes
+4. **Maintainability**: Changes to common operations propagate automatically
+5. **Educational Clarity**: Linalg patterns demonstrate structured compilation; manual loops demonstrate direct control
 
 ---
 

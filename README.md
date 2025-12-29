@@ -16,14 +16,14 @@ A hands-on tutorial demonstrating MLIR JIT compilation, progressing from basic m
 ### Prerequisites
 
 ```bash
-# Ubuntu/WSL2 - LLVM 19 Required
+# Ubuntu/WSL2 - LLVM 20 Required
 sudo apt install -y llvm-20 llvm-20-dev llvm-20-runtime
 sudo apt install -y mlir-20-tools libmlir-20-dev
 sudo apt install -y clang-20
 sudo apt install -y python3-dev python3-numpy ninja-build libzstd-dev
 
 # Fix LLVM header conflict (required for pybind11)
-sudo mv /usr/lib/llvm-20/include/cxxabi.h /usr/lib/llvm-19/include/cxxabi.h.backup
+sudo mv /usr/lib/llvm-20/include/cxxabi.h /usr/lib/llvm-20/include/cxxabi.h.backup
 ```
 
 ### Build All Chapters
@@ -161,7 +161,7 @@ python3 test_jit.py
 - Linalg generalization and fusion
 - Performance measurement and comparison
 - Reusing Chapter 9's NN dialect
-- LLVM 19 API updates
+- LLVM 20 API updates
 
 ### Chapter 11: Multi-Head Attention with Transformer Dialect
 **Goal**: Implement multi-head scaled dot-product attention with custom dialect
@@ -169,11 +169,11 @@ python3 test_jit.py
 **Operations**: matmul, add, mul, softmax, transpose, attention
 
 **Key Concepts**:
-- TableGen without attributes (LLVM 19 BytecodeOpInterface issue)
+- TableGen without attributes (LLVM 20 BytecodeOpInterface issue)
 - Minimal includes pattern (only mlir/IR/OpBase.td)
 - Multi-pass softmax with numerical stability
 - C++ reference implementation for validation
-- LLVM 19 compatibility (API changes in ExecutionEngine, cast methods)
+- LLVM 20 compatibility (API changes in ExecutionEngine, cast methods)
 - Lowering transformer ops to standard MLIR (scf.for loops, memref operations)
 
 **Documentation**: `ch.11.Attention/README.md`

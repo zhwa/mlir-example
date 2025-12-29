@@ -5,6 +5,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -27,6 +28,7 @@
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
+#include "mlir/Dialect/Linalg/Passes.h"
 
 #include <llvm/Support/TargetSelect.h>
 
@@ -65,6 +67,7 @@ public:
     context_.loadDialect<transformer::TransformerDialect,
                          func::FuncDialect, arith::ArithDialect,
                          memref::MemRefDialect, scf::SCFDialect, math::MathDialect,
+                         linalg::LinalgDialect,
                          LLVM::LLVMDialect>();
   }
 
@@ -77,6 +80,9 @@ public:
     pm.addNestedPass<func::FuncOp>(createLowerTransformerToStandardPass());
     pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
     pm.addNestedPass<func::FuncOp>(createCSEPass());
+
+    // Lower linalg operations to loops
+    pm.addNestedPass<func::FuncOp>(createConvertLinalgToLoopsPass());
 
     // Lower to LLVM
     pm.addPass(createConvertMathToLLVMPass());
@@ -275,7 +281,8 @@ Tensor linear(const Tensor& input, py::array_t<float> weight, py::array_t<float>
   node->weight = weight;
   node->bias = bias;
   auto weight_info = weight.request();
-  node->shape = {input.node->shape[0], weight_info.shape[0]};
+  // Ch13: weight is (in_features, out_features)
+  node->shape = {input.node->shape[0], weight_info.shape[1]};
   return Tensor(node);
 }
 

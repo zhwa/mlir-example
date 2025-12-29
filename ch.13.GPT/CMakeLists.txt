@@ -40,6 +40,7 @@ add_llvm_library(MLIRCh13TransformerDialect
   LINK_LIBS PUBLIC
   MLIRIR
   MLIRArithDialect
+  MLIRLinalgDialect
   MLIRMathDialect
   MLIRMemRefDialect
   MLIRSCFDialect
@@ -62,6 +63,8 @@ target_link_libraries(ch13 PRIVATE
   MLIRExecutionEngine
   MLIRArithDialect
   MLIRFuncDialect
+  MLIRLinalgDialect
+  MLIRLinalgTransforms
   MLIRMathDialect
   MLIRMemRefDialect
   MLIRSCFDialect

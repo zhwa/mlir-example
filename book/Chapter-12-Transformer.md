@@ -19,11 +19,11 @@ TransformerBlock(x):
   # Sub-layer 1: Multi-head attention with residual
   attn_out = MultiHeadAttention(LayerNorm(x))
   x = x + attn_out
-  
+
   # Sub-layer 2: Feedforward network with residual
   ffn_out = FeedForward(LayerNorm(x))
   x = x + ffn_out
-  
+
   return x
 ```
 
@@ -44,19 +44,19 @@ def multi_head_attention(x, W_q, W_k, W_v, W_o, num_heads):
     Q = x @ W_q  # [seq_len, d_model] @ [d_model, d_model] → [seq_len, d_model]
     K = x @ W_k
     V = x @ W_v
-    
+
     # Split into multiple heads
     Q_heads = split(Q, num_heads)  # num_heads × [seq_len, d_k]
     K_heads = split(K, num_heads)
     V_heads = split(V, num_heads)
-    
+
     # Run attention on each head
     head_outputs = [attention(q, k, v) for q, k, v in zip(Q_heads, K_heads, V_heads)]
-    
+
     # Concatenate heads and project
     concat = concatenate(head_outputs)  # [seq_len, d_model]
     output = concat @ W_o  # [seq_len, d_model] @ [d_model, d_model] → [seq_len, d_model]
-    
+
     return output
 ```
 
@@ -188,24 +188,24 @@ def Transformer_LayerNormOp : Transformer_Op<"layernorm", [Pure]> {
   let summary = "Layer normalization operation";
   let description = [{
     Computes layer normalization over the last dimension:
-    
+
       mean = sum(input) / d_model
       variance = sum((input - mean)^2) / d_model
       normalized = (input - mean) / sqrt(variance + epsilon)
       output = gamma * normalized + beta
-    
+
     For input shape [seq_len, d_model], computes seq_len independent normalizations.
   }];
-  
+
   let arguments = (ins
     AnyRankedTensor:$input,
     AnyRankedTensor:$gamma,  // [d_model]
     AnyRankedTensor:$beta,   // [d_model]
     F32Attr:$epsilon
   );
-  
+
   let results = (outs AnyRankedTensor:$output);
-  
+
   let assemblyFormat = [{
     $input `,` $gamma `,` $beta attr-dict `:` type($input) `->` type($output)
   }];
@@ -214,62 +214,148 @@ def Transformer_LayerNormOp : Transformer_Op<"layernorm", [Pure]> {
 
 The operation takes input tensor, gamma/beta parameters, and epsilon attribute. It returns normalized output with the same shape as input.
 
-**Lowering to Linalg**. Layer normalization lowers to a sequence of Linalg operations:
+**Lowering to Linalg**. Layer normalization lowers to a sequence of Linalg operations combining reductions and element-wise computations. Following Chapter 11's pattern, we leverage `linalg.reduce` for computing statistics and `linalg.generic` for element-wise transformations:
 
 ```cpp
-// src/TransformerToStandard.cpp
+// src/TransformerPasses.cpp
 struct LayerNormOpLowering : public OpRewritePattern<LayerNormOp> {
   using OpRewritePattern::OpRewritePattern;
-  
+
   LogicalResult matchAndRewrite(LayerNormOp op, PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     Value input = op.getInput();
     Value gamma = op.getGamma();
     Value beta = op.getBeta();
-    float epsilon = op.getEpsilon().convertToFloat();
-    
-    auto inputType = input.getType().cast<RankedTensorType>();
-    auto shape = inputType.getShape();  // [seq_len, d_model]
-    int64_t seqLen = shape[0];
-    int64_t dModel = shape[1];
-    
-    // Step 1: Compute mean = sum(input) / d_model
-    Value sumMap = /* affine_map<(d0, d1) -> (d0)> */;
-    Value mean = rewriter.create<linalg::ReduceOp>(
-      loc, input, 
-      ReduceOp::getReduceAxis(1),  // Reduce along d_model dimension
-      [](OpBuilder &b, Location loc, ValueRange args) {
-        return b.create<arith::AddFOp>(loc, args[0], args[1]);
-      }
+    float epsilon = 1e-5f;
+
+    auto inputType = cast<MemRefType>(input.getType());
+    ArrayRef<int64_t> shape = inputType.getShape();  // [seq_len, d_model]
+    int rank = shape.size();
+
+    // Create temporary buffers for mean and variance (reduced shape)
+    SmallVector<int64_t> reducedShape(shape.begin(), shape.end() - 1);
+    auto reducedType = MemRefType::get(reducedShape, rewriter.getF32Type());
+    Value meanBuffer = rewriter.create<memref::AllocOp>(loc, reducedType);
+    Value varianceBuffer = rewriter.create<memref::AllocOp>(loc, reducedType);
+
+    // Step 1: Compute mean using linalg.reduce along last dimension
+    Value zero = createConstantFloat(rewriter, loc, 0.0f);
+    rewriter.create<linalg::FillOp>(loc, zero, meanBuffer);
+
+    rewriter.create<linalg::ReduceOp>(
+        loc,
+        ValueRange{input},
+        ValueRange{meanBuffer},
+        SmallVector<int64_t>{rank - 1},  // reduce along d_model dimension
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          Value sum = b.create<arith::AddFOp>(loc, args[0], args[1]);
+          b.create<linalg::YieldOp>(loc, sum);
+        }
     );
-    
-    // Divide by d_model
-    Value dModelConst = rewriter.create<arith::ConstantOp>(
-      loc, rewriter.getF32FloatAttr(static_cast<float>(dModel))
+
+    // Normalize mean: divide by d_model
+    Value dModel = createConstantFloat(rewriter, loc, static_cast<float>(shape[rank - 1]));
+    rewriter.create<linalg::GenericOp>(
+        loc,
+        ValueRange{meanBuffer},
+        ValueRange{meanBuffer},  // in-place division
+        SmallVector<AffineMap>{reducedIdentityMap, reducedIdentityMap},
+        reducedIteratorTypes,
+        [dModel](OpBuilder &b, Location loc, ValueRange args) {
+          Value normalized = b.create<arith::DivFOp>(loc, args[0], dModel);
+          b.create<linalg::YieldOp>(loc, normalized);
+        }
     );
-    mean = rewriter.create<linalg::GenericOp>(
-      loc, mean.getType(), mean,
-      [&](OpBuilder &b, Location loc, ValueRange args) {
-        return b.create<arith::DivFOp>(loc, args[0], dModelConst);
-      }
+
+    // Step 2: Compute centered values (input - mean) with broadcasting
+    Value centeredBuffer = rewriter.create<memref::AllocOp>(loc, inputType);
+
+    // Broadcasting affine map: mean has shape [seq_len], broadcast to [seq_len, d_model]
+    auto broadcastMap = AffineMap::get(rank, 0, 
+        {rewriter.getAffineDimExpr(0), /* omit last dim */}, 
+        rewriter.getContext());
+
+    rewriter.create<linalg::GenericOp>(
+        loc,
+        ValueRange{input, meanBuffer},
+        ValueRange{centeredBuffer},
+        SmallVector<AffineMap>{identityMap, broadcastMap, identityMap},
+        iteratorTypes,
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          Value centered = b.create<arith::SubFOp>(loc, args[0], args[1]);
+          b.create<linalg::YieldOp>(loc, centered);
+        }
     );
-    
-    // Step 2: Compute variance = sum((input - mean)^2) / d_model
-    // ... similar pattern with subtract, multiply, reduce, divide ...
-    
-    // Step 3: Normalize: (input - mean) / sqrt(variance + epsilon)
-    // ... element-wise subtract, rsqrt, multiply ...
-    
-    // Step 4: Apply gamma and beta: output = gamma * normalized + beta
-    // ... element-wise multiply by gamma, add beta ...
-    
-    rewriter.replaceOp(op, normalizedOutput);
+
+    // Step 3: Compute variance = sum(centered^2) / d_model
+    rewriter.create<linalg::FillOp>(loc, zero, varianceBuffer);
+    rewriter.create<linalg::ReduceOp>(
+        loc,
+        ValueRange{centeredBuffer},
+        ValueRange{varianceBuffer},
+        SmallVector<int64_t>{rank - 1},
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          Value squared = b.create<arith::MulFOp>(loc, args[0], args[0]);
+          Value sum = b.create<arith::AddFOp>(loc, squared, args[1]);
+          b.create<linalg::YieldOp>(loc, sum);
+        }
+    );
+
+    // Compute invStd = rsqrt(variance/d_model + epsilon)
+    Value epsilonVal = createConstantFloat(rewriter, loc, epsilon);
+    rewriter.create<linalg::GenericOp>(
+        loc,
+        ValueRange{varianceBuffer},
+        ValueRange{varianceBuffer},  // in-place
+        SmallVector<AffineMap>{reducedIdentityMap, reducedIdentityMap},
+        reducedIteratorTypes,
+        [dModel, epsilonVal](OpBuilder &b, Location loc, ValueRange args) {
+          Value variance = b.create<arith::DivFOp>(loc, args[0], dModel);
+          Value variancePlusEps = b.create<arith::AddFOp>(loc, variance, epsilonVal);
+          Value invStd = b.create<math::RsqrtOp>(loc, variancePlusEps);
+          b.create<linalg::YieldOp>(loc, invStd);
+        }
+    );
+
+    // Step 4: Normalize and apply scale/shift: output = ((input - mean) * invStd) * gamma + beta
+    // Broadcasting maps: invStd [seq_len], gamma/beta [d_model]
+    auto gammaBetaBroadcastMap = AffineMap::get(rank, 0,
+        {rewriter.getAffineDimExpr(rank - 1)},  // only last dimension
+        rewriter.getContext());
+
+    rewriter.create<linalg::GenericOp>(
+        loc,
+        ValueRange{centeredBuffer, varianceBuffer, gamma, beta},
+        ValueRange{output},
+        SmallVector<AffineMap>{identityMap, broadcastMap, gammaBetaBroadcastMap, gammaBetaBroadcastMap, identityMap},
+        iteratorTypes,
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          // args[0]=centered, args[1]=invStd, args[2]=gamma, args[3]=beta
+          Value normalized = b.create<arith::MulFOp>(loc, args[0], args[1]);
+          Value scaled = b.create<arith::MulFOp>(loc, normalized, args[2]);
+          Value result = b.create<arith::AddFOp>(loc, scaled, args[3]);
+          b.create<linalg::YieldOp>(loc, result);
+        }
+    );
+
+    // Clean up temporary buffers
+    rewriter.create<memref::DeallocOp>(loc, meanBuffer);
+    rewriter.create<memref::DeallocOp>(loc, varianceBuffer);
+    rewriter.create<memref::DeallocOp>(loc, centeredBuffer);
+
+    rewriter.eraseOp(op);
     return success();
   }
 };
 ```
 
-This lowering translates the high-level layer norm operation into explicit loops and arithmetic. The Linalg operations express the computation structure (reductions, element-wise operations), enabling subsequent optimization passes to fuse operations and vectorize loops.
+This lowering demonstrates **structured reduction patterns** that MLIR's optimization passes can exploit:
+
+1. **Two-stage reductions**: First `linalg.reduce` computes sums, then `linalg.generic` normalizes—this enables fusion opportunities
+2. **Broadcast semantics**: Affine maps explicitly encode how 1D statistics (mean, variance) broadcast across 2D tensors—no manual index arithmetic
+3. **Buffer allocation**: Temporary buffers for intermediate results enable in-place updates and memory reuse after deallocation
+
+The pattern mirrors Chapter 11's softmax lowering: reduce to compute statistics, then element-wise operations with broadcasting. MLIR's Linalg dialect provides the abstraction layer—operations describe *what* to compute (reductions, element-wise ops), enabling subsequent passes to determine *how* (loop tiling, vectorization, parallelization).
 
 **Testing Layer Normalization**. Numerical correctness verification:
 
@@ -356,14 +442,14 @@ def Transformer_FFNOp : Transformer_Op<"ffn", [Pure]> {
   let summary = "Feedforward network with GELU activation";
   let description = [{
     Applies a two-layer MLP with GELU activation:
-    
+
       hidden = input @ W_1 + b_1
       activated = GELU(hidden)
       output = activated @ W_2 + b_2
-    
+
     Typically d_ff = 4 * d_model for the intermediate dimension.
   }];
-  
+
   let arguments = (ins
     AnyRankedTensor:$input,   // [seq_len, d_model]
     AnyRankedTensor:$w1,      // [d_model, d_ff]
@@ -371,9 +457,9 @@ def Transformer_FFNOp : Transformer_Op<"ffn", [Pure]> {
     AnyRankedTensor:$w2,      // [d_ff, d_model]
     AnyRankedTensor:$b2       // [d_model]
   );
-  
+
   let results = (outs AnyRankedTensor:$output);  // [seq_len, d_model]
-  
+
   let assemblyFormat = [{
     $input `,` $w1 `,` $b1 `,` $w2 `,` $b2 attr-dict `:` 
     type($input) `->` type($output)
@@ -383,79 +469,136 @@ def Transformer_FFNOp : Transformer_Op<"ffn", [Pure]> {
 
 The operation encapsulates both linear layers and activation, providing a single high-level primitive for the entire feedforward sub-layer.
 
-**Lowering to Standard Dialects**. The feedforward operation lowers to matrix multiplications and element-wise operations:
+**Lowering to Linalg**. The feedforward network implements a standard two-layer MLP. Chapter 12 provides a higher-level `LinearOp` that encapsulates `input @ weight^T + bias`, which itself lowers to Linalg operations. The complete FFN lowering chain demonstrates MLIR's compositional design:
 
 ```cpp
-// src/TransformerToStandard.cpp
-struct FFNOpLowering : public OpRewritePattern<FFNOp> {
+// src/TransformerPasses.cpp
+struct LinearOpLowering : public OpRewritePattern<LinearOp> {
   using OpRewritePattern::OpRewritePattern;
-  
-  LogicalResult matchAndRewrite(FFNOp op, PatternRewriter &rewriter) const override {
+
+  LogicalResult matchAndRewrite(LinearOp op, PatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value input = op.getInput();   // [seq_len, in_features]
+    Value weight = op.getWeight(); // [out_features, in_features]
+    Value bias = op.getBias();     // [out_features]
+    Value output = op.getOutput(); // [seq_len, out_features]
+
+    // Step 1: Transpose weight for matmul compatibility
+    // Need (in_features, out_features) for input @ weight
+    SmallVector<int64_t> transposedShape = {inFeatures, outFeatures};
+    auto transposedType = MemRefType::get(transposedShape, rewriter.getF32Type());
+    Value transposedWeight = rewriter.create<memref::AllocOp>(loc, transposedType);
+
+    rewriter.create<linalg::TransposeOp>(
+        loc,
+        weight,
+        transposedWeight,
+        SmallVector<int64_t>{1, 0}  // swap dimensions
+    );
+
+    // Step 2: Perform matmul with zero initialization
+    Value zero = createConstantFloat(rewriter, loc, 0.0f);
+    rewriter.create<linalg::FillOp>(loc, zero, output);
+
+    rewriter.create<linalg::MatmulOp>(
+        loc,
+        ValueRange{input, transposedWeight},
+        ValueRange{output}  // accumulates: output += input @ weight^T
+    );
+
+    // Step 3: Add bias with broadcasting (bias broadcasts across seq_len)
+    auto identityMap = AffineMap::getMultiDimIdentityMap(2, rewriter.getContext());
+    auto biasBroadcastMap = AffineMap::get(2, 0,
+        {rewriter.getAffineDimExpr(1)},  // only second dimension
+        rewriter.getContext());
+
+    rewriter.create<linalg::GenericOp>(
+        loc,
+        ValueRange{output, bias},
+        ValueRange{output},  // in-place addition
+        SmallVector<AffineMap>{identityMap, biasBroadcastMap, identityMap},
+        SmallVector<utils::IteratorType>(2, utils::IteratorType::parallel),
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          Value result = b.create<arith::AddFOp>(loc, args[0], args[1]);
+          b.create<linalg::YieldOp>(loc, result);
+        }
+    );
+
+    rewriter.create<memref::DeallocOp>(loc, transposedWeight);
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+struct GeluOpLowering : public OpRewritePattern<GeluOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(GeluOp op, PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     Value input = op.getInput();
-    Value w1 = op.getW1();
-    Value b1 = op.getB1();
-    Value w2 = op.getW2();
-    Value b2 = op.getB2();
-    
-    // Step 1: hidden = input @ W_1
-    Value hidden = rewriter.create<linalg::MatmulOp>(
-      loc, input, w1
+    Value output = op.getOutput();
+
+    auto outputType = cast<MemRefType>(output.getType());
+    int rank = outputType.getRank();
+
+    // GELU approximation constants
+    Value c0_5 = createConstantFloat(rewriter, loc, 0.5f);
+    Value c1 = createConstantFloat(rewriter, loc, 1.0f);
+    Value cSqrt2OverPi = createConstantFloat(rewriter, loc, 0.7978845608f);
+    Value c0_044715 = createConstantFloat(rewriter, loc, 0.044715f);
+
+    // Element-wise GELU using linalg.generic
+    auto identityMap = AffineMap::getMultiDimIdentityMap(rank, rewriter.getContext());
+
+    rewriter.create<linalg::GenericOp>(
+        loc,
+        ValueRange{input},
+        ValueRange{output},
+        SmallVector<AffineMap>{identityMap, identityMap},
+        SmallVector<utils::IteratorType>(rank, utils::IteratorType::parallel),
+        [c0_5, c1, cSqrt2OverPi, c0_044715](OpBuilder &b, Location loc, ValueRange args) {
+          Value x = args[0];
+
+          // GELU(x) ≈ 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x^3)))
+          Value x2 = b.create<arith::MulFOp>(loc, x, x);
+          Value x3 = b.create<arith::MulFOp>(loc, x2, x);
+          Value term = b.create<arith::MulFOp>(loc, c0_044715, x3);
+          Value inner = b.create<arith::AddFOp>(loc, x, term);
+          Value scaled = b.create<arith::MulFOp>(loc, cSqrt2OverPi, inner);
+          Value tanhVal = b.create<math::TanhOp>(loc, scaled);
+          Value onePlusTanh = b.create<arith::AddFOp>(loc, c1, tanhVal);
+          Value halfX = b.create<arith::MulFOp>(loc, c0_5, x);
+          Value result = b.create<arith::MulFOp>(loc, halfX, onePlusTanh);
+
+          b.create<linalg::YieldOp>(loc, result);
+        }
     );
-    
-    // Step 2: hidden = hidden + b_1 (broadcast bias across seq_len)
-    hidden = rewriter.create<linalg::GenericOp>(
-      loc, hidden.getType(), ValueRange{hidden, b1},
-      [&](OpBuilder &b, Location loc, ValueRange args) {
-        return b.create<arith::AddFOp>(loc, args[0], args[1]);
-      }
-    );
-    
-    // Step 3: activated = GELU(hidden)
-    // Using tanh approximation for efficiency
-    Value activated = rewriter.create<linalg::GenericOp>(
-      loc, hidden.getType(), hidden,
-      [&](OpBuilder &b, Location loc, ValueRange args) {
-        Value x = args[0];
-        
-        // GELU(x) ≈ 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x^3)))
-        Value c1 = b.create<arith::ConstantOp>(loc, b.getF32FloatAttr(0.5f));
-        Value c2 = b.create<arith::ConstantOp>(loc, b.getF32FloatAttr(0.7978845608f)); // √(2/π)
-        Value c3 = b.create<arith::ConstantOp>(loc, b.getF32FloatAttr(0.044715f));
-        
-        Value x2 = b.create<arith::MulFOp>(loc, x, x);
-        Value x3 = b.create<arith::MulFOp>(loc, x2, x);
-        Value inner = b.create<arith::MulFOp>(loc, c3, x3);
-        inner = b.create<arith::AddFOp>(loc, x, inner);
-        inner = b.create<arith::MulFOp>(loc, c2, inner);
-        Value tanh = b.create<math::TanhOp>(loc, inner);
-        Value one = b.create<arith::ConstantOp>(loc, b.getF32FloatAttr(1.0f));
-        Value sum = b.create<arith::AddFOp>(loc, one, tanh);
-        Value mul = b.create<arith::MulFOp>(loc, x, sum);
-        return b.create<arith::MulFOp>(loc, c1, mul);
-      }
-    );
-    
-    // Step 4: output = activated @ W_2
-    Value output = rewriter.create<linalg::MatmulOp>(
-      loc, activated, w2
-    );
-    
-    // Step 5: output = output + b_2
-    output = rewriter.create<linalg::GenericOp>(
-      loc, output.getType(), ValueRange{output, b2},
-      [&](OpBuilder &b, Location loc, ValueRange args) {
-        return b.create<arith::AddFOp>(loc, args[0], args[1]);
-      }
-    );
-    
-    rewriter.replaceOp(op, output);
+
+    rewriter.eraseOp(op);
     return success();
   }
 };
 ```
 
-This lowering generates efficient IR: the matrix multiplications become Linalg operations (enabling tiling and vectorization from Chapter 10), and GELU computes inline using scalar arithmetic (enabling fusion with surrounding operations).
+The complete FFN operation composes these building blocks:
+
+```python
+# High-level FFN API
+ffn_out = transformer.ffn(input, W1, b1, W2, b2)
+
+# Lowers to:
+hidden = transformer.linear(input, W1, b1)     # → linalg.transpose + linalg.matmul + linalg.generic
+activated = transformer.gelu(hidden)            # → linalg.generic
+output = transformer.linear(activated, W2, b2)  # → linalg.transpose + linalg.matmul + linalg.generic
+```
+
+**Why This Design Works**. Breaking FFN into composable operations (`linear`, `gelu`) rather than monolithic lowering provides:
+
+1. **Reusability**: `LinearOp` is used twice in FFN but also in attention projections (Q/K/V/O matrices)—single implementation serves multiple use cases
+2. **Optimization opportunities**: Separate operations enable per-operation optimizations (matrix multiplication tiling, GELU fusion) before composition-level optimizations (fusing linear+GELU)
+3. **Maintenance**: Updating linear layer implementation (e.g., adding quantization) automatically benefits all users
+
+The Linalg-based implementation enables Chapter 14's production optimizations: `linalg.matmul` tiles efficiently for cache locality, `linalg.generic` vectorizes GELU computation, and fusion passes combine operations to reduce memory traffic.
 
 **Performance Analysis**. Feedforward networks dominate transformer computation—they account for approximately **2/3 of total FLOPs** in standard architectures. For input `[seq_len, d_model]`:
 
@@ -480,7 +623,7 @@ class FeedForward(nn.Module):
         super().__init__()
         self.linear1 = nn.Linear(d_model, d_ff)
         self.linear2 = nn.Linear(d_ff, d_model)
-    
+
     def forward(self, x):
         x = self.linear1(x)
         x = torch.nn.functional.gelu(x, approximate='tanh')
@@ -542,7 +685,7 @@ With layer normalization, attention, and feedforward networks implemented indivi
 def transformer_block(x, params):
     """
     Complete pre-norm transformer block.
-    
+
     Args:
         x: Input tensor [seq_len, d_model]
         params: Dictionary containing:
@@ -551,7 +694,7 @@ def transformer_block(x, params):
             - ln2_gamma, ln2_beta: Layer norm 2 parameters [d_model]
             - ffn_w1, ffn_b1: FFN first layer [d_model, d_ff], [d_ff]
             - ffn_w2, ffn_b2: FFN second layer [d_ff, d_model], [d_model]
-    
+
     Returns:
         Output tensor [seq_len, d_model]
     """
@@ -563,7 +706,7 @@ def transformer_block(x, params):
         params['attn_wv'], params['attn_wo']
     )
     x = x + attn_out  # Residual connection
-    
+
     # Sub-layer 2: Feedforward with residual
     normed2 = layernorm(x, params['ln2_gamma'], params['ln2_beta'])
     ffn_out = feedforward(
@@ -572,7 +715,7 @@ def transformer_block(x, params):
         params['ffn_w2'], params['ffn_b2']
     )
     x = x + ffn_out  # Residual connection
-    
+
     return x
 ```
 
@@ -605,17 +748,17 @@ def multi_head_attention(x, W_q, W_k, W_v, W_o, num_heads=8):
     """Multi-head self-attention."""
     seq_len, d_model = x.shape
     d_k = d_model // num_heads
-    
+
     # Project to Q, K, V
     Q = x @ W_q  # [seq_len, d_model]
     K = x @ W_k
     V = x @ W_v
-    
+
     # Reshape to separate heads: [seq_len, num_heads, d_k]
     Q = Q.reshape(seq_len, num_heads, d_k)
     K = K.reshape(seq_len, num_heads, d_k)
     V = V.reshape(seq_len, num_heads, d_k)
-    
+
     # Compute attention per head (in parallel)
     # For each head h: attention(Q[:, h, :], K[:, h, :], V[:, h, :])
     head_outputs = []
@@ -626,13 +769,13 @@ def multi_head_attention(x, W_q, W_k, W_v, W_o, num_heads=8):
             V[:, h, :]
         )
         head_outputs.append(head_output)
-    
+
     # Concatenate heads: [seq_len, num_heads * d_k] = [seq_len, d_model]
     concat = concatenate(head_outputs, axis=1)
-    
+
     # Output projection
     output = concat @ W_o
-    
+
     return output
 ```
 
@@ -668,15 +811,15 @@ def Transformer_BlockOp : Transformer_Op<"block", [Pure]> {
   let summary = "Complete transformer block with pre-norm architecture";
   let description = [{
     Applies a full transformer block:
-    
+
       attn_out = MultiHeadAttention(LayerNorm(x))
       x = x + attn_out
       ffn_out = FFN(LayerNorm(x))
       x = x + ffn_out
-    
+
     Returns the transformed input with same shape.
   }];
-  
+
   let arguments = (ins
     AnyRankedTensor:$input,
     // Layer norm 1
@@ -699,7 +842,7 @@ def Transformer_BlockOp : Transformer_Op<"block", [Pure]> {
     I64Attr:$num_heads,
     F32Attr:$epsilon
   );
-  
+
   let results = (outs AnyRankedTensor:$output);
 }
 ```
@@ -772,7 +915,7 @@ class TransformerBlock:
         self.d_model = d_model
         self.d_ff = d_ff
         self.num_heads = num_heads
-        
+
         # Initialize parameters (normally loaded from trained model)
         self.ln1_gamma = Tensor.parameter([d_model])
         self.ln1_beta = Tensor.parameter([d_model])
@@ -786,7 +929,7 @@ class TransformerBlock:
         self.ffn_b1 = Tensor.parameter([d_ff])
         self.ffn_w2 = Tensor.parameter([d_ff, d_model])
         self.ffn_b2 = Tensor.parameter([d_model])
-    
+
     def forward(self, x):
         # Sub-layer 1: Attention with residual
         normed1 = layernorm(x, self.ln1_gamma, self.ln1_beta)
@@ -795,7 +938,7 @@ class TransformerBlock:
             self.attn_wv, self.attn_wo, self.num_heads
         )
         x = x + attn_out
-        
+
         # Sub-layer 2: FFN with residual
         normed2 = layernorm(x, self.ln2_gamma, self.ln2_beta)
         ffn_out = feedforward(
@@ -803,7 +946,7 @@ class TransformerBlock:
             self.ffn_w2, self.ffn_b2
         )
         x = x + ffn_out
-        
+
         return x
 ```
 
@@ -817,7 +960,7 @@ py::array_t<float> forward(const Tensor& output_tensor) {
   // Collect all parameters from the graph
   std::vector<Tensor*> parameters;
   std::vector<Tensor*> inputs;
-  
+
   for (auto& node : graph.nodes) {
     if (node.op_type == OpType::Parameter) {
       parameters.push_back(&node);
@@ -825,7 +968,7 @@ py::array_t<float> forward(const Tensor& output_tensor) {
       inputs.push_back(&node);
     }
   }
-  
+
   // Build function signature: func.func @compute(inputs..., params..., output)
   SmallVector<Type> inputTypes;
   for (auto* input : inputs) {
@@ -835,12 +978,12 @@ py::array_t<float> forward(const Tensor& output_tensor) {
     inputTypes.push_back(getMemRefType(param->shape));
   }
   inputTypes.push_back(getMemRefType(output_tensor.shape));  // Output
-  
+
   auto funcType = builder.getFunctionType(inputTypes, {});
   auto func = builder.create<func::FuncOp>(loc, "compute", funcType);
-  
+
   // ... build IR ...
-  
+
   // Prepare arguments for execution
   std::vector<void*> args;
   for (auto* input : inputs) {
@@ -850,10 +993,10 @@ py::array_t<float> forward(const Tensor& output_tensor) {
     args.push_back(prepareMemRefDescriptor(param->data));
   }
   args.push_back(prepareMemRefDescriptor(output_data));
-  
+
   // Execute via libffi
   executionEngine->invoke("compute", args);
-  
+
   return output;
 }
 ```
@@ -891,10 +1034,10 @@ def test_layernorm():
     x = np.random.randn(4, 512).astype(np.float32)
     gamma = np.ones(512, dtype=np.float32)
     beta = np.zeros(512, dtype=np.float32)
-    
+
     output_mlir = compiler.layernorm(x, gamma, beta)
     output_numpy = layernorm_reference(x, gamma, beta)
-    
+
     np.testing.assert_allclose(output_mlir, output_numpy, rtol=1e-4)
     print("✓ LayerNorm test passed")
 
@@ -905,10 +1048,10 @@ def test_feedforward():
     b1 = np.zeros(2048, dtype=np.float32)
     w2 = np.random.randn(2048, 512).astype(np.float32) * 0.02
     b2 = np.zeros(512, dtype=np.float32)
-    
+
     output_mlir = compiler.ffn(x, w1, b1, w2, b2)
     output_torch = ffn_reference(x, w1, b1, w2, b2)
-    
+
     np.testing.assert_allclose(output_mlir, output_torch, rtol=1e-3)
     print("✓ FFN test passed")
 
@@ -916,21 +1059,21 @@ def test_transformer_block():
     """Test complete transformer block end-to-end."""
     x = np.random.randn(4, 512).astype(np.float32)
     params = initialize_random_params(d_model=512, d_ff=2048, num_heads=8)
-    
+
     output_mlir = compiler.transformer_block(x, params)
     output_torch = pytorch_transformer_block(x, params)
-    
+
     np.testing.assert_allclose(output_mlir, output_torch, rtol=1e-3)
     print("✓ Transformer block test passed")
 
 def test_multi_block_stack():
     """Test multiple transformer blocks in sequence."""
     x = np.random.randn(4, 512).astype(np.float32)
-    
+
     # Stack 3 blocks
     for block_params in all_block_params:
         x = compiler.transformer_block(x, block_params)
-    
+
     # Verify output shape
     assert x.shape == (4, 512)
     assert not np.isnan(x).any()
@@ -949,11 +1092,11 @@ def benchmark_transformer_block(seq_len=512, d_model=768, d_ff=3072, num_trials=
     """Measure transformer block latency."""
     x = np.random.randn(seq_len, d_model).astype(np.float32)
     params = initialize_random_params(d_model, d_ff, num_heads=12)
-    
+
     # Warmup
     for _ in range(10):
         _ = compiler.transformer_block(x, params)
-    
+
     # Timed runs
     times = []
     for _ in range(num_trials):
@@ -961,7 +1104,7 @@ def benchmark_transformer_block(seq_len=512, d_model=768, d_ff=3072, num_trials=
         _ = compiler.transformer_block(x, params)
         elapsed = time.perf_counter() - start
         times.append(elapsed)
-    
+
     print(f"Mean latency: {np.mean(times)*1000:.2f} ms")
     print(f"Std dev: {np.std(times)*1000:.2f} ms")
     print(f"Min: {np.min(times)*1000:.2f} ms")

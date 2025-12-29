@@ -3,9 +3,11 @@
 #include "TransformerOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Utils/StructuredOpsUtils.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -40,91 +42,148 @@ struct LayerNormOpLowering : public OpRewritePattern<LayerNormOp> {
     Value gamma = op.getGamma();
     Value beta = op.getBeta();
     Value output = op.getOutput();
-    float epsilon = 1e-5f; // Hardcoded for now (avoid BytecodeOpInterface issues)
+    float epsilon = 1e-5f;
 
     auto inputType = cast<MemRefType>(input.getType());
+    ArrayRef<int64_t> shape = inputType.getShape();
+    int rank = shape.size();
 
-    int64_t seqLen = inputType.getShape()[0];
-    int64_t dModel = inputType.getShape()[1];
+    // Create temporary buffers for mean and variance (reduce along last dim)
+    SmallVector<int64_t> reducedShape(shape.begin(), shape.end() - 1);
+    auto reducedType = MemRefType::get(reducedShape, rewriter.getF32Type());
+    Value meanBuffer = rewriter.create<memref::AllocOp>(loc, reducedType);
+    Value varianceBuffer = rewriter.create<memref::AllocOp>(loc, reducedType);
 
-    Value epsilonVal = createConstantFloat(rewriter, loc, epsilon);
     Value zero = createConstantFloat(rewriter, loc, 0.0f);
-    Value dModelFloat = createConstantFloat(rewriter, loc, static_cast<float>(dModel));
+    Value epsilonVal = createConstantFloat(rewriter, loc, epsilon);
 
-    // For each sequence position
-    Value seqLenVal = createConstantIndex(rewriter, loc, seqLen);
-    Value dModelVal = createConstantIndex(rewriter, loc, dModel);
-    Value zeroIdx = createConstantIndex(rewriter, loc, 0);
-    Value oneIdx = createConstantIndex(rewriter, loc, 1);
+    // Step 1: Compute mean using linalg.reduce (sum along last dim)
+    rewriter.create<linalg::FillOp>(loc, zero, meanBuffer);
+    rewriter.create<linalg::ReduceOp>(
+        loc,
+        ValueRange{input},
+        ValueRange{meanBuffer},
+        SmallVector<int64_t>{rank - 1},  // reduce along last dimension
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          Value sum = b.create<arith::AddFOp>(loc, args[0], args[1]);
+          b.create<linalg::YieldOp>(loc, sum);
+        }
+    );
 
-    rewriter.create<scf::ForOp>(
-        loc, zeroIdx, seqLenVal, oneIdx, ValueRange{},
-        [&](OpBuilder &builder, Location loc, Value i, ValueRange iterArgs) {
-          // Step 1: Compute mean
-          // mean = sum(input[i, :]) / d_model
-          Value sum = zero;
-          builder.create<scf::ForOp>(
-              loc, zeroIdx, dModelVal, oneIdx, ValueRange{sum},
-              [&](OpBuilder &builder, Location loc, Value j, ValueRange iterArgs) {
-                Value currentSum = iterArgs[0];
-                Value val = builder.create<memref::LoadOp>(loc, input, ValueRange{i, j});
-                Value newSum = builder.create<arith::AddFOp>(loc, currentSum, val);
-                builder.create<scf::YieldOp>(loc, newSum);
-              });
+    // Divide by d_model to get mean
+    Value dModel = createConstantFloat(rewriter, loc, static_cast<float>(shape[rank - 1]));
+    SmallVector<AffineMap> meanNormalizeMaps;
+    auto reducedIdentityMap = AffineMap::getMultiDimIdentityMap(rank - 1, rewriter.getContext());
+    meanNormalizeMaps.push_back(reducedIdentityMap);  // meanBuffer
+    meanNormalizeMaps.push_back(reducedIdentityMap);  // output (in-place)
 
-          Value sumResult = builder.create<scf::ForOp>(
-              loc, zeroIdx, dModelVal, oneIdx, ValueRange{zero},
-              [&](OpBuilder &builder, Location loc, Value j, ValueRange iterArgs) {
-                Value currentSum = iterArgs[0];
-                Value val = builder.create<memref::LoadOp>(loc, input, ValueRange{i, j});
-                Value newSum = builder.create<arith::AddFOp>(loc, currentSum, val);
-                builder.create<scf::YieldOp>(loc, newSum);
-              }).getResult(0);
+    SmallVector<utils::IteratorType> reducedIteratorTypes(rank - 1, utils::IteratorType::parallel);
 
-          Value mean = builder.create<arith::DivFOp>(loc, sumResult, dModelFloat);
+    rewriter.create<linalg::GenericOp>(
+        loc,
+        ValueRange{meanBuffer},
+        ValueRange{meanBuffer},  // in-place
+        meanNormalizeMaps,
+        reducedIteratorTypes,
+        [dModel](OpBuilder &b, Location loc, ValueRange args) {
+          Value normalized = b.create<arith::DivFOp>(loc, args[0], dModel);
+          b.create<linalg::YieldOp>(loc, normalized);
+        }
+    );
 
-          // Step 2: Compute variance
-          // variance = sum((input[i, :] - mean)^2) / d_model
-          Value varianceSum = builder.create<scf::ForOp>(
-              loc, zeroIdx, dModelVal, oneIdx, ValueRange{zero},
-              [&](OpBuilder &builder, Location loc, Value j, ValueRange iterArgs) {
-                Value currentSum = iterArgs[0];
-                Value val = builder.create<memref::LoadOp>(loc, input, ValueRange{i, j});
-                Value diff = builder.create<arith::SubFOp>(loc, val, mean);
-                Value diffSq = builder.create<arith::MulFOp>(loc, diff, diff);
-                Value newSum = builder.create<arith::AddFOp>(loc, currentSum, diffSq);
-                builder.create<scf::YieldOp>(loc, newSum);
-              }).getResult(0);
+    // Step 2: Compute variance: sum((input - mean)^2) / d_model
+    // Create temporary buffer for centered values
+    Value centeredBuffer = rewriter.create<memref::AllocOp>(loc, inputType);
 
-          Value variance = builder.create<arith::DivFOp>(loc, varianceSum, dModelFloat);
+    // Compute centered = input - mean (broadcast mean)
+    SmallVector<AffineMap> centeringMaps;
+    auto identityMap = AffineMap::getMultiDimIdentityMap(rank, rewriter.getContext());
+    SmallVector<AffineExpr> reducedExprs;
+    for (int i = 0; i < rank - 1; i++) {
+      reducedExprs.push_back(rewriter.getAffineDimExpr(i));
+    }
+    auto broadcastMap = AffineMap::get(rank, 0, reducedExprs, rewriter.getContext());
 
-          // Step 3: Compute rsqrt(variance + epsilon)
-          Value variancePlusEps = builder.create<arith::AddFOp>(loc, variance, epsilonVal);
-          Value invStd = builder.create<math::RsqrtOp>(loc, variancePlusEps);
+    centeringMaps.push_back(identityMap);     // input
+    centeringMaps.push_back(broadcastMap);    // meanBuffer (broadcasted)
+    centeringMaps.push_back(identityMap);     // centeredBuffer
 
-          // Step 4: Normalize and apply scale/shift
-          // output[i, j] = ((input[i, j] - mean) * invStd) * gamma[j] + beta[j]
-          builder.create<scf::ForOp>(
-              loc, zeroIdx, dModelVal, oneIdx, ValueRange{},
-              [&](OpBuilder &builder, Location loc, Value j, ValueRange iterArgs) {
-                Value val = builder.create<memref::LoadOp>(loc, input, ValueRange{i, j});
-                Value gammaVal = builder.create<memref::LoadOp>(loc, gamma, ValueRange{j});
-                Value betaVal = builder.create<memref::LoadOp>(loc, beta, ValueRange{j});
+    SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
 
-                // Normalize: (val - mean) * invStd
-                Value centered = builder.create<arith::SubFOp>(loc, val, mean);
-                Value normalized = builder.create<arith::MulFOp>(loc, centered, invStd);
+    rewriter.create<linalg::GenericOp>(
+        loc,
+        ValueRange{input, meanBuffer},
+        ValueRange{centeredBuffer},
+        centeringMaps,
+        iteratorTypes,
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          Value centered = b.create<arith::SubFOp>(loc, args[0], args[1]);
+          b.create<linalg::YieldOp>(loc, centered);
+        }
+    );
 
-                // Scale and shift: normalized * gamma + beta
-                Value scaled = builder.create<arith::MulFOp>(loc, normalized, gammaVal);
-                Value result = builder.create<arith::AddFOp>(loc, scaled, betaVal);
+    // Compute variance: sum(centered^2) / d_model
+    rewriter.create<linalg::FillOp>(loc, zero, varianceBuffer);
+    rewriter.create<linalg::ReduceOp>(
+        loc,
+        ValueRange{centeredBuffer},
+        ValueRange{varianceBuffer},
+        SmallVector<int64_t>{rank - 1},
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          Value squared = b.create<arith::MulFOp>(loc, args[0], args[0]);
+          Value sum = b.create<arith::AddFOp>(loc, squared, args[1]);
+          b.create<linalg::YieldOp>(loc, sum);
+        }
+    );
 
-                builder.create<memref::StoreOp>(loc, result, output, ValueRange{i, j});
-                builder.create<scf::YieldOp>(loc);
-              });
+    // Divide by d_model and compute rsqrt(variance + epsilon)
+    rewriter.create<linalg::GenericOp>(
+        loc,
+        ValueRange{varianceBuffer},
+        ValueRange{varianceBuffer},  // in-place
+        meanNormalizeMaps,
+        reducedIteratorTypes,
+        [dModel, epsilonVal](OpBuilder &b, Location loc, ValueRange args) {
+          Value variance = b.create<arith::DivFOp>(loc, args[0], dModel);
+          Value variancePlusEps = b.create<arith::AddFOp>(loc, variance, epsilonVal);
+          Value invStd = b.create<math::RsqrtOp>(loc, variancePlusEps);
+          b.create<linalg::YieldOp>(loc, invStd);
+        }
+    );
 
-          builder.create<scf::YieldOp>(loc);
-        });
+    // Step 3: Normalize and apply scale/shift: output = ((input - mean) * invStd) * gamma + beta
+    // Using centered values, multiply by invStd, then scale by gamma and shift by beta
+    // Create broadcast map for gamma/beta (1D tensors indexing only last dimension)
+    SmallVector<AffineExpr> gammaBetaExprs;
+    gammaBetaExprs.push_back(rewriter.getAffineDimExpr(rank - 1));  // only last dimension
+    auto gammaBetaBroadcastMap = AffineMap::get(rank, 0, gammaBetaExprs, rewriter.getContext());
+
+    SmallVector<AffineMap> normalizeMaps;
+    normalizeMaps.push_back(identityMap);              // centeredBuffer
+    normalizeMaps.push_back(broadcastMap);             // varianceBuffer (invStd, broadcasted)
+    normalizeMaps.push_back(gammaBetaBroadcastMap);    // gamma (broadcasted)
+    normalizeMaps.push_back(gammaBetaBroadcastMap);    // beta (broadcasted)
+    normalizeMaps.push_back(identityMap);              // output
+
+    rewriter.create<linalg::GenericOp>(
+        loc,
+        ValueRange{centeredBuffer, varianceBuffer, gamma, beta},
+        ValueRange{output},
+        normalizeMaps,
+        iteratorTypes,
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          // args[0] = centered, args[1] = invStd, args[2] = gamma, args[3] = beta
+          Value normalized = b.create<arith::MulFOp>(loc, args[0], args[1]);
+          Value scaled = b.create<arith::MulFOp>(loc, normalized, args[2]);
+          Value result = b.create<arith::AddFOp>(loc, scaled, args[3]);
+          b.create<linalg::YieldOp>(loc, result);
+        }
+    );
+
+    // Clean up temporary buffers
+    rewriter.create<memref::DeallocOp>(loc, meanBuffer);
+    rewriter.create<memref::DeallocOp>(loc, varianceBuffer);
+    rewriter.create<memref::DeallocOp>(loc, centeredBuffer);
 
     rewriter.eraseOp(op);
     return success();
@@ -148,46 +207,69 @@ struct LinearOpLowering : public OpRewritePattern<LinearOp> {
 
     auto inputType = cast<MemRefType>(input.getType());
     auto weightType = cast<MemRefType>(weight.getType());
+    auto outputType = cast<MemRefType>(output.getType());
+
+    // Linear: output = input @ weight^T + bias
+    // input: (seq_len, in_features), weight: (out_features, in_features)
+    // Need to transpose weight to (in_features, out_features) for matmul
 
     int64_t seqLen = inputType.getShape()[0];
     int64_t inFeatures = inputType.getShape()[1];
     int64_t outFeatures = weightType.getShape()[0];
 
+    // Step 1: Transpose weight (out_features, in_features) -> (in_features, out_features)
+    SmallVector<int64_t> transposedWeightShape = {inFeatures, outFeatures};
+    auto transposedWeightType = MemRefType::get(transposedWeightShape, rewriter.getF32Type());
+    Value transposedWeight = rewriter.create<memref::AllocOp>(loc, transposedWeightType);
+
+    rewriter.create<linalg::TransposeOp>(
+        loc,
+        weight,
+        transposedWeight,
+        SmallVector<int64_t>{1, 0}  // swap dimensions
+    );
+
+    // Step 2: Initialize output to zero and perform matmul
     Value zero = createConstantFloat(rewriter, loc, 0.0f);
-    Value seqLenVal = createConstantIndex(rewriter, loc, seqLen);
-    Value outFeaturesVal = createConstantIndex(rewriter, loc, outFeatures);
-    Value inFeaturesVal = createConstantIndex(rewriter, loc, inFeatures);
-    Value zeroIdx = createConstantIndex(rewriter, loc, 0);
-    Value oneIdx = createConstantIndex(rewriter, loc, 1);
+    rewriter.create<linalg::FillOp>(loc, zero, output);
 
-    // output[i, j] = sum_k(input[i, k] * weight[j, k]) + bias[j]
-    rewriter.create<scf::ForOp>(
-        loc, zeroIdx, seqLenVal, oneIdx, ValueRange{},
-        [&](OpBuilder &builder, Location loc, Value i, ValueRange iterArgs) {
-          builder.create<scf::ForOp>(
-              loc, zeroIdx, outFeaturesVal, oneIdx, ValueRange{},
-              [&](OpBuilder &builder, Location loc, Value j, ValueRange iterArgs) {
-                // Compute matmul: sum_k(input[i, k] * weight[j, k])
-                Value sum = builder.create<scf::ForOp>(
-                    loc, zeroIdx, inFeaturesVal, oneIdx, ValueRange{zero},
-                    [&](OpBuilder &builder, Location loc, Value k, ValueRange iterArgs) {
-                      Value currentSum = iterArgs[0];
-                      Value inputVal = builder.create<memref::LoadOp>(loc, input, ValueRange{i, k});
-                      Value weightVal = builder.create<memref::LoadOp>(loc, weight, ValueRange{j, k});
-                      Value prod = builder.create<arith::MulFOp>(loc, inputVal, weightVal);
-                      Value newSum = builder.create<arith::AddFOp>(loc, currentSum, prod);
-                      builder.create<scf::YieldOp>(loc, newSum);
-                    }).getResult(0);
+    // Matmul: (seq_len, in_features) @ (in_features, out_features) -> (seq_len, out_features)
+    rewriter.create<linalg::MatmulOp>(
+        loc,
+        ValueRange{input, transposedWeight},
+        ValueRange{output}
+    );
 
-                // Add bias
-                Value biasVal = builder.create<memref::LoadOp>(loc, bias, ValueRange{j});
-                Value result = builder.create<arith::AddFOp>(loc, sum, biasVal);
+    // Step 3: Add bias using linalg.generic (broadcast bias across seq_len)
+    int rank = 2;
+    SmallVector<AffineMap> indexingMaps;
+    auto identityMap = AffineMap::getMultiDimIdentityMap(rank, rewriter.getContext());
 
-                builder.create<memref::StoreOp>(loc, result, output, ValueRange{i, j});
-                builder.create<scf::YieldOp>(loc);
-              });
-          builder.create<scf::YieldOp>(loc);
-        });
+    // Broadcast map for bias (only last dimension)
+    SmallVector<AffineExpr> biasExprs;
+    biasExprs.push_back(rewriter.getAffineDimExpr(1));  // only use second dimension
+    auto broadcastMap = AffineMap::get(rank, 0, biasExprs, rewriter.getContext());
+
+    indexingMaps.push_back(identityMap);     // output (read)
+    indexingMaps.push_back(broadcastMap);    // bias (broadcasted)
+    indexingMaps.push_back(identityMap);     // output (write)
+
+    SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
+
+    rewriter.create<linalg::GenericOp>(
+        loc,
+        ValueRange{output, bias},
+        ValueRange{output},  // in-place
+        indexingMaps,
+        iteratorTypes,
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          Value result = b.create<arith::AddFOp>(loc, args[0], args[1]);
+          b.create<linalg::YieldOp>(loc, result);
+        }
+    );
+
+    // Clean up
+    rewriter.create<memref::DeallocOp>(loc, transposedWeight);
 
     rewriter.eraseOp(op);
     return success();
@@ -207,56 +289,65 @@ struct GeluOpLowering : public OpRewritePattern<GeluOp> {
     Value input = op.getInput();
     Value output = op.getOutput();
 
-    auto inputType = cast<MemRefType>(input.getType());
-    auto shape = inputType.getShape();
+    auto outputType = cast<MemRefType>(output.getType());
+    int rank = outputType.getRank();
 
-    // GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    // GELU approximation constants: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
     Value c0_5 = createConstantFloat(rewriter, loc, 0.5f);
     Value c1 = createConstantFloat(rewriter, loc, 1.0f);
     Value cSqrt2OverPi = createConstantFloat(rewriter, loc, 0.7978845608f); // sqrt(2/pi)
     Value c0_044715 = createConstantFloat(rewriter, loc, 0.044715f);
 
-    Value dim0Val = createConstantIndex(rewriter, loc, shape[0]);
-    Value dim1Val = createConstantIndex(rewriter, loc, shape[1]);
-    Value zeroIdx = createConstantIndex(rewriter, loc, 0);
-    Value oneIdx = createConstantIndex(rewriter, loc, 1);
+    // Use linalg.generic for element-wise GELU activation
+    SmallVector<AffineMap> indexingMaps;
+    auto identityMap = AffineMap::getMultiDimIdentityMap(rank, rewriter.getContext());
+    indexingMaps.push_back(identityMap);  // input
+    indexingMaps.push_back(identityMap);  // output
 
-    rewriter.create<scf::ForOp>(
-        loc, zeroIdx, dim0Val, oneIdx, ValueRange{},
-        [&](OpBuilder &builder, Location loc, Value i, ValueRange iterArgs) {
-          builder.create<scf::ForOp>(
-              loc, zeroIdx, dim1Val, oneIdx, ValueRange{},
-              [&](OpBuilder &builder, Location loc, Value j, ValueRange iterArgs) {
-                Value x = builder.create<memref::LoadOp>(loc, input, ValueRange{i, j});
+    SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
 
-                // Compute x^3
-                Value x2 = builder.create<arith::MulFOp>(loc, x, x);
-                Value x3 = builder.create<arith::MulFOp>(loc, x2, x);
+    // Capture constants for use in body builder
+    Value capturedC0_5 = c0_5;
+    Value capturedC1 = c1;
+    Value capturedCSqrt2OverPi = cSqrt2OverPi;
+    Value capturedC0_044715 = c0_044715;
 
-                // Compute 0.044715 * x^3
-                Value term = builder.create<arith::MulFOp>(loc, c0_044715, x3);
+    rewriter.create<linalg::GenericOp>(
+        loc,
+        ValueRange{input},
+        ValueRange{output},
+        indexingMaps,
+        iteratorTypes,
+        [capturedC0_5, capturedC1, capturedCSqrt2OverPi, capturedC0_044715]
+        (OpBuilder &b, Location loc, ValueRange args) {
+          Value x = args[0];
 
-                // Compute x + 0.044715 * x^3
-                Value inner = builder.create<arith::AddFOp>(loc, x, term);
+          // Compute x^3
+          Value x2 = b.create<arith::MulFOp>(loc, x, x);
+          Value x3 = b.create<arith::MulFOp>(loc, x2, x);
 
-                // Compute sqrt(2/pi) * (x + 0.044715 * x^3)
-                Value scaled = builder.create<arith::MulFOp>(loc, cSqrt2OverPi, inner);
+          // Compute 0.044715 * x^3
+          Value term = b.create<arith::MulFOp>(loc, capturedC0_044715, x3);
 
-                // Compute tanh(...)
-                Value tanhVal = builder.create<math::TanhOp>(loc, scaled);
+          // Compute x + 0.044715 * x^3
+          Value inner = b.create<arith::AddFOp>(loc, x, term);
 
-                // Compute 1 + tanh(...)
-                Value onePlusTanh = builder.create<arith::AddFOp>(loc, c1, tanhVal);
+          // Compute sqrt(2/pi) * (x + 0.044715 * x^3)
+          Value scaled = b.create<arith::MulFOp>(loc, capturedCSqrt2OverPi, inner);
 
-                // Compute 0.5 * x * (1 + tanh(...))
-                Value halfX = builder.create<arith::MulFOp>(loc, c0_5, x);
-                Value result = builder.create<arith::MulFOp>(loc, halfX, onePlusTanh);
+          // Compute tanh(...)
+          Value tanhVal = b.create<math::TanhOp>(loc, scaled);
 
-                builder.create<memref::StoreOp>(loc, result, output, ValueRange{i, j});
-                builder.create<scf::YieldOp>(loc);
-              });
-          builder.create<scf::YieldOp>(loc);
-        });
+          // Compute 1 + tanh(...)
+          Value onePlusTanh = b.create<arith::AddFOp>(loc, capturedC1, tanhVal);
+
+          // Compute 0.5 * x * (1 + tanh(...))
+          Value halfX = b.create<arith::MulFOp>(loc, capturedC0_5, x);
+          Value result = b.create<arith::MulFOp>(loc, halfX, onePlusTanh);
+
+          b.create<linalg::YieldOp>(loc, result);
+        }
+    );
 
     rewriter.eraseOp(op);
     return success();
@@ -277,28 +368,32 @@ struct AddOpLowering : public OpRewritePattern<AddOp> {
     Value rhs = op.getRhs();
     Value output = op.getOutput();
 
-    auto lhsType = cast<MemRefType>(lhs.getType());
-    auto shape = lhsType.getShape();
+    auto outputType = cast<MemRefType>(output.getType());
+    int rank = outputType.getRank();
 
-    Value dim0Val = createConstantIndex(rewriter, loc, shape[0]);
-    Value dim1Val = createConstantIndex(rewriter, loc, shape[1]);
-    Value zeroIdx = createConstantIndex(rewriter, loc, 0);
-    Value oneIdx = createConstantIndex(rewriter, loc, 1);
+    // Create indexing maps: all identity (parallel element-wise operation)
+    SmallVector<AffineMap> indexingMaps;
+    auto identityMap = AffineMap::getMultiDimIdentityMap(rank, rewriter.getContext());
+    indexingMaps.push_back(identityMap);  // lhs
+    indexingMaps.push_back(identityMap);  // rhs
+    indexingMaps.push_back(identityMap);  // output
 
-    rewriter.create<scf::ForOp>(
-        loc, zeroIdx, dim0Val, oneIdx, ValueRange{},
-        [&](OpBuilder &builder, Location loc, Value i, ValueRange iterArgs) {
-          builder.create<scf::ForOp>(
-              loc, zeroIdx, dim1Val, oneIdx, ValueRange{},
-              [&](OpBuilder &builder, Location loc, Value j, ValueRange iterArgs) {
-                Value lhsVal = builder.create<memref::LoadOp>(loc, lhs, ValueRange{i, j});
-                Value rhsVal = builder.create<memref::LoadOp>(loc, rhs, ValueRange{i, j});
-                Value result = builder.create<arith::AddFOp>(loc, lhsVal, rhsVal);
-                builder.create<memref::StoreOp>(loc, result, output, ValueRange{i, j});
-                builder.create<scf::YieldOp>(loc);
-              });
-          builder.create<scf::YieldOp>(loc);
-        });
+    // All dimensions are parallel (no reductions)
+    SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
+
+    // Create linalg.generic operation
+    rewriter.create<linalg::GenericOp>(
+        loc,
+        /*inputs=*/ValueRange{lhs, rhs},
+        /*outputs=*/ValueRange{output},
+        /*indexingMaps=*/indexingMaps,
+        /*iteratorTypes=*/iteratorTypes,
+        /*bodyBuilder=*/[](OpBuilder &b, Location loc, ValueRange args) {
+          // args[0] = lhs element, args[1] = rhs element
+          Value sum = b.create<arith::AddFOp>(loc, args[0], args[1]);
+          b.create<linalg::YieldOp>(loc, sum);
+        }
+    );
 
     rewriter.eraseOp(op);
     return success();
@@ -319,44 +414,20 @@ struct MatmulOpLowering : public OpRewritePattern<MatmulOp> {
     Value rhs = op.getRhs();
     Value output = op.getOutput();
 
-    auto lhsType = cast<MemRefType>(lhs.getType());
-    auto rhsType = cast<MemRefType>(rhs.getType());
+    auto outputType = cast<MemRefType>(output.getType());
 
-    // Support 2D matmul: (M, K) @ (K, N) -> (M, N)
-    int64_t M = lhsType.getShape()[0];
-    int64_t K = lhsType.getShape()[1];
-    int64_t N = rhsType.getShape()[1];
-
+    // Step 1: Initialize output to zero using linalg.fill
+    // linalg.matmul uses accumulation semantics (C += A @ B), so we need C = 0 first
     Value zero = createConstantFloat(rewriter, loc, 0.0f);
-    Value MVal = createConstantIndex(rewriter, loc, M);
-    Value NVal = createConstantIndex(rewriter, loc, N);
-    Value KVal = createConstantIndex(rewriter, loc, K);
-    Value zeroIdx = createConstantIndex(rewriter, loc, 0);
-    Value oneIdx = createConstantIndex(rewriter, loc, 1);
+    rewriter.create<linalg::FillOp>(loc, zero, output);
 
-    // output[i, j] = sum_k(lhs[i, k] * rhs[k, j])
-    rewriter.create<scf::ForOp>(
-        loc, zeroIdx, MVal, oneIdx, ValueRange{},
-        [&](OpBuilder &builder, Location loc, Value i, ValueRange iterArgs) {
-          builder.create<scf::ForOp>(
-              loc, zeroIdx, NVal, oneIdx, ValueRange{},
-              [&](OpBuilder &builder, Location loc, Value j, ValueRange iterArgs) {
-                Value sum = builder.create<scf::ForOp>(
-                    loc, zeroIdx, KVal, oneIdx, ValueRange{zero},
-                    [&](OpBuilder &builder, Location loc, Value k, ValueRange iterArgs) {
-                      Value currentSum = iterArgs[0];
-                      Value lhsVal = builder.create<memref::LoadOp>(loc, lhs, ValueRange{i, k});
-                      Value rhsVal = builder.create<memref::LoadOp>(loc, rhs, ValueRange{k, j});
-                      Value prod = builder.create<arith::MulFOp>(loc, lhsVal, rhsVal);
-                      Value newSum = builder.create<arith::AddFOp>(loc, currentSum, prod);
-                      builder.create<scf::YieldOp>(loc, newSum);
-                    }).getResult(0);
-
-                builder.create<memref::StoreOp>(loc, sum, output, ValueRange{i, j});
-                builder.create<scf::YieldOp>(loc);
-              });
-          builder.create<scf::YieldOp>(loc);
-        });
+    // Step 2: Perform matrix multiplication using linalg.matmul
+    // For both 2D and 3D (batched), linalg.matmul handles it automatically
+    rewriter.create<linalg::MatmulOp>(
+        loc,
+        ValueRange{lhs, rhs},  // inputs
+        ValueRange{output}     // output (accumulates into initialized buffer)
+    );
 
     rewriter.eraseOp(op);
     return success();
@@ -377,31 +448,25 @@ struct TransposeOpLowering : public OpRewritePattern<TransposeOp> {
     Value output = op.getOutput();
 
     auto inputType = cast<MemRefType>(input.getType());
-    auto shape = inputType.getShape();
+    int rank = inputType.getRank();
 
-    // Transpose: input is (dim0, dim1), output is (dim1, dim0)
-    int64_t inputDim0 = shape[0];
-    int64_t inputDim1 = shape[1];
+    // Create permutation: swap last two dimensions
+    // For rank=2: [0,1] -> [1,0]
+    // For rank=3: [0,1,2] -> [0,2,1]
+    SmallVector<int64_t> permutation;
+    for (int i = 0; i < rank - 2; i++) {
+      permutation.push_back(i);
+    }
+    permutation.push_back(rank - 1);  // Swap: last dimension first
+    permutation.push_back(rank - 2);  // Swap: second-to-last dimension second
 
-    Value inputDim0Val = createConstantIndex(rewriter, loc, inputDim0);
-    Value inputDim1Val = createConstantIndex(rewriter, loc, inputDim1);
-    Value zeroIdx = createConstantIndex(rewriter, loc, 0);
-    Value oneIdx = createConstantIndex(rewriter, loc, 1);
-
-    // output[i, j] = input[j, i]
-    // Output shape is (inputDim1, inputDim0), so iterate accordingly
-    rewriter.create<scf::ForOp>(
-        loc, zeroIdx, inputDim1Val, oneIdx, ValueRange{},
-        [&](OpBuilder &builder, Location loc, Value i, ValueRange iterArgs) {
-          builder.create<scf::ForOp>(
-              loc, zeroIdx, inputDim0Val, oneIdx, ValueRange{},
-              [&](OpBuilder &builder, Location loc, Value j, ValueRange iterArgs) {
-                Value val = builder.create<memref::LoadOp>(loc, input, ValueRange{j, i});
-                builder.create<memref::StoreOp>(loc, val, output, ValueRange{i, j});
-                builder.create<scf::YieldOp>(loc);
-              });
-          builder.create<scf::YieldOp>(loc);
-        });
+    // Use linalg.transpose with the permutation
+    rewriter.create<linalg::TransposeOp>(
+        loc,
+        input,
+        output,
+        permutation
+    );
 
     rewriter.eraseOp(op);
     return success();
@@ -422,58 +487,94 @@ struct SoftmaxOpLowering : public OpRewritePattern<SoftmaxOp> {
     Value output = op.getOutput();
 
     auto inputType = cast<MemRefType>(input.getType());
-    auto shape = inputType.getShape();
+    ArrayRef<int64_t> shape = inputType.getShape();
+    int rank = shape.size();
 
-    int64_t rows = shape[0];
-    int64_t cols = shape[1];
+    // Create temporary buffers for intermediate results
+    SmallVector<int64_t> reducedShape(shape.begin(), shape.end() - 1);
+    auto reducedType = MemRefType::get(reducedShape, rewriter.getF32Type());
+    Value maxBuffer = rewriter.create<memref::AllocOp>(loc, reducedType);
+    Value sumBuffer = rewriter.create<memref::AllocOp>(loc, reducedType);
 
-    Value negInf = createConstantFloat(rewriter, loc, -std::numeric_limits<float>::infinity());
+    // Step 1: Find max along last dimension using linalg.reduce
+    Value negInf = createConstantFloat(rewriter, loc, -1e9f);
+    rewriter.create<linalg::FillOp>(loc, negInf, maxBuffer);
+
+    rewriter.create<linalg::ReduceOp>(
+        loc,
+        ValueRange{input},
+        ValueRange{maxBuffer},
+        SmallVector<int64_t>{rank - 1},  // reduce along last dimension
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          // args[0] = input element, args[1] = current max
+          Value newMax = b.create<arith::MaximumFOp>(loc, args[0], args[1]);
+          b.create<linalg::YieldOp>(loc, newMax);
+        }
+    );
+
+    // Step 2: Compute exp(input - max) using linalg.generic
+    // This broadcasts max across the last dimension and computes exp
+    SmallVector<AffineMap> indexingMaps;
+    auto identityMap = AffineMap::getMultiDimIdentityMap(rank, rewriter.getContext());
+    SmallVector<AffineExpr> reducedExprs;
+    for (int i = 0; i < rank - 1; i++) {
+      reducedExprs.push_back(rewriter.getAffineDimExpr(i));
+    }
+    auto broadcastMap = AffineMap::get(rank, 0, reducedExprs, rewriter.getContext());
+
+    indexingMaps.push_back(identityMap);     // input
+    indexingMaps.push_back(broadcastMap);    // maxBuffer (broadcasted)
+    indexingMaps.push_back(identityMap);     // output
+
+    SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
+
+    rewriter.create<linalg::GenericOp>(
+        loc,
+        ValueRange{input, maxBuffer},
+        ValueRange{output},
+        indexingMaps,
+        iteratorTypes,
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          // args[0] = input element, args[1] = max value (broadcasted)
+          Value shifted = b.create<arith::SubFOp>(loc, args[0], args[1]);
+          Value expVal = b.create<math::ExpOp>(loc, shifted);
+          b.create<linalg::YieldOp>(loc, expVal);
+        }
+    );
+
+    // Step 3: Sum exp values along last dimension using linalg.reduce
     Value zero = createConstantFloat(rewriter, loc, 0.0f);
-    Value rowsVal = createConstantIndex(rewriter, loc, rows);
-    Value colsVal = createConstantIndex(rewriter, loc, cols);
-    Value zeroIdx = createConstantIndex(rewriter, loc, 0);
-    Value oneIdx = createConstantIndex(rewriter, loc, 1);
+    rewriter.create<linalg::FillOp>(loc, zero, sumBuffer);
 
-    // For each row: softmax(x_i) = exp(x_i - max(x)) / sum(exp(x_j - max(x)))
-    rewriter.create<scf::ForOp>(
-        loc, zeroIdx, rowsVal, oneIdx, ValueRange{},
-        [&](OpBuilder &builder, Location loc, Value i, ValueRange iterArgs) {
-          // Step 1: Find max
-          Value maxVal = builder.create<scf::ForOp>(
-              loc, zeroIdx, colsVal, oneIdx, ValueRange{negInf},
-              [&](OpBuilder &builder, Location loc, Value j, ValueRange iterArgs) {
-                Value currentMax = iterArgs[0];
-                Value val = builder.create<memref::LoadOp>(loc, input, ValueRange{i, j});
-                Value newMax = builder.create<arith::MaximumFOp>(loc, currentMax, val);
-                builder.create<scf::YieldOp>(loc, newMax);
-              }).getResult(0);
+    rewriter.create<linalg::ReduceOp>(
+        loc,
+        ValueRange{output},  // input is now the exp values
+        ValueRange{sumBuffer},
+        SmallVector<int64_t>{rank - 1},  // reduce along last dimension
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          // args[0] = exp element, args[1] = current sum
+          Value newSum = b.create<arith::AddFOp>(loc, args[0], args[1]);
+          b.create<linalg::YieldOp>(loc, newSum);
+        }
+    );
 
-          // Step 2: Compute sum of exp(x - max)
-          Value sumExp = builder.create<scf::ForOp>(
-              loc, zeroIdx, colsVal, oneIdx, ValueRange{zero},
-              [&](OpBuilder &builder, Location loc, Value j, ValueRange iterArgs) {
-                Value currentSum = iterArgs[0];
-                Value val = builder.create<memref::LoadOp>(loc, input, ValueRange{i, j});
-                Value shifted = builder.create<arith::SubFOp>(loc, val, maxVal);
-                Value expVal = builder.create<math::ExpOp>(loc, shifted);
-                Value newSum = builder.create<arith::AddFOp>(loc, currentSum, expVal);
-                builder.create<scf::YieldOp>(loc, newSum);
-              }).getResult(0);
+    // Step 4: Normalize by dividing exp values by sum using linalg.generic
+    rewriter.create<linalg::GenericOp>(
+        loc,
+        ValueRange{output, sumBuffer},  // exp values and sum
+        ValueRange{output},              // in-place normalization
+        SmallVector<AffineMap>{identityMap, broadcastMap, identityMap},
+        iteratorTypes,
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          // args[0] = exp element, args[1] = sum (broadcasted)
+          Value normalized = b.create<arith::DivFOp>(loc, args[0], args[1]);
+          b.create<linalg::YieldOp>(loc, normalized);
+        }
+    );
 
-          // Step 3: Normalize
-          builder.create<scf::ForOp>(
-              loc, zeroIdx, colsVal, oneIdx, ValueRange{},
-              [&](OpBuilder &builder, Location loc, Value j, ValueRange iterArgs) {
-                Value val = builder.create<memref::LoadOp>(loc, input, ValueRange{i, j});
-                Value shifted = builder.create<arith::SubFOp>(loc, val, maxVal);
-                Value expVal = builder.create<math::ExpOp>(loc, shifted);
-                Value result = builder.create<arith::DivFOp>(loc, expVal, sumExp);
-                builder.create<memref::StoreOp>(loc, result, output, ValueRange{i, j});
-                builder.create<scf::YieldOp>(loc);
-              });
-
-          builder.create<scf::YieldOp>(loc);
-        });
+    // Clean up temporary buffers
+    rewriter.create<memref::DeallocOp>(loc, maxBuffer);
+    rewriter.create<memref::DeallocOp>(loc, sumBuffer);
 
     rewriter.eraseOp(op);
     return success();
@@ -494,30 +595,35 @@ struct ScaleOpLowering : public OpRewritePattern<ScaleOp> {
     Value scale = op.getScale();
     Value output = op.getOutput();
 
-    auto inputType = cast<MemRefType>(input.getType());
-    auto shape = inputType.getShape();
+    auto outputType = cast<MemRefType>(output.getType());
+    int rank = outputType.getRank();
 
-    // Load scalar scale value
+    // Load scalar scale value from 1D memref
     Value zeroIdx = createConstantIndex(rewriter, loc, 0);
-    Value scaleVal = rewriter.create<memref::LoadOp>(loc, scale, ValueRange{zeroIdx});
+    Value scalarValue = rewriter.create<memref::LoadOp>(loc, scale, ValueRange{zeroIdx});
 
-    Value dim0Val = createConstantIndex(rewriter, loc, shape[0]);
-    Value dim1Val = createConstantIndex(rewriter, loc, shape[1]);
-    Value oneIdx = createConstantIndex(rewriter, loc, 1);
+    // Use linalg.generic for element-wise multiplication
+    SmallVector<AffineMap> indexingMaps;
+    auto identityMap = AffineMap::getMultiDimIdentityMap(rank, rewriter.getContext());
+    indexingMaps.push_back(identityMap);  // input
+    indexingMaps.push_back(identityMap);  // output
 
-    rewriter.create<scf::ForOp>(
-        loc, zeroIdx, dim0Val, oneIdx, ValueRange{},
-        [&](OpBuilder &builder, Location loc, Value i, ValueRange iterArgs) {
-          builder.create<scf::ForOp>(
-              loc, zeroIdx, dim1Val, oneIdx, ValueRange{},
-              [&](OpBuilder &builder, Location loc, Value j, ValueRange iterArgs) {
-                Value val = builder.create<memref::LoadOp>(loc, input, ValueRange{i, j});
-                Value result = builder.create<arith::MulFOp>(loc, val, scaleVal);
-                builder.create<memref::StoreOp>(loc, result, output, ValueRange{i, j});
-                builder.create<scf::YieldOp>(loc);
-              });
-          builder.create<scf::YieldOp>(loc);
-        });
+    SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
+
+    // Capture the scalar value for use in body builder
+    Value capturedScalar = scalarValue;
+
+    rewriter.create<linalg::GenericOp>(
+        loc,
+        ValueRange{input},
+        ValueRange{output},
+        indexingMaps,
+        iteratorTypes,
+        [capturedScalar](OpBuilder &b, Location loc, ValueRange args) {
+          Value product = b.create<arith::MulFOp>(loc, args[0], capturedScalar);
+          b.create<linalg::YieldOp>(loc, product);
+        }
+    );
 
     rewriter.eraseOp(op);
     return success();
@@ -534,7 +640,8 @@ struct LowerTransformerToStandardPass
 
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<arith::ArithDialect, scf::SCFDialect,
-                    memref::MemRefDialect, math::MathDialect>();
+                    memref::MemRefDialect, math::MathDialect,
+                    linalg::LinalgDialect>();
   }
 
   void runOnOperation() override {

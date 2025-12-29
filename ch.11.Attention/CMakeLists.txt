@@ -37,6 +37,7 @@ target_link_libraries(TransformerDialect PUBLIC
     MLIRIR
     MLIRSupport
     MLIRSideEffectInterfaces
+    MLIRLinalgDialect
 )
 
 # Python bindings for attention
