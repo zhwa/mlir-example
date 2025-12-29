@@ -1213,8 +1213,8 @@ void test_kv_cache() {
 int main(int argc, char** argv) {
     std::cout << "\n";
     std::cout << "╔════════════════════════════════════════════════════════════╗\n";
-    std::cout << "║  Chapter 15: GPU Concepts (AOT Compilation)               ║\n";
-    std::cout << "║  Phase 0: Vector Operations                               ║\n";
+    std::cout << "║  Chapter 15: GPU Concepts (AOT Compilation)                ║\n";
+    std::cout << "║  Phase 0: Vector Operations                                ║\n";
     std::cout << "╚════════════════════════════════════════════════════════════╝\n";
     std::cout << "\n";
     std::cout << "Architecture: AOT (No JIT, No GPU - CPU emulation via SCF)\n";
@@ -1234,7 +1234,7 @@ int main(int argc, char** argv) {
     // Phase 1 tests
     std::cout << "\n";
     std::cout << "╔════════════════════════════════════════════════════════════╗\n";
-    std::cout << "║  Phase 1: Matrix Multiplication (2D GPU)                  ║\n";
+    std::cout << "║  Phase 1: Matrix Multiplication (2D GPU)                   ║\n";
     std::cout << "╚════════════════════════════════════════════════════════════╝\n";
     std::cout << "\n";
     std::cout << "GPU Concept: 16×16 thread blocks, 2D grid\n";
@@ -1252,7 +1252,7 @@ int main(int argc, char** argv) {
     // Phase 2 tests
     std::cout << "\n";
     std::cout << "╔════════════════════════════════════════════════════════════╗\n";
-    std::cout << "║  Phase 2: Element-wise Operations                         ║\n";
+    std::cout << "║  Phase 2: Element-wise Operations                          ║\n";
     std::cout << "╚════════════════════════════════════════════════════════════╝\n";
     std::cout << "\n";
     std::cout << "GPU Concept: 1D thread blocks (same as Phase 0)\n";
@@ -1270,7 +1270,7 @@ int main(int argc, char** argv) {
     // Phase 3 tests
     std::cout << "\n";
     std::cout << "╔════════════════════════════════════════════════════════════╗\n";
-    std::cout << "║  Phase 3: Softmax (Reductions)                            ║\n";
+    std::cout << "║  Phase 3: Softmax (Reductions)                             ║\n";
     std::cout << "╚════════════════════════════════════════════════════════════╝\n";
     std::cout << "\n";
     std::cout << "GPU Concept: Multi-pass algorithm (max → exp+sum → normalize)\n";
@@ -1288,7 +1288,7 @@ int main(int argc, char** argv) {
     // Phase 4 tests
     std::cout << "\n";
     std::cout << "╔════════════════════════════════════════════════════════════╗\n";
-    std::cout << "║  Phase 4: LayerNorm (The JIT Bug Survivor!)              ║\n";
+    std::cout << "║  Phase 4: LayerNorm (The JIT Bug Survivor!)                ║\n";
     std::cout << "╚════════════════════════════════════════════════════════════╝\n";
     std::cout << "\n";
     std::cout << "GPU Concept: 3-pass reduction (mean → variance → normalize)\n";
@@ -1307,7 +1307,7 @@ int main(int argc, char** argv) {
     // Phase 5 tests
     std::cout << "\n";
     std::cout << "╔════════════════════════════════════════════════════════════╗\n";
-    std::cout << "║  Phase 5: Transpose (Memory Access Patterns)              ║\n";
+    std::cout << "║  Phase 5: Transpose (Memory Access Patterns)               ║\n";
     std::cout << "╚════════════════════════════════════════════════════════════╝\n";
     std::cout << "\n";
     std::cout << "GPU Concept: 2D indexing with swapped dimensions\n";
@@ -1325,7 +1325,7 @@ int main(int argc, char** argv) {
     // Phase 6 tests
     std::cout << "\n";
     std::cout << "╔════════════════════════════════════════════════════════════╗\n";
-    std::cout << "║  Phase 6: Attention Mechanism (Composing Operations)     ║\n";
+    std::cout << "║  Phase 6: Attention Mechanism (Composing Operations)       ║\n";
     std::cout << "╚════════════════════════════════════════════════════════════╝\n";
     std::cout << "\n";
     std::cout << "Attention: Q@K^T → scale → softmax → @V\n";
@@ -1344,7 +1344,7 @@ int main(int argc, char** argv) {
     // Phase 7 tests
     std::cout << "\n";
     std::cout << "╔════════════════════════════════════════════════════════════╗\n";
-    std::cout << "║  Phase 7: Transformer & Nano-GPT                          ║\n";
+    std::cout << "║  Phase 7: Transformer & Nano-GPT                           ║\n";
     std::cout << "╚════════════════════════════════════════════════════════════╝\n";
     std::cout << "\n";
     std::cout << "Complete transformer: Embedding + Attention + FFN\n";

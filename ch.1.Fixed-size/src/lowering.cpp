@@ -61,7 +61,7 @@ LogicalResult applyOptimizationPasses(ModuleOp module) {
   // === Phase 3: SCF → Control Flow ===
   // Transform: scf.for (structured loops) → cf.br (goto-style branches)
   // This converts high-level loops into basic blocks that CPUs understand
-  pm.addPass(createConvertSCFToCFPass());
+  pm.addPass(createSCFToControlFlowPass());
 
   // === Phase 4: MemRef → LLVM ===
   // Transform: memref<8x32xf32> → raw pointers + strides

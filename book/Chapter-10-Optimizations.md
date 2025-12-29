@@ -545,6 +545,14 @@ pm.addPass(createConvertSCFToCFPass());
 
 Why auto-vectorization? **Simplicity and maturity**. LLVM's loop vectorizer has decades of development and handles edge cases (remainder loops, alignment, cost models) robustly. While MLIR's vector dialect provides more control for advanced use cases (explicit tiling strategies, target-specific SIMD patterns), LLVM's auto-vectorizer suffices for typical ML workloads and requires no additional passes in the pipeline.
 
+**LLVM 21 VPlan Enhancement**. This book uses LLVM 21, which includes major improvements to the loop vectorizer through **VPlan (Vectorization Plan)**—a hierarchical control flow graph that models multiple vectorization strategies before code generation. Key improvements:
+
+- **Early Exit Vectorization**: Loops with `break` or `return` statements (e.g., `std::find`) can now be vectorized—previously these were rejected entirely
+- **Better Register Pressure Modeling**: Per-plan cost estimation prevents over-vectorization that causes register spilling (5-10% performance improvement for data-heavy loops)
+- **Uncountable Loop Support**: Loops where trip count isn't known at compile time benefit from VPlan's adaptive strategy selection
+
+For MLIR users, this means the auto-vectorizer produces better code "for free"—your loops lower to LLVM IR, and LLVM 21's VPlan automatically applies more aggressive optimizations than LLVM 20 could. The loop invariant code motion and fusion optimizations in this chapter prepare IR that VPlan can exploit effectively.
+
 **Vectorization of Reduction Loops**. Parallelizable loops (embarrassingly parallel computations like element-wise operations) vectorize straightforwardly. Reduction loops (sum, max, matrix multiplication) require more sophistication. Consider:
 
 ```mlir

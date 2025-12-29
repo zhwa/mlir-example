@@ -51,7 +51,7 @@ LogicalResult applyLoweringPasses(ModuleOp module) {
   pm.addPass(createConvertMathToLibmPass());
 
   // === Phase 3: Lower SCF to Control Flow ===
-  pm.addPass(createConvertSCFToCFPass());
+  pm.addPass(createSCFToControlFlowPass());
 
   // === Phase 4: Convert everything to LLVM dialect ===
   pm.addPass(createArithToLLVMConversionPass());

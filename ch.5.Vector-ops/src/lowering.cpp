@@ -40,7 +40,7 @@ LogicalResult applyLoweringPasses(ModuleOp module) {
 
   // === Phase 2: SCF to Control Flow ===
   // Lower scf.for to cf.br (branch instructions)
-  pm.addPass(createConvertSCFToCFPass());
+  pm.addPass(createSCFToControlFlowPass());
 
   // === Phase 3: Convert to LLVM ===
   // Lower all remaining dialects to LLVM

@@ -15,11 +15,12 @@ Total: 67 comprehensive tests
 """
 
 import sys
+import os
 import time
 import numpy as np
 
-# Add python module to path
-sys.path.insert(0, './python')
+# Add python module to path (relative to this test file)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'python'))
 
 from request import Request
 from batch import Batch

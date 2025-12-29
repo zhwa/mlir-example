@@ -83,7 +83,7 @@ public:
         // Lower to LLVM (same order as Chapter 7)
         pm.addPass(createConvertMathToLLVMPass());
         pm.addPass(createConvertMathToLibmPass());
-        pm.addPass(createConvertSCFToCFPass());
+        pm.addPass(createSCFToControlFlowPass());
         pm.addPass(createArithToLLVMConversionPass());
         pm.addPass(createConvertControlFlowToLLVMPass());
         pm.addPass(createFinalizeMemRefToLLVMConversionPass());

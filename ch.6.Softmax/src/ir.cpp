@@ -111,8 +111,9 @@ OwningOpRef<ModuleOp> createSoftmaxModule(MLIRContext& context) {
   //===--------------------------------------------------------------------===//
 
   // Initialize with negative infinity
-  Value negInf = builder.create<arith::ConstantFloatOp>(
-      loc, APFloat::getInf(f32Type.getFloatSemantics(), /*Negative=*/true), f32Type);
+  Value negInf = builder.create<arith::ConstantOp>(
+      loc, builder.getFloatAttr(f32Type, 
+          APFloat::getInf(f32Type.getFloatSemantics(), /*Negative=*/true)));
 
   // Create loop to find max
   auto findMaxLoop = builder.create<scf::ForOp>(
@@ -130,8 +131,8 @@ OwningOpRef<ModuleOp> createSoftmaxModule(MLIRContext& context) {
   // Pass 2: Compute exp(x - max) and accumulate sum
   //===--------------------------------------------------------------------===//
 
-  Value zeroFloat = builder.create<arith::ConstantFloatOp>(
-      loc, APFloat(0.0f), f32Type);
+  Value zeroFloat = builder.create<arith::ConstantOp>(
+      loc, builder.getFloatAttr(f32Type, APFloat(0.0f)));
 
   auto expSumLoop = builder.create<scf::ForOp>(
       loc, c0, size, c1, ValueRange{zeroFloat},

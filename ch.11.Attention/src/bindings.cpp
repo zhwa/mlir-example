@@ -92,7 +92,7 @@ public:
     // Lower to LLVM
     pm.addPass(createConvertMathToLLVMPass());
     pm.addPass(createConvertMathToLibmPass());
-    pm.addPass(createConvertSCFToCFPass());
+    pm.addPass(createSCFToControlFlowPass());
     pm.addPass(createArithToLLVMConversionPass());
     pm.addPass(createConvertControlFlowToLLVMPass());
     pm.addPass(createFinalizeMemRefToLLVMConversionPass());
@@ -340,8 +340,8 @@ public:
 
         // Create constant scale factor memref (same shape as input)
         Value scale = createAlloc(node->shape);
-        Value scaleConst = builder.create<arith::ConstantFloatOp>(
-            loc, llvm::APFloat(node->scale_factor), builder.getF32Type());
+        Value scaleConst = builder.create<arith::ConstantOp>(
+            loc, builder.getFloatAttr(builder.getF32Type(), llvm::APFloat(node->scale_factor)));
 
         // Fill scale memref with constant
         SmallVector<Value> bounds;

@@ -99,7 +99,7 @@ Logits [seq_len, vocab_size]
 
 We switched from JIT to AOT (Ahead-Of-Time) compilation because:
 
-- ✅ **Sidesteps LLVM 20 JIT bug** that caused 21 failures with LayerNorm
+- ✅ **Sidesteps LLVM 21 JIT bug** that caused 21 failures with LayerNorm
 - ✅ **Faster execution** - no runtime compilation overhead
 - ✅ **Production-ready** - matches IREE, XLA, TVM architecture
 - ✅ **Better debugging** - inspect assembly with objdump, use gdb

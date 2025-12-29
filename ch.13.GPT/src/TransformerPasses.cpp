@@ -672,11 +672,11 @@ struct CreateCausalMaskOpLowering : public OpRewritePattern<CreateCausalMaskOp> 
     }
 
     // Constants for mask values
-    Value zeroFloat = rewriter.create<arith::ConstantFloatOp>(
-        loc, llvm::APFloat(0.0f), rewriter.getF32Type());
-    Value negInf = rewriter.create<arith::ConstantFloatOp>(
-        loc, llvm::APFloat::getInf(llvm::APFloat::IEEEsingle(), /*Negative=*/true),
-        rewriter.getF32Type());
+    Value zeroFloat = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getFloatAttr(rewriter.getF32Type(), llvm::APFloat(0.0f)));
+    Value negInf = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getFloatAttr(rewriter.getF32Type(),
+            llvm::APFloat::getInf(llvm::APFloat::IEEEsingle(), /*Negative=*/true)));
 
     // Generate mask: mask[i][j] = (j <= i) ? 0.0 : -inf
     rewriter.create<scf::ForOp>(
@@ -760,11 +760,11 @@ struct MaskedSoftmaxOpLowering : public OpRewritePattern<MaskedSoftmaxOp> {
       }
     }
 
-    Value zero = rewriter.create<arith::ConstantFloatOp>(
-        loc, llvm::APFloat(0.0f), rewriter.getF32Type());
-    Value negInfInit = rewriter.create<arith::ConstantFloatOp>(
-        loc, llvm::APFloat::getLargest(llvm::APFloat::IEEEsingle(), /*Negative=*/true),
-        rewriter.getF32Type());
+    Value zero = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getFloatAttr(rewriter.getF32Type(), llvm::APFloat(0.0f)));
+    Value negInfInit = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getFloatAttr(rewriter.getF32Type(),
+            llvm::APFloat::getLargest(llvm::APFloat::IEEEsingle(), /*Negative=*/true)));
 
     // For each position in batch and row
     rewriter.create<scf::ForOp>(
@@ -881,8 +881,8 @@ struct RoPEOpLowering : public OpRewritePattern<RoPEOp> {
     }
 
     // Constants for RoPE computation
-    Value base = rewriter.create<arith::ConstantFloatOp>(
-        loc, llvm::APFloat(10000.0f), rewriter.getF32Type());
+    Value base = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getFloatAttr(rewriter.getF32Type(), llvm::APFloat(10000.0f)));
 
     // For each position and dimension pair
     rewriter.create<scf::ForOp>(

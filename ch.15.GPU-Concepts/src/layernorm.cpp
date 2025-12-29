@@ -22,7 +22,7 @@ using namespace mlir;
 // Pass 2: Compute variance = sum((input - mean)²) / N
 // Pass 3: Normalize each element
 //
-// This is the operation that caused the LLVM 20 JIT bug (21 failed attempts!)
+// This is the operation that caused the LLVM 21 JIT bug (21 failed attempts!)
 // With AOT compilation, it should work perfectly.
 //
 

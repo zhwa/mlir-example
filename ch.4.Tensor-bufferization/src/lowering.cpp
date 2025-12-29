@@ -78,14 +78,13 @@ LogicalResult applyOptimizationPasses(ModuleOp module) {
   // Transform: tensor<?x?xf32> → memref<?x?xf32>
   // This converts functional tensor semantics to imperative memory operations
   
-  // Configure One-Shot Bufferize to handle function boundaries
-  bufferization::OneShotBufferizationOptions options;
-  options.bufferizeFunctionBoundaries = true;
-  options.setFunctionBoundaryTypeConversion(
-      bufferization::LayoutMapOption::IdentityLayoutMap);
+  // LLVM 21: Configure OneShotBufferize with OneShotBufferizePassOptions
+  // We need to enable function boundary bufferization
+  bufferization::OneShotBufferizePassOptions bufferizationOptions;
+  bufferizationOptions.bufferizeFunctionBoundaries = true;
   
   // "One-Shot Bufferize" converts all tensors to memrefs (including function args/results)
-  pm.addPass(bufferization::createOneShotBufferizePass(options));
+  pm.addPass(bufferization::createOneShotBufferizePass(bufferizationOptions));
   
   // Convert memref function results to out-parameters
   // This transforms: func(memref, memref) -> memref
@@ -93,7 +92,7 @@ LogicalResult applyOptimizationPasses(ModuleOp module) {
   pm.addPass(bufferization::createBufferResultsToOutParamsPass());
   
   // Lower remaining bufferization operations to memref  
-  pm.addPass(createBufferizationToMemRefPass());
+  pm.addPass(createConvertBufferizationToMemRefPass());
   pm.addPass(createCanonicalizerPass());  // Clean up
 
   // === Phase 3: Linalg → Loops ===
@@ -105,7 +104,7 @@ LogicalResult applyOptimizationPasses(ModuleOp module) {
   // === Phase 4: SCF → Control Flow ===
   // Transform: scf.for (structured loops) → cf.br (goto-style branches)
   // This converts high-level loops into basic blocks that CPUs understand
-  pm.addPass(createConvertSCFToCFPass());
+  pm.addPass(createSCFToControlFlowPass());
 
   // === Phase 5: MemRef → LLVM ===
   // Transform: memref<8x32xf32> → raw pointers + strides

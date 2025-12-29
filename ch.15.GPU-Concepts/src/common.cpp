@@ -55,7 +55,7 @@ mlir::LogicalResult lowerToLLVMDialect(mlir::ModuleOp module) {
 
     // Lowering pipeline for CPU execution
     // 1. SCF → ControlFlow (convert loops to branches)
-    pm.addPass(mlir::createConvertSCFToCFPass());
+    pm.addPass(mlir::createSCFToControlFlowPass());
 
     // 2. Math → Libm (convert math ops to libm calls BEFORE lowering to LLVM)
     pm.addPass(mlir::createConvertMathToLibmPass());

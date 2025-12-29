@@ -121,7 +121,7 @@ public:
         pm.addPass(createConvertVectorToLLVMPass());  // Vector → LLVM first
         pm.addPass(createConvertMathToLLVMPass());
         pm.addPass(createConvertMathToLibmPass());
-        pm.addPass(createConvertSCFToCFPass());
+        pm.addPass(createSCFToControlFlowPass());
         pm.addPass(createArithToLLVMConversionPass());
         pm.addPass(createConvertControlFlowToLLVMPass());
         pm.addPass(createFinalizeMemRefToLLVMConversionPass());

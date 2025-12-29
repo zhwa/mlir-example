@@ -44,7 +44,7 @@ Run Time:    Link executable → Execute (no compilation overhead)
 ```
 
 **Benefits:**
-- ✅ No JIT bugs (LLVM 20 ORC JIT had issues with LayerNorm)
+- ✅ No JIT bugs (LLVM 21 ORC JIT had issues with LayerNorm)
 - ✅ Faster execution (no runtime compilation)
 - ✅ Better debugging (inspect assembly, use gdb)
 - ✅ Production-ready (matches IREE, XLA, TVM)
@@ -57,7 +57,7 @@ Run Time:    Link executable → Execute (no compilation overhead)
 
 **Chapter 15 Switch to AOT:**
 
-During development, we encountered an unfixable LLVM 20 ORC JIT bug where `engine->lookup()` would hang indefinitely on LayerNorm operations. After 21 different workaround attempts (see git history), we switched to AOT compilation.
+During development, we encountered an unfixable LLVM 21 ORC JIT bug where `engine->lookup()` would hang indefinitely on LayerNorm operations. After 21 different workaround attempts (see git history), we switched to AOT compilation.
 
 **Result:** All 25 kernels now work perfectly, including LayerNorm! ✅
 
@@ -684,7 +684,7 @@ test_layernorm_large (N=512)... ✅ PASSED (max error: 2.38e-07)
 
 ### Why This Works Now (AOT)
 
-**JIT Problem (LLVM 20):** `engine->lookup()` hung indefinitely on any LayerNorm function
+**JIT Problem (LLVM 21):** `engine->lookup()` hung indefinitely on any LayerNorm function
 
 **AOT Solution:** Compile to object file at build time, link directly
 - No symbol lookup at runtime
