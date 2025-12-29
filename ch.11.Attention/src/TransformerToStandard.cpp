@@ -290,25 +290,6 @@ struct TransposeOpLowering : public OpRewritePattern<TransposeOp> {
   }
 };
 
-// Lower transformer.attention (this will be complex, but demonstrates the full pipeline)
-struct AttentionOpLowering : public OpRewritePattern<AttentionOp> {
-  using OpRewritePattern<AttentionOp>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(AttentionOp op,
-                                PatternRewriter &rewriter) const override {
-    // For now, leave attention as-is or implement as composition of other ops
-    // The attention op is complex and would benefit from being implemented
-    // as a combination of the primitives we've already defined
-
-    // This is a placeholder - in a real implementation, you'd either:
-    // 1. Decompose attention into matmul, softmax, etc. ops
-    // 2. Lower directly to loops (very complex)
-    // 3. Keep it high-level and implement in C++/Python
-
-    return failure(); // Don't lower attention yet
-  }
-};
-
 //===----------------------------------------------------------------------===//
 // Pass Definition
 //===----------------------------------------------------------------------===//
@@ -327,7 +308,7 @@ struct LowerTransformerToStandardPass
   void runOnOperation() override {
     RewritePatternSet patterns(&getContext());
     patterns.add<MatmulOpLowering, AddOpLowering, MulOpLowering,
-                 SoftmaxOpLowering, TransposeOpLowering, AttentionOpLowering>(
+                 SoftmaxOpLowering, TransposeOpLowering>(
         &getContext());
 
     if (failed(applyPatternsGreedily(getOperation(),

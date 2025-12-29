@@ -80,47 +80,4 @@ def Transformer_TransposeOp : Transformer_Op<"transpose"> {
   let assemblyFormat = "$input `,` $output attr-dict `:` type($input) `,` type($output)";
 }
 
-//===----------------------------------------------------------------------===//
-// Scaled Dot-Product Attention (Core Operation)
-//===----------------------------------------------------------------------===//
-
-def Transformer_AttentionOp : Transformer_Op<"attention"> {
-  let summary = "Scaled dot-product attention";
-  let description = [{
-    Computes scaled dot-product attention:
-
-    scores = (Q @ K^T) / sqrt(head_dim)
-    attn_weights = softmax(scores)
-    output = attn_weights @ V
-
-    For multi-head attention, the input is expected to be already split into heads:
-    Input shape: (batch, seq_len, d_model)
-
-    If Q/K/V projections are provided (w_q, w_k, w_v), applies:
-      Q = input @ w_q^T
-      K = input @ w_k^T  
-      V = input @ w_v^T
-    Otherwise uses self-attention (Q = K = V = input)
-
-    Outputs concatenated heads, optionally applies output projection (w_o).
-
-    Note: num_heads and head_dim are inferred from weight dimensions to avoid
-    TableGen BytecodeOpInterface issues in LLVM 19.
-  }];
-
-  let arguments = (ins 
-    AnyMemRef:$input,
-    AnyMemRef:$output,
-    AnyMemRef:$w_q,
-    AnyMemRef:$w_k,
-    AnyMemRef:$w_v,
-    AnyMemRef:$w_o
-  );
-
-  let assemblyFormat = [{
-    `(` $input `,` $output `,` $w_q `,` $w_k `,` $w_v `,` $w_o `)`
-    attr-dict `:` type($input) `,` type($output) `,` type($w_q) `,` type($w_k) `,` type($w_v) `,` type($w_o)
-  }];
-}
-
 #endif // TRANSFORMER_OPS
