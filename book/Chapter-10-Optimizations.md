@@ -17,9 +17,9 @@ Before examining optimization techniques, let's quantify the problem. Consider a
 
 For a 128×128 matrix, this performs:
 - **2 memory allocations** (overhead)
-- **128×128 = 16,384 writes** (matmul output)
-- **16,384 reads + 16,384 writes** (ReLU pass)
-- **Total**: 49,152 memory operations plus allocation overhead
+- **128×128 = 16384 writes** matmul output
+- **16384 reads + 16384 writes** (ReLU pass)
+- **Total**: 16384*3=49152 memory operations plus allocation overhead
 
 Optimized code using fusion:
 
@@ -28,10 +28,10 @@ Optimized code using fusion:
 
 This performs:
 - **1 memory allocation**
-- **16,384 writes** (fused results)
-- **Total**: 16,384 memory operations
+- **16384 writes** (fused results)
+- **Total**: 16384 memory operations
 
-The optimized version performs significantly less memory traffic. On modern CPUs where memory bandwidth often bottlenecks computation, reducing memory operations improves performance. The optimized code also enables vectorization (processing multiple elements per instruction with SIMD), provides better cache locality (data accessed once stays in cache for ReLU computation), and reduces allocation overhead (one malloc instead of two). These optimizations combine to substantially improve execution efficiency.
+The optimized version performs significantly less memory traffic. On modern CPUs where memory bandwidth often bottlenecks computation, reducing memory operations improves performance. Crucially, fusion provides **temporal locality**: the unoptimized version writes matmul results to DRAM then immediately reads them back, while the fused version keeps intermediate values in L1 cache or CPU registers. This cache residency makes the performance delta even larger than raw operation counts suggest. The optimized code also enables vectorization (processing multiple elements per instruction with SIMD) and reduces allocation overhead (one malloc instead of two). These optimizations combine to substantially improve execution efficiency.
 
 **Why Manual Optimization Doesn't Scale**. You might think "just write fused kernels manually"—implement `matmul_relu_fused()` by hand. This works for small operator sets but fails at scale:
 
@@ -122,7 +122,7 @@ The canonicalizer applies **canonicalization patterns**—simple, local optimiza
 - **Algebraic simplification**: `x + 0 → x`, `x * 1 → x`
 - **Redundancy elimination**: `transpose(transpose(x)) → x`
 
-Each operation can register canonicalization patterns (Chapter 9 showed this for custom operations). The canonicalizer runs all registered patterns repeatedly until fixpoint—IR stops changing. This "cleanup between major transformations" pattern is ubiquitous in MLIR pipelines: big passes create messy IR (generalization creates verbose generic ops, fusion creates complicated indexing), canonicalizer simplifies, next pass works on cleaner input.
+Each operation can register canonicalization patterns (Chapter 9 showed this for custom operations). The canonicalizer runs all registered patterns repeatedly until fixpoint—IR stops changing. Importantly, the canonicalizer is **greedy**: it applies all patterns without a cost model, assuming simplification is always beneficial. This distinguishes it from optimization passes like fusion, which should ideally evaluate whether transformations improve performance before applying them. This "cleanup between major transformations" pattern is ubiquitous in MLIR pipelines: big passes create messy IR (generalization creates verbose generic ops, fusion creates complicated indexing), canonicalizer simplifies, next pass works on cleaner input.
 
 **Why Not One Big Pass?** You might wonder: why many small passes instead of one comprehensive optimizer? Several reasons:
 
@@ -138,7 +138,7 @@ The cost is coordination complexity—ensuring passes don't interfere or assume 
 
 ### 10.2.5 The Affine Dialect: Why This Book Uses Linalg Instead
 
-Before diving into specific optimizations, we should address a dialect you might encounter in other MLIR resources: the **affine dialect**. Chapter 10—and indeed this entire book—**does not use affine dialect operations**. We use Linalg for high-level structured operations and SCF for explicit loops. This section explains what affine is, why it exists, and why we chose a different path.
+Before diving into specific optimizations, we should address a dialect you might encounter in other MLIR resources: the **affine dialect**. Chapter 10—and indeed this entire book—**eschews the affine dialect in favor of the more flexible Linalg and SCF dialects**. This section explains what affine is, why it exists, and why we made this deliberate architectural choice.
 
 **Important Distinction: AffineMap vs Affine Dialect**. You've already seen `AffineMap` extensively—it's the mathematical type used in Linalg's indexing maps:
 ```mlir
@@ -246,17 +246,6 @@ NN Dialect → Linalg → SCF → CF → LLVM
 
 We skip the affine layer entirely. Linalg's fusion patterns and SCF's loop optimizations (LICM, vectorization) provide sufficient optimization for pedagogical examples and most ML workloads.
 
-**Key Takeaway for This Book**. When you see `affine_map<...>` in our code (Chapters 9, 14), that's **not the affine dialect**—it's just the `AffineMap` type used by Linalg for indexing. When you encounter references to affine in MLIR documentation or other codebases, now you understand:
-- What it is (polyhedral loop optimization)
-- Why it exists (automatic analysis of structured loops)
-- Why we don't use it (Linalg + SCF is more practical for ML workloads)
-- When you might use it (static kernels, research, specific production cases)
-
-**Further Reading** (if you're curious about affine):
-- **MLIR Affine Dialect Docs**: [`Dialects/Affine.md`](https://mlir.llvm.org/docs/Dialects/Affine/)
-- **Polyhedral Compilation Primer**: Uday Bondhugula's papers on automatic loop optimization
-- **Polygeist Project**: C/C++ → Affine MLIR → Optimized parallel code
-
 ## 10.3 Linalg Fusion: Reducing Memory Traffic
 
 Fusion merges adjacent operations to reduce memory operations—the most impactful optimization for memory-bound workloads (which ML often is). MLIR's Linalg dialect enables sophisticated fusion through its structured operation abstraction. Let's understand how fusion works, why it requires careful analysis, and what MLIR automates.
@@ -296,13 +285,12 @@ The matmul writes output `%C`, the generic reads `%C`. There's a **producer-cons
 }
 ```
 
-The fused operation combines matmul's computation (multiply-accumulate) with ReLU's max operation in a single loop nest. The intermediate buffer `%C` disappears—values flow directly from matmul to ReLU within registers. This eliminates:
+The fused operation combines matmul's computation (multiply-accumulate) with ReLU's max operation in a single loop nest. The intermediate buffer `%C` becomes dead code—values flow directly from matmul to ReLU within registers. This eliminates:
 
-- Memory allocation for `%C`
-- 16,384 writes (matmul results)
-- 16,384 reads (ReLU inputs)
+- 16384 writes (matmul results to `%C`)
+- 16384 reads (ReLU inputs from `%C`)
 
-On modern CPUs, memory access costs ~100× more than arithmetic. Eliminating 32,768 memory operations is huge.
+The unused buffer allocation is subsequently removed by MLIR's dead-buffer-elimination during bufferization cleanup—fusion makes the buffer unused, separate passes remove it. On modern CPUs, memory access costs ~100× more than arithmetic. Eliminating 32768 memory operations is huge.
 
 **Why Fusion Is Hard**. Naive fusion breaks correctness. Consider:
 
@@ -312,13 +300,15 @@ On modern CPUs, memory access costs ~100× more than arithmetic. Eliminating 32,
 %2 = linalg.generic ins(%buf) outs(%out)   // Use buffer
 ```
 
-Can we fuse matmul and generic? **Not safely!** Matmul accumulates—it reads existing buffer values. Fusing would read uninitialized data if fill doesn't execute first. The fusion pass must analyze dependencies:
+Can we fuse matmul and generic? **Not safely!** Matmul accumulates—it reads existing buffer values. Fusing would read uninitialized data if fill doesn't execute first. The fusion pass must check three dependency types:
 
-- **Read-after-write (RAW)**: Consumer reads what producer writes (safe to fuse)
-- **Write-after-read (WAR)**: Producer writes what consumer reads (unsafe unless iteration spaces don't overlap)
-- **Write-after-write (WAW)**: Both write to same buffer (unsafe unless disjoint)
+- **Read-after-write (RAW)**: Consumer reads what producer writes → safe to fuse (producer's output becomes consumer's input)
+- **Write-after-read (WAR)**: Producer writes to a location the consumer already read → unsafe if they execute simultaneously
+- **Write-after-write (WAW)**: Both write to the same buffer location → unsafe unless they write to different indices
 
-MLIR's fusion pass performs this analysis automatically using Linalg's structured operations. The indexing maps (affine expressions relating iterators to tensor dimensions) make dependency analysis tractable. Generic IR (arbitrary code in loops) makes this NP-hard; structured operations make it polynomial-time and practical.
+**Why Linalg Makes Dependency Analysis Practical**. MLIR's Linalg fusion analyzes these dependencies automatically because Linalg operations declare their access patterns explicitly through indexing maps. Consider `linalg.matmul`: the operation tells us "I read A[i,k], read B[k,j], accumulate into C[i,j]" via affine expressions. The compiler can algebraically compare these access patterns to determine if operations conflict.
+
+Contrast with arbitrary loop code (like hand-written C loops with pointer arithmetic): the compiler must solve "does `ptr1 + f(i,j)` alias `ptr2 + g(k)`?" for arbitrary functions f and g. This pointer aliasing problem is undecidable in general. Linalg's structured format restricts access patterns to affine expressions (linear combinations of loop indices), making the problem solvable through well-known algorithms from polyhedral compilation. This is why Linalg fusion works reliably where general loop fusion often fails or requires programmer annotations.
 
 **Generalization: The Prerequisite for Fusion**. Chapter 10's pipeline includes an unexpected pass before fusion:
 
@@ -357,7 +347,7 @@ Now the fusion pass sees the loop body explicitly and can analyze dependencies b
 3. **Merge loop nests**: Combine iteration spaces, fuse loop bodies, eliminate intermediate buffer
 4. **Update uses**: Redirect buffer uses to the fused operation's result
 
-The actual implementation is more sophisticated (handles multi-consumer fusion, tiled iteration spaces, structured control flow), but the core idea is straightforward. What makes MLIR's version powerful is its generality: the same fusion logic works on matmul+ReLU, conv+batchnorm, any producer-consumer pair with compatible iteration spaces.
+While the core idea is straightforward, MLIR's implementation is sophisticated enough to handle **tiled fusion**—where operations are fused while simultaneously being broken into cache-friendly chunks. It also handles multi-consumer fusion (one producer, multiple consumers) and structured control flow. What makes MLIR's version powerful is its generality: the same fusion logic works on matmul+ReLU, conv+batchnorm, any producer-consumer pair with compatible iteration spaces.
 
 **When Fusion Helps (and When It Doesn't)**. Fusion benefits memory-bound workloads where memory traffic dominates arithmetic cost. For compute-bound operations (large matmuls where memory traffic is small compared to O(n³) arithmetic), fusion matters less. Fusion can even hurt performance by:
 
@@ -365,7 +355,7 @@ The actual implementation is more sophisticated (handles multi-consumer fusion, 
 - **Reducing parallelism**: Separate operations can execute concurrently (different cores, different functional units); fusion serializes them
 - **Hurting cache behavior**: Very large fused operations might not fit in cache where separate operations would
 
-Production compilers use cost models to decide when to fuse. Chapter 10's simple pipeline always fuses elementwise operations with their consumers—a good heuristic for typical ML workloads but not universally optimal. Advanced optimizations (Chapter 14's attention, future work) require more sophisticated fusion control.
+Production compilers use cost models to decide when to fuse. Chapter 10's simple pipeline always fuses elementwise operations with their consumers—a good heuristic for typical ML workloads but not universally optimal. Chapter 14 applies similar techniques at larger scale using Linalg operations and the Transform dialect for declarative optimization specification.
 
 ## 10.4 Loop Invariant Code Motion: Hoisting Computations
 
@@ -384,7 +374,7 @@ scf.for %i = %c0 to %c128 step %c1 {
 }
 ```
 
-The `scale = 1.0 / size` computation occurs inside nested loops, executing 128×128 = 16,384 times. But `size` doesn't depend on loop iterators `%i` or `%j`—the computation is **loop-invariant**. LICM hoists it outside:
+The `scale = 1.0 / size` computation occurs inside nested loops, executing 128×128 = 16384 times. But `size` doesn't depend on loop iterators `%i` or `%j`—the computation is **loop-invariant**. LICM hoists it outside:
 
 ```mlir
 %scale = arith.divf %c1, %size : f32  // Hoisted!
@@ -397,7 +387,7 @@ scf.for %i = %c0 to %c128 step %c1 {
 }
 ```
 
-Now the division executes once instead of 16,384 times. For expensive operations (division, transcendentals like `exp`, `log`), hoisting eliminates redundant computation.
+Now the division executes once instead of 16384 times. For expensive operations (division, transcendentals like `exp`, `log`), hoisting eliminates redundant computation.
 
 **LICM's Safety Requirements**. Like fusion, naive hoisting breaks correctness. Consider:
 
@@ -420,7 +410,7 @@ MLIR's LICM pass checks safety conditions before hoisting:
 3. **Side-effect freedom**: Operation doesn't read/write memory or have other observable effects (pure computation)
 4. **Exception safety**: Operation can't fault (no division by zero, no out-of-bounds access, etc.)
 
-For arithmetic operations on SSA values, these checks are straightforward. For memory operations, LICM is conservative: it doesn't hoist loads/stores because aliasing analysis is complex and wrong hoisting could reorder memory effects incorrectly.
+For arithmetic operations on SSA values, these checks are straightforward. For memory operations, LICM is conservative: it doesn't hoist loads/stores because **alias analysis** is complex. If the compiler can't prove that a `memref.store` inside the loop doesn't affect a `memref.load` you want to hoist, the load must stay inside the loop. Wrong hoisting could reorder memory effects incorrectly, breaking correctness.
 
 **How LICM Works**. The algorithm:
 
@@ -507,9 +497,9 @@ vector<4x4xf32>    // 2D vectors (for matrix operations)
 // Vector operations
 %v = vector.load %mem[%idx] : memref<?xf32>, vector<8xf32>
 vector.store %v, %mem[%idx] : memref<?xf32>, vector<8xf32>
-%sum = vector.reduction <add>, %v : vector<8xf32> to f32
-%bcast = vector.broadcast %scalar : f32 to vector<8xf32>
-%shuffled = vector.shuffle %v1, %v2 [0, 2, 4, 6, 1, 3, 5, 7] : vector<8xf32>
+%sum = vector.reduction <add>, %v : vector<8xf32>  // Result: f32
+%bcast = vector.broadcast %scalar : vector<8xf32>   // %scalar: f32, result: vector<8xf32>
+%shuffled = vector.shuffle %v1, %v2 [0, 2, 4, 6, 1, 3, 5, 7] : vector<8xf32>, vector<8xf32>
 ```
 
 The dialect abstracts hardware details: `vector<8xf32>` compiles to `vmovups` (AVX load), `vmulps` (AVX multiply), `vmovups` (AVX store) on x86, but different instructions on ARM or other architectures. This portability is crucial—write vectorization once, run on any SIMD hardware.
@@ -553,7 +543,7 @@ pm.addNestedPass<func::FuncOp>(createConvertVectorToSCFPass());
 pm.addPass(createConvertVectorToLLVMPass());
 ```
 
-Why explicit vectorization? **Control and predictability**. Linalg operations explicitly encode parallelism through iterator types (`parallel`, `reduction`); lowering to vector dialect preserves this intent. Auto-vectorization in LLVM is heuristic-based—it sometimes fails to vectorize even obviously parallel code, or vectorizes inefficiently. By generating vector IR explicitly, we guarantee SIMD usage and can inspect/debug the vector-level IR.
+Why explicit vectorization? **Control and predictability**. Linalg operations explicitly encode parallelism through iterator types (`parallel`, `reduction`); lowering to vector dialect preserves this intent. Auto-vectorization in LLVM's middle-end (as of LLVM 20) is heuristic-based—relying on cost models and alias analysis that sometimes fail to vectorize even obviously parallel code, or vectorize inefficiently. LLVM's ongoing VPlan improvements may address some limitations, but the fundamental challenge remains: MLIR's `vector` dialect handles multi-dimensional vectors natively, while LLVM IR is inherently one-dimensional. By generating vector IR explicitly, we guarantee SIMD usage and can inspect/debug the vector-level IR.
 
 **Vectorization of Reduction Loops**. Parallelizable loops (embarrassingly parallel computations like element-wise operations) vectorize straightforwardly. Reduction loops (sum, max, matrix multiplication) require more sophistication. Consider:
 
@@ -577,6 +567,8 @@ Naive vectorization fails: each iteration depends on the previous iteration's ac
 %sum = vector.reduction <add>, %partial_sums : vector<8xf32> to f32
 ```
 
+The `iter_args(%acc_vec = %init_vec)` syntax specifies **loop-carried variables**: values that persist across iterations. The `%acc_vec` parameter receives `%init_vec` initially, then receives the yielded value from each iteration. The `-> (vector<8xf32>)` declares the loop's result type, which matches the yield type. This pattern is MLIR's equivalent of functional programming's fold/reduce with explicit accumulator threading.
+
 The loop now accumulates into a vector of 8 partial sums (each element accumulates every 8th input element), then performs a final horizontal reduction (`vector.reduction`) to combine them into a scalar. This parallelizes the reduction while maintaining numerical correctness.
 
 **Handling Remainder Loops**. Vector lengths rarely divide evenly into data sizes. For 128 elements with vector length 8, the main vectorized loop processes 120 elements (15 iterations), leaving 8 elements. MLIR's `vector-to-scf` conversion generates **remainder loops**:
@@ -594,28 +586,6 @@ scf.for %i = %c120 to %c128 step %c1 {
 ```
 
 The pass calculates trip counts (`120 = (128 / 8) * 8`), generates a vectorized loop for the bulk, and a scalar loop for leftovers. This ensures correctness for any data size. More sophisticated approaches use **vector masking** (process full vector width with masks disabling unused lanes), but remainder loops are simpler and often sufficient.
-
-**Measuring Vectorization Impact**. Chapter 10's test suite includes performance measurements:
-
-```python
-import time
-import numpy as np
-
-# Unoptimized execution (Chapter 9)
-start = time.perf_counter()
-result_unopt = compiler_unopt.jit(input_data)
-time_unopt = time.perf_counter() - start
-
-# Optimized execution (Chapter 10)
-start = time.perf_counter()
-result_opt = compiler_opt.jit(input_data)
-time_opt = time.perf_counter() - start
-
-speedup = time_unopt / time_opt
-print(f"Vectorization speedup: {speedup:.2f}×")
-```
-
-The exact performance impact depends on several factors: memory-bound operations (element-wise) typically see less benefit than compute-bound operations (reductions), larger data sizes amortize vectorization overhead better, and hardware capabilities vary significantly (AVX-512 provides 16-wide SIMD, AVX2 provides 8-wide, SSE provides 4-wide). Vectorization rarely applies alone—it combines with fusion and LICM for multiplicative benefits.
 
 ## 10.6 The Complete Optimization Pipeline
 
@@ -799,112 +769,7 @@ When debugging, verify invariants at each stage using `-mlir-print-ir-after-all`
 
 This prints IR after every pass. If Stage 2 should eliminate intermediate buffers but doesn't, inspect IR after `LinalgElementwiseOpFusionPass` to see what fusion missed and why. Systematic debugging through pipeline stages beats guessing.
 
-## 10.7 Understanding Optimization Effects
-
-Optimization passes transform code to execute more efficiently while preserving semantics. This section discusses how to think about optimization effectiveness, what to look for when examining transformed IR, and the principles that guide performance engineering in compilers.
-
-**Measuring Performance**. When developing optimizations, systematic measurement requires careful methodology:
-
-1. **Same input data**: Use identical test cases to eliminate data-dependent variations
-2. **Warm-up runs**: First execution hits cold caches and JIT compilation; discard these measurements
-3. **Multiple trials**: Performance varies due to system noise; average across many runs to reduce variance
-4. **Stable environment**: Minimize interference from CPU frequency scaling, background applications, and other system activity
-
-Chapter 10's `test_jit.py` demonstrates these practices:
-
-```python
-def benchmark_compiler(compiler, input_data, num_trials=20, warmup=5):
-    """Benchmark JIT compilation and execution."""
-    # Warmup runs (discard results)
-    for _ in range(warmup):
-        _ = compiler.jit(input_data)
-    
-    # Timed trials
-    times = []
-    for _ in range(num_trials):
-        start = time.perf_counter()
-        result = compiler.jit(input_data)
-        elapsed = time.perf_counter() - start
-        times.append(elapsed)
-    
-    return {
-        'mean': np.mean(times),
-        'std': np.std(times),
-        'min': np.min(times),
-        'max': np.max(times)
-    }
-```
-
-The warmup ensures JIT compilation happens outside measurements. Multiple trials capture variability, with standard deviation indicating measurement reliability.
-
-**Understanding Optimization Impact**. To understand which optimizations contribute most, run ablation studies—disable optimizations individually and compare results:
-
-```python
-# Baseline: No optimizations
-pm_baseline = PassManager()
-pm_baseline.add(createConvertNNToStandardPass())
-pm_baseline.add(createConvertLinalgToLoopsPass())
-pm_baseline.add(createConvertSCFToCFPass())
-# ... lower to LLVM ...
-
-# Fusion only
-pm_fusion = PassManager()
-pm_fusion.add(createConvertNNToStandardPass())
-pm_fusion.add(createLinalgGeneralizeNamedOpsPass())
-pm_fusion.add(createLinalgElementwiseOpFusionPass())  # Added
-pm_fusion.add(createConvertLinalgToLoopsPass())
-# ... rest unchanged ...
-
-# Fusion + LICM
-pm_fusion_licm = PassManager()
-# ... fusion pipeline ...
-pm_fusion_licm.add(createLoopInvariantCodeMotionPass())  # Added
-# ... rest unchanged ...
-
-# Full optimizations (Fusion + LICM + Vectorization)
-pm_full = PassManager()
-# ... Chapter 10's full pipeline ...
-```
-
-This systematic approach reveals which optimizations provide the most benefit for specific workloads and helps identify optimization interactions—where one optimization enables another to be more effective.
-
-**What to Observe**. When examining optimization effects, look for:
-
-**Memory Operations**: Fusion should eliminate intermediate buffers. Count memory allocation operations in the IR before and after fusion passes. Fewer allocations and reduced load/store operations indicate successful fusion.
-
-**Loop Structure**: LICM should hoist invariant computations outside loops. Examine loop bodies—computations not depending on loop iterators should appear before loop entry.
-
-**Vectorization**: Optimized code should use vector operations where possible. Look for `vector.load`, `vector.store`, and vector arithmetic operations in the IR, indicating SIMD utilization.
-
-**Multiplicative Effects**: Optimizations often enable each other. Fusion creates larger basic blocks that vectorization can process more effectively. LICM simplifies loop bodies, making vectorization patterns easier to match. The combined effect exceeds individual contributions.
-
-**Profiling for Insights**. Beyond timing, profiling tools provide detailed analysis:
-
-```bash
-# Linux perf for CPU profiling
-perf record -g ./test_jit
-perf report
-
-# Valgrind's cachegrind for cache analysis
-valgrind --tool=cachegrind ./test_jit
-cg_annotate cachegrind.out.<pid>
-```
-
-Profiling reveals where time is spent during execution, identifying bottlenecks that deserve optimization attention. For typical ML operations like matmul, expect compute-intensive work to dominate. For element-wise operations, memory bandwidth becomes the bottleneck.
-
-**When Optimizations Don't Help**. Not all workloads benefit equally from optimization. Small problem sizes may not justify optimization overhead—vectorization setup costs and remainder loop handling can exceed benefits when data fits easily in registers. Production compilers use **cost models** to estimate whether optimization benefits exceed costs, applying transformations selectively based on problem characteristics.
-
-**The Performance Engineering Mindset**. Key principles from this section:
-
-1. **Measure systematically**: Use proper benchmarking methodology with warmup, multiple trials, and controlled environments
-2. **Understand your bottleneck**: Memory-bound and compute-bound code require different optimization strategies
-3. **Optimization interactions matter**: Small improvements compound when optimizations enable each other
-4. **Context is crucial**: Know your typical workload—optimizations effective for large tensors may hurt small ones
-5. **Inspect transformed IR**: Understanding what optimizations actually do to code guides effective pipeline construction
-
-These principles apply throughout compiler development, from simple operations in Chapter 10 to complex attention mechanisms in Chapters 11-14.
-
-## 10.8 Topological Traversal: Ordering Computation Graphs
+## 10.7 Topological Traversal: Ordering Computation Graphs
 
 Before we can execute or compile a computation graph, we must solve a fundamental problem: **determining execution order**. Operations have dependencies—an addition operation that consumes the output of a matrix multiplication cannot execute until the multiplication completes. This dependency structure forms a **directed acyclic graph (DAG)**, and executing it correctly requires **topological sorting**—ordering operations so dependencies execute before dependents. This section explains why topological traversal is essential for compilers, how the algorithm works, and how to implement it efficiently.
 
@@ -1140,7 +1005,7 @@ DFS-based sorting is slightly harder to understand but has the same O(V + E) com
 
 Topological sorting is a fundamental algorithm every compiler engineer must understand. It bridges the gap between user-written computation graphs (arbitrary order) and executable IR (dependencies-respecting order), enabling everything else—optimization, parallelization, execution—to work correctly.
 
-## 10.9 Summary
+## 10.8 Summary
 
 This chapter explored MLIR's optimization infrastructure through three core techniques—Linalg fusion (reduces memory traffic), loop-invariant code motion (reduces redundant computation), and vectorization (exploits SIMD hardware). We also examined topological sorting, the fundamental algorithm enabling correct computation graph execution.
 
@@ -1152,5 +1017,3 @@ Key insights:
 - **Measurement-driven**: Optimization effectiveness must be measured through profiling and benchmarking, not assumed
 
 Chapter 10 established that optimizations preserve user-facing APIs—the Python interface stayed identical between Chapters 9 and 10, demonstrating how backend improvements remain transparent to users.
-
-**Looking Ahead**. Chapters 11-14 apply these techniques to modern ML architectures: attention mechanisms (Chapter 11), transformer blocks (Chapter 12), GPT models (Chapter 13), and production optimizations including FlashAttention-style fusion (Chapter 14). The optimization principles—fusion, locality, vectorization, correct ordering—remain constant while their application grows more sophisticated.
