@@ -17,14 +17,19 @@ A hands-on tutorial demonstrating MLIR JIT compilation, progressing from basic m
 
 ```bash
 # Ubuntu/WSL2 - LLVM 21 Required
-# (LLVM 21 includes VPlan vectorization improvements: 5-10% faster auto-vectorization)
+
+# Add LLVM 21 repository
+wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+sudo add-apt-repository -y "deb http://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-21 main"
+sudo apt update
+
+# Install LLVM/MLIR 21
 sudo apt install -y llvm-21 llvm-21-dev llvm-21-runtime
 sudo apt install -y mlir-21-tools libmlir-21-dev
 sudo apt install -y clang-21
-sudo apt install -y python3-dev python3-numpy ninja-build libzstd-dev
 
-# Fix LLVM header conflict (required for pybind11)
-sudo mv /usr/lib/llvm-21/include/cxxabi.h /usr/lib/llvm-21/include/cxxabi.h.backup
+# Install build tools and Python dependencies
+sudo apt install -y cmake python3 python3-dev python3-numpy ninja-build libzstd-dev libffi-dev pkg-config
 ```
 
 ### Build All Chapters
