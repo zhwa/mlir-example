@@ -250,10 +250,10 @@ struct NNAddOpLowering : public OpRewritePattern<AddOp> {
           // Build body: element-wise addition
           Value sum = b.create<arith::AddFOp>(loc, args[0], args[1]);
           b.create<linalg::YieldOp>(loc, sum);
-        });
+        }).getResult(0);
 
-    // Remove original nn.add operation
-    rewriter.eraseOp(op);
+    // Replace original nn.add operation
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
@@ -389,9 +389,9 @@ LogicalResult matchAndRewrite(AddOp op, PatternRewriter &rewriter) const {
         [&](OpBuilder &b, Location loc, ValueRange args) {
           Value sum = b.create<arith::AddFOp>(loc, args[0], args[1]);
           b.create<linalg::YieldOp>(loc, sum);
-        });
+        }).getResult(0);
 
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
     // Returns: LogicalResult (success/failure)
 }
@@ -465,11 +465,11 @@ struct NNMatMulOpLowering : public OpRewritePattern<MatMulOp> {
         loc, ValueRange{zero}, ValueRange{op.getOutput()});
 
     // Create linalg.matmul
-    rewriter.create<linalg::MatmulOp>(
+    Value result = rewriter.create<linalg::MatmulOp>(
         loc, ValueRange{op.getLhs(), op.getRhs()},
         ValueRange{op.getOutput()});
 
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
@@ -683,9 +683,9 @@ struct NNMyOpLowering : public OpRewritePattern<MyOp> {
         [&](OpBuilder &b, Location loc, ValueRange args) {
           Value result = b.create<arith::MyArithOp>(loc, args[0], args[1]);
           b.create<linalg::YieldOp>(loc, result);
-        });
+        }).getResult(0);
 
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
@@ -725,9 +725,9 @@ struct NNMyUnaryOpLowering : public OpRewritePattern<MyUnaryOp> {
         [&](OpBuilder &b, Location loc, ValueRange args) {
           Value result = b.create<SomeOp>(loc, args[0]);
           b.create<linalg::YieldOp>(loc, result);
-        });
+        }).getResult(0);
 
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
@@ -761,10 +761,10 @@ struct NNMatMulOpLowering : public OpRewritePattern<MatMulOp> {
     rewriter.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{op.getOutput()});
 
     // Create named linalg operation
-    rewriter.create<linalg::MatmulOp>(
+    Value result = rewriter.create<linalg::MatmulOp>(
         loc, ValueRange{op.getLhs(), op.getRhs()}, ValueRange{op.getOutput()});
 
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };

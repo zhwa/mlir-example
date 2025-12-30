@@ -815,7 +815,157 @@ When debugging, verify invariants at each stage using `-mlir-print-ir-after-all`
 
 This prints IR after every pass. If Stage 2 should eliminate intermediate buffers but doesn't, inspect IR after `LinalgElementwiseOpFusionPass` to see what fusion missed and why. Systematic debugging through pipeline stages beats guessing.
 
-## 10.7 Topological Traversal: Ordering Computation Graphs
+## 10.7 The Tensor Abstraction: Building Computation Graphs
+
+Before we can compile and optimize operations, we need a way for users to express them. Starting from Chapter 9, our examples use a **tensor abstraction**—a Python API where users build computation graphs symbolically, much like PyTorch's JIT mode or TensorFlow's graph mode. This section explains the design that we've been using throughout: how the `Tensor` class works, why we defer execution, and how computation graphs capture dependencies.
+
+**The Tensor Abstraction**. Python users work with a `Tensor` class wrapping NumPy arrays:
+
+```python
+import ch10
+import numpy as np
+
+Q = ch10.Tensor(np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32))
+K = ch10.Tensor(np.array([[5.0, 6.0], [7.0, 8.0]], dtype=np.float32))
+
+# Build computation graph (no execution yet)
+result_tensor = ch10.matmul(Q, K)  # Example operation
+
+# Compile and execute
+output = ch10.forward(result_tensor)  # Returns NumPy array
+```
+
+The `Tensor` class doesn't compute immediately. Instead, it records operations in a **computation graph**—a directed acyclic graph (DAG) where nodes represent operations and edges represent data dependencies. This deferred execution pattern matches PyTorch's JIT and TensorFlow's graph mode: build a symbolic representation, compile once, execute many times.
+
+**Computation Graph Representation**. From [src/bindings.cpp](ch.10.Optimizations/src/bindings.cpp):
+
+```cpp
+enum class OpType {
+  Input,      // Leaf node: data provided by user
+  Matmul,     // Binary operation: lhs @ rhs
+  Add,        // Binary operation: lhs + rhs
+  Transpose,  // Unary operation: transpose(input)
+  Softmax,    // Unary operation: softmax(input)
+  Scale       // Unary operation: input * scale_factor
+};
+
+struct GraphNode {
+  OpType type;
+  std::vector<std::shared_ptr<GraphNode>> inputs;  // Dependencies
+  py::array_t<float> data;                          // For Input nodes
+  float scale_factor = 1.0f;                        // For Scale nodes
+  std::vector<int64_t> shape;                       // Output shape
+
+  GraphNode(OpType t) : type(t) {}
+};
+```
+
+Each node stores:
+- **Type**: What operation this represents
+- **Inputs**: Pointers to input nodes (empty for `Input` nodes, non-empty for operations)
+- **Data**: For leaf nodes (`Input`), the actual NumPy array
+- **Shape**: The output shape of this operation (inferred from inputs)
+
+**Graph Construction API**. The `Tensor` class provides methods building nodes:
+
+```cpp
+class Tensor {
+public:
+  std::shared_ptr<GraphNode> node;
+
+  Tensor(py::array_t<float> data) {
+    node = std::make_shared<GraphNode>(OpType::Input);
+    node->data = data;
+    auto buf = data.request();
+    node->shape.resize(buf.ndim);
+    for (int i = 0; i < buf.ndim; i++) {
+      node->shape[i] = static_cast<int64_t>(buf.shape[i]);
+    }
+  }
+
+  Tensor(std::shared_ptr<GraphNode> n) : node(n) {}
+
+  // Operator overloading for arithmetic
+  Tensor add(const Tensor& other) const {
+    auto result_node = std::make_shared<GraphNode>(OpType::Add);
+    result_node->inputs = {node, other.node};
+    result_node->shape = node->shape;  // Assumes compatible shapes
+    return Tensor(result_node);
+  }
+
+  const std::vector<int64_t>& shape() const { return node->shape; }
+};
+```
+
+Each method creates a new node pointing to input nodes, returns a new `Tensor` wrapping that node. No computation happens—we're just building the graph.
+
+**Python Bindings**. pybind11 exposes these methods to Python:
+
+```cpp
+py::class_<Tensor>(m, "Tensor")
+  .def(py::init<py::array_t<float>>())
+  .def("__add__", &Tensor::add)
+  .def("__mul__", &Tensor::mul)
+  .def("shape", &Tensor::shape);
+```
+
+Python's `a + b` calls `Tensor.__add__()`, which calls the C++ `add()` method. This provides natural syntax hiding graph construction complexity.
+
+**Higher-Level Operations**. Operations like matmul, transpose, softmax are module-level functions:
+
+```cpp
+Tensor matmul(const Tensor& lhs, const Tensor& rhs) {
+  auto result_node = std::make_shared<GraphNode>(OpType::Matmul);
+  result_node->inputs = {lhs.node, rhs.node};
+  
+  // Shape inference: (M, K) @ (K, N) -> (M, N)
+  result_node->shape = {lhs.shape()[0], rhs.shape()[1]};
+  return Tensor(result_node);
+}
+```
+
+These functions follow the same pattern: create node, set inputs, infer output shape, return tensor. Shape inference is crucial—we need shapes to generate correct MLIR IR (allocating buffers, setting loop bounds).
+
+**Composing Operations**. With primitives defined, complex computations become straightforward compositions:
+
+```cpp
+// Example: Fused operations (A + B) * C
+Tensor fused_computation(const Tensor& A, const Tensor& B, const Tensor& C) {
+  auto sum = add(A, B);        // First operation: add
+  auto result = mul(sum, C);   // Second operation: multiply
+  return result;
+}
+
+// Example: MatMul followed by ReLU (common in neural networks)
+Tensor linear_relu(const Tensor& input, const Tensor& weights) {
+  auto matmul_result = matmul(input, weights);
+  auto activated = relu(matmul_result);
+  return activated;
+}
+```
+
+This is **compositional**: each operation returns a tensor, which feeds into the next operation. For the fused computation example, the graph has these nodes:
+1. Input nodes (A, B, C)
+2. Add operation (A + B)
+3. Mul operation (sum * C)
+
+The graph structure encodes dependencies: the mul operation depends on the add operation completing first.
+
+**Why Graphs?** You might wonder: why not compile each operation individually? Several reasons:
+
+1. **Optimization Opportunities**: With the full graph, we can fuse operations (this chapter's fusion techniques), reorder for better cache locality, eliminate redundant computation.
+
+2. **Memory Planning**: Knowing all operations upfront lets us plan buffer allocation—reuse buffers for intermediate results when possible.
+
+3. **Batching**: If multiple inputs flow through the same graph, compile once, execute repeatedly (amortizing compilation cost).
+
+4. **Debugging**: Graph visualization shows computation structure, helping identify errors (wrong operation ordering, shape mismatches).
+
+Our implementation is simple: compile on every `forward()` call. Production systems (PyTorch JIT, TensorFlow) cache compiled graphs, only recompiling when graph structure changes. But the principle is identical.
+
+With the computation graph built, we now face the fundamental problem of executing it: determining the correct order.
+
+## 10.8 Topological Traversal: Ordering Computation Graphs
 
 Before we can execute or compile a computation graph, we must solve a fundamental problem: **determining execution order**. Operations have dependencies—an addition operation that consumes the output of a matrix multiplication cannot execute until the multiplication completes. This dependency structure forms a **directed acyclic graph (DAG)**, and executing it correctly requires **topological sorting**—ordering operations so dependencies execute before dependents. This section explains why topological traversal is essential for compilers, how the algorithm works, and how to implement it efficiently.
 
@@ -1051,9 +1201,9 @@ DFS-based sorting is slightly harder to understand but has the same O(V + E) com
 
 Topological sorting is a fundamental algorithm every compiler engineer must understand. It bridges the gap between user-written computation graphs (arbitrary order) and executable IR (dependencies-respecting order), enabling everything else—optimization, parallelization, execution—to work correctly.
 
-## 10.8 Summary
+## 10.9 Summary
 
-This chapter explored MLIR's optimization infrastructure through three core techniques—Linalg fusion (reduces memory traffic), loop-invariant code motion (reduces redundant computation), and vectorization (exploits SIMD hardware). We also examined topological sorting, the fundamental algorithm enabling correct computation graph execution.
+This chapter explored MLIR's optimization infrastructure through three core techniques—Linalg fusion (reduces memory traffic), loop-invariant code motion (reduces redundant computation), and vectorization (exploits SIMD hardware). We also examined the tensor abstraction design (introduced in Chapter 9) for building computation graphs, and topological sorting, the fundamental algorithm enabling correct graph execution.
 
 Key insights:
 

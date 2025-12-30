@@ -958,8 +958,8 @@ rewriter.replaceOp(oldOp, newValues);
 auto newOp = rewriter.create<NewOp>(loc, operands);
 rewriter.replaceOp(oldOp, newOp.getResults());
 
-// Erase operation (must have no uses)
-rewriter.eraseOp(op);
+// Erase operation (legacy API - prefer replaceOp)
+// rewriter.eraseOp(op);  // Deprecated
 
 // Modify operation in-place
 rewriter.updateRootInPlace(op, [&] {

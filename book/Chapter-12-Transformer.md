@@ -217,7 +217,7 @@ def Transformer_LayerNormOp : Transformer_Op<"layer_norm"> {
 
 The operation takes input tensor, gamma/beta parameters, and returns normalized output with the same shape as input. This follows Chapter 11's tensor-first architecture pattern.
 
-**Lowering to Linalg**. Layer normalization lowers to a sequence of tensor-based Linalg operations combining reductions and element-wise computations. Following Chapter 11's tensor-first pattern, we use `tensor::EmptyOp` for outputs, linalg ops that return tensors, and `replaceOp` instead of `eraseOp`:
+**Lowering to Linalg**. Layer normalization lowers to a sequence of tensor-based Linalg operations combining reductions and element-wise computations:
 
 ```cpp
 // src/TransformerPasses.cpp

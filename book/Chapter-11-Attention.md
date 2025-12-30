@@ -118,7 +118,7 @@ Chapter 9 taught TableGen-based dialect definition. Now we apply that knowledge 
 
 2. **Shape Polymorphism**: Operations should handle 2D and 3D tensors (batched attention) uniformly. The same `matmul` works for single-instance and batched cases.
 
-3. **Type System**: Use memrefs for in-place computation (avoid allocations in generated code). Shapes can be dynamic (runtime-determined sequence lengths).
+3. **Type System**: Use tensors for functional-style operations with automatic bufferization handling memory management. Shapes can be dynamic (runtime-determined sequence lengths).
 
 4. **Composability**: Operations compose to build higher-level primitives. Attention is `matmul` + `transpose` + element-wise scaling (via `mul`) + `softmax` + `matmul` again.
 
@@ -173,8 +173,8 @@ def Transformer_MatmulOp : Transformer_Op<"matmul"> {
 }
 ```
 
-**Design Choices** (Tensor-First Architecture):
-- **Tensor operations**: Operations consume tensor arguments and return tensor results, following pure functional semantics (consistent with Chapters 5-10).
+**Design Choices**:
+- **Tensor operations**: Operations consume tensor arguments and return tensor results, following pure functional semantics.
 - **AnyTensor**: Accepts tensors of any rank/type (typically `tensor<?x?xf32>` for dynamic 2D matrices).
 - **Results instead of output parameters**: Modern MLIR uses result values rather than output parameters.
 - **Bufferization handles memory**: Tensor operations remain pure; the bufferization pipeline converts to memref-based execution later.
@@ -256,16 +256,14 @@ def Transformer_MulOp : Transformer_Op<"mul"> {
 }
 ```
 
-Addition handles residual connections (Chapter 12). Multiplication enables element-wise operations, including scaling. The Python API's `scale()` function uses `mul` to implement scaling by √d_k. Both operations are rank-generic: work on any-shaped tensors with compatible shapes. Like all transformer operations, they return tensor results that later bufferize to memrefs.
+Addition handles residual connections (Chapter 12). Multiplication enables element-wise operations, including scaling. The Python API's `scale()` function uses `mul` to implement scaling by √d_k. Both operations are rank-generic: work on any-shaped tensors with compatible shapes.
 
 
-## 11.3 Lowering Patterns: Tensor-First Linalg Lowering
+## 11.3 Lowering Patterns
 
-Operations defined, we now implement lowering—converting high-level `transformer.*` operations to MLIR's **Linalg dialect** using **tensor-based** operations. This tensor-first approach (consistent with Chapters 5-10) provides cleaner semantics: operations are pure functions returning new tensors rather than mutating output parameters. The bufferization pipeline (Section 11.5) later converts these tensor operations to efficient memref-based code.
+Operations defined, we now implement lowering—converting high-level `transformer.*` operations to MLIR's **Linalg dialect** using tensor operations. The transformer dialect provides domain-specific names (`transformer.matmul` is clearer than `linalg.matmul` in attention code) that immediately lower to linalg for optimization. The bufferization pipeline (Section 11.5) later converts these pure tensor operations to efficient memref-based execution code.
 
-**Design Philosophy**: The transformer dialect is a **thin wrapper** around linalg's tensor operations. Operations provide domain-specific names (`transformer.matmul` is clearer than `linalg.matmul` in attention code), but immediately lower to tensor-based linalg for optimization. This combines usability with performance while maintaining consistency with the architecture established in Chapters 5-10.
-
-### 11.3.1 Matrix Multiplication Lowering (Tensor-Based)
+### 11.3.1 Matrix Multiplication Lowering
 
 Matrix multiplication C = A @ B lowers to tensor-based linalg operations:
 
@@ -325,15 +323,7 @@ struct MatmulOpLowering : public OpRewritePattern<MatmulOp> {
 };
 ```
 
-Key differences from memref-based lowering:
-- No `memref.alloc`—uses `tensor.empty` instead
-- Operations return results instead of mutating outputs
-- `replaceOp` replaces the original operation with the result value
-- Bufferization pipeline converts this to memref operations later
-
-Compare to manual loop lowering: ~115 lines of nested `scf.for` loops with index management—now ~25 lines of tensor operations that later optimize and bufferize automatically.
-
-**Execution**: The bufferization pipeline (Section 11.5) converts these tensor operations to memref-based code, then `createConvertLinalgToLoopsPass()` generates loops—but optimization passes run **before** loop generation, enabling transformations impossible with raw loops.
+The pattern creates tensor operations (`tensor.empty`, `linalg.fill`, `linalg.matmul`) that return result values. The bufferization pipeline (Section 11.5) later converts these to efficient memref-based execution. This ~25-line implementation replaces what would require ~115 lines of nested loops with manual index management, while enabling optimizations that run before loop generation.
 
 ### 11.3.2 Transpose Lowering
 
@@ -371,15 +361,13 @@ struct TransposeOpLowering : public OpRewritePattern<TransposeOp> {
     rewriter.create<linalg::TransposeOp>(
         loc, input, output, perm);
 
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, output);
     return success();
   }
 };
 ```
 
 This pattern constructs a permutation vector `[0, 1, ..., rank-3, rank-1, rank-2]` (identity except swapping the last two dimensions). Works for 2D (rank 2) and 3D (rank 3, batched attention) tensors uniformly.
-
-Compare to manual lowering: ~50 lines of nested loops with careful index swapping—now 20 lines generating a declarative operation.
 
 ### 11.3.3 Softmax Lowering: Reductions and Broadcasting
 
@@ -429,24 +417,12 @@ The affine map `(d0, d1) -> (d0)` **broadcasts** `max_vals`: for each `(i, j)`, 
 
 **Steps 3-5**: Follow the same pattern—reduce for sum, generic for exp and division with broadcasting.
 
-**The Lowering Pattern** (abbreviated):
+**The Lowering Pattern** (abbreviated, focusing on the key operations):
 
 ```cpp
 struct SoftmaxOpLowering : public OpRewritePattern<SoftmaxOp> {
-  LogicalResult matchAndRewrite(SoftmaxOp op,
-                                  PatternRewriter &rewriter) const override {
-    auto loc = op.getLoc();
-    Value input = op.getInput();
-    Value output = op.getOutput();
-    
-    auto inputType = cast<MemRefType>(input.getType());
-    auto shape = inputType.getShape();
-    int64_t rank = inputType.getRank();
-    
-    // Allocate temporaries for max and sum
-    auto reducedShape = SmallVector<int64_t>(shape.begin(), shape.end() - 1);
-    auto maxType = MemRefType::get(reducedShape, rewriter.getF32Type());
-    Value maxVals = rewriter.create<memref::AllocOp>(loc, maxType);
+  LogicalResult matchAndRewrite(SoftmaxOp op, PatternRewriter &rewriter) const override {
+    // ... extract location, input, types, allocate temporaries ...
     
     // Step 1: Reduce max along last dimension
     rewriter.create<linalg::ReduceOp>(
@@ -458,21 +434,40 @@ struct SoftmaxOpLowering : public OpRewritePattern<SoftmaxOp> {
         });
     
     // Step 2: Subtract max (broadcasting) and compute exp
-    // ... (linalg.generic with affine maps for broadcasting)
+    Value expVals = rewriter.create<linalg::GenericOp>(
+        loc, outputType, ValueRange{input, maxVals}, ValueRange{expTensor},
+        broadcastMaps, iteratorTypes,
+        [&](OpBuilder &b, Location loc, ValueRange args) {
+          Value diff = b.create<arith::SubFOp>(loc, args[0], args[1]);
+          Value exp = b.create<math::ExpOp>(loc, diff);
+          b.create<linalg::YieldOp>(loc, exp);
+        }).getResult(0);
     
-    // Step 3: Reduce sum
-    // ... (linalg.reduce with addf)
+    // Step 3: Reduce sum along last dimension
+    rewriter.create<linalg::ReduceOp>(
+        loc, ValueRange{expVals}, ValueRange{sumVals},
+        ArrayRef<int64_t>{rank - 1},
+        [&](OpBuilder &b, Location loc, ValueRange args) {
+          Value sum = b.create<arith::AddFOp>(loc, args[0], args[1]);
+          b.create<linalg::YieldOp>(loc, sum);
+        });
     
     // Step 4: Divide by sum (broadcasting)
-    // ... (linalg.generic with broadcasting)
+    Value normalized = rewriter.create<linalg::GenericOp>(
+        loc, outputType, ValueRange{expVals, sumVals}, ValueRange{outTensor},
+        broadcastMaps, iteratorTypes,
+        [&](OpBuilder &b, Location loc, ValueRange args) {
+          Value result = b.create<arith::DivFOp>(loc, args[0], args[1]);
+          b.create<linalg::YieldOp>(loc, result);
+        }).getResult(0);
     
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, normalized);
     return success();
   }
 };
 ```
 
-Compare to manual lowering: ~105 lines of three-pass nested loops with temporary buffers—now 75 lines of declarative linalg operations. More importantly, linalg's structured form enables **fusion**: later passes can merge operations, eliminating intermediate buffers.
+Linalg's structured form enables **fusion**: later passes can merge operations, eliminating intermediate buffers and improving performance.
 
 ### 11.3.4 Element-Wise Operations
 
@@ -529,35 +524,35 @@ struct AddOpLowering : public OpRewritePattern<AddOp> {
           b.create<linalg::YieldOp>(loc, sum);
         });
     
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
 ```
 
-Multiplication follows identically, replacing `arith.AddFOp` with `arith.MulFOp`.
+Multiplication follows identically, replacing `arith.AddFOp` with `arith.MulFOp`. Linalg's rank-polymorphic operations handle arbitrary tensor ranks naturally.
 
-Compare to manual lowering: ~50 lines of recursive loop generation for arbitrary ranks—now 25 lines of generic operation. Rank-polymorphism comes naturally with linalg.
+### 11.3.5 From Tensors to Executable Code: The Pass Pipeline
 
-### 11.3.5 From Linalg to Loops: The Pass Pipeline
-
-Linalg operations don't execute directly—they lower to loops. The pass pipeline:
+Our transformer operations lower to tensor-based linalg operations, which then go through bufferization and loop generation. The complete pass pipeline:
 
 ```cpp
-pm.addPass(createLowerTransformerToStandardPass());  // transformer -> linalg
+pm.addPass(createLowerTransformerToStandardPass());  // transformer -> linalg (tensors)
+// Optimization passes work on linalg tensor operations here
+pm.addPass(createBufferizePass());                   // tensors -> memrefs
 pm.addPass(createConvertLinalgToLoopsPass());        // linalg -> scf.for
 pm.addPass(createSCFToControlFlowPass());            // scf -> control flow
 // ... remaining passes to LLVM IR
 ```
 
-**Key Insight**: Optimization passes run **between** transformer→linalg and linalg→loops. Linalg's structured form enables:
+**The Tensor-First Advantage**: Our lowering produces tensor-based linalg operations (`linalg.matmul` on tensors, `linalg.generic` with tensor inputs/outputs). This enables optimization passes that work on the tensor level:
 
 - **Tiling**: Break operations into cache-friendly blocks
-- **Fusion**: Merge producer-consumer operations, eliminating loads/stores
+- **Fusion**: Merge producer-consumer operations, eliminating intermediate tensors
 - **Vectorization**: Generate SIMD instructions (AVX, NEON)
 - **Parallelization**: Distribute across threads
 
-Manual loop lowering bypasses these. By lowering to linalg, we get these optimizations **for free** as MLIR evolves.
+After optimizations, bufferization converts tensors to memrefs, and loop lowering generates actual control flow. This staged approach—high-level tensor operations → optimizations → bufferization → loops—gives us the best of both worlds: composable functional-style IR and efficient imperative execution.
 
 **Registering the Linalg Dialect**. From [src/bindings.cpp](ch.11.Attention/src/bindings.cpp):
 
@@ -585,198 +580,9 @@ std::unique_ptr<Pass> createLowerTransformerToStandardPass() {
 
 The pass applies all patterns in a single traversal. MLIR's pattern rewriting framework handles orchestration: which patterns to try, in what order, how to handle failures. We provide the logic; MLIR provides the infrastructure.
 
-## 11.4 Python API: Building Computation Graphs
+## 11.4 JIT Compilation: From Graphs to Native Code
 
-Lowering patterns convert operations to loops, but where do those operations come from? Users don't write MLIR IR directly—they use Python APIs building computation graphs symbolically. This section examines Chapter 11's Python API design, showing how operator overloading and deferred execution create PyTorch-like ergonomics while generating MLIR underneath.
-
-**The Tensor Abstraction**. Python users work with a `Tensor` class wrapping NumPy arrays:
-
-```python
-import ch11
-import numpy as np
-
-Q = ch11.Tensor(np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32))
-K = ch11.Tensor(np.array([[5.0, 6.0], [7.0, 8.0]], dtype=np.float32))
-
-# Build computation graph (no execution yet)
-result_tensor = ch11.attention(Q, K, K)
-
-# Compile and execute
-output = ch11.forward(result_tensor)  # Returns NumPy array
-```
-
-The `Tensor` class doesn't compute immediately. Instead, it records operations in a **computation graph**—a directed acyclic graph (DAG) where nodes represent operations and edges represent data dependencies. This deferred execution pattern matches PyTorch's JIT and TensorFlow's graph mode: build a symbolic representation, compile once, execute many times.
-
-**Computation Graph Representation**. From [src/bindings.cpp](ch.11.Attention/src/bindings.cpp):
-
-```cpp
-enum class OpType {
-  Input,      // Leaf node: data provided by user
-  Matmul,     // Binary operation: lhs @ rhs
-  Add,        // Binary operation: lhs + rhs
-  Transpose,  // Unary operation: transpose(input)
-  Softmax,    // Unary operation: softmax(input)
-  Scale       // Unary operation: input * scale_factor
-};
-
-struct GraphNode {
-  OpType type;
-  std::vector<std::shared_ptr<GraphNode>> inputs;  // Dependencies
-  py::array_t<float> data;                          // For Input nodes
-  float scale_factor = 1.0f;                        // For Scale nodes
-  std::vector<int64_t> shape;                       // Output shape
-
-  GraphNode(OpType t) : type(t) {}
-};
-```
-
-Each node stores:
-- **Type**: What operation this represents
-- **Inputs**: Pointers to input nodes (empty for `Input` nodes, non-empty for operations)
-- **Data**: For leaf nodes (`Input`), the actual NumPy array
-- **Shape**: The output shape of this operation (inferred from inputs)
-
-**Graph Construction API**. The `Tensor` class provides methods building nodes:
-
-```cpp
-class Tensor {
-public:
-  std::shared_ptr<GraphNode> node;
-
-  Tensor(py::array_t<float> data) {
-    node = std::make_shared<GraphNode>(OpType::Input);
-    node->data = data;
-    auto buf = data.request();
-    node->shape.resize(buf.ndim);
-    for (int i = 0; i < buf.ndim; i++) {
-      node->shape[i] = static_cast<int64_t>(buf.shape[i]);
-    }
-  }
-
-  Tensor(std::shared_ptr<GraphNode> n) : node(n) {}
-
-  // Operator overloading for arithmetic
-  Tensor add(const Tensor& other) const {
-    auto result_node = std::make_shared<GraphNode>(OpType::Add);
-    result_node->inputs = {node, other.node};
-    result_node->shape = node->shape;  // Assumes compatible shapes
-    return Tensor(result_node);
-  }
-
-  Tensor mul(const Tensor& other) const {
-    auto result_node = std::make_shared<GraphNode>(OpType::Mul);
-    result_node->inputs = {node, other.node};
-    result_node->shape = node->shape;
-    return Tensor(result_node);
-  }
-
-  const std::vector<int64_t>& shape() const { return node->shape; }
-};
-```
-
-Each method creates a new node pointing to input nodes, returns a new `Tensor` wrapping that node. No computation happens—we're just building the graph.
-
-**Python Bindings**. pybind11 exposes these methods to Python:
-
-```cpp
-py::class_<Tensor>(m, "Tensor")
-  .def(py::init<py::array_t<float>>())
-  .def("__add__", &Tensor::add)
-  .def("__mul__", &Tensor::mul)
-  .def("shape", &Tensor::shape);
-```
-
-Python's `a + b` calls `Tensor.__add__()`, which calls the C++ `add()` method. This provides natural syntax hiding graph construction complexity.
-
-**Higher-Level Operations**. Operations like matmul, transpose, softmax are module-level functions:
-
-```cpp
-Tensor matmul(const Tensor& lhs, const Tensor& rhs) {
-  auto result_node = std::make_shared<GraphNode>(OpType::Matmul);
-  result_node->inputs = {lhs.node, rhs.node};
-  
-  // Shape inference: (M, K) @ (K, N) -> (M, N)
-  result_node->shape = {lhs.shape()[0], rhs.shape()[1]};
-  return Tensor(result_node);
-}
-
-Tensor transpose(const Tensor& input) {
-  auto result_node = std::make_shared<GraphNode>(OpType::Transpose);
-  result_node->inputs = {input.node};
-  
-  // Shape inference: (M, N) -> (N, M)
-  auto& in_shape = input.shape();
-  result_node->shape = {in_shape[1], in_shape[0]};
-  return Tensor(result_node);
-}
-
-Tensor softmax(const Tensor& input) {
-  auto result_node = std::make_shared<GraphNode>(OpType::Softmax);
-  result_node->inputs = {input.node};
-  result_node->shape = input.shape();  // Softmax preserves shape
-  return Tensor(result_node);
-}
-
-Tensor scale(const Tensor& input, float factor) {
-  auto result_node = std::make_shared<GraphNode>(OpType::Scale);
-  result_node->inputs = {input.node};
-  result_node->scale_factor = factor;
-  result_node->shape = input.shape();
-  return Tensor(result_node);
-}
-```
-
-These functions follow the same pattern: create node, set inputs, infer output shape, return tensor. Shape inference is crucial—we need shapes to generate correct MLIR IR (allocating buffers, setting loop bounds).
-
-**Implementation Note**: While `matmul`, `transpose`, and `softmax` directly map to transformer dialect operations, `scale()` is implemented differently: during MLIR IR generation, it creates a constant-filled memref with the scale factor and emits a `transformer.mul` operation for element-wise multiplication. This design reuses the existing `mul` operation rather than introducing a dedicated `scale` operation.
-
-**Composing Attention**. With primitives defined, attention becomes straightforward:
-
-```cpp
-Tensor attention(const Tensor& Q, const Tensor& K, const Tensor& V) {
-  // scores = Q @ K^T
-  auto K_T = transpose(K);
-  auto scores = matmul(Q, K_T);
-  
-  // scaled_scores = scores / sqrt(d_k)
-  int64_t d_k = Q.shape()[1];  // Key dimension
-  float scale_factor = 1.0f / std::sqrt(static_cast<float>(d_k));
-  auto scaled_scores = scale(scores, scale_factor);
-  
-  // attn_weights = softmax(scaled_scores)
-  auto attn_weights = softmax(scaled_scores);
-  
-  // output = attn_weights @ V
-  auto output = matmul(attn_weights, V);
-  
-  return output;
-}
-```
-
-This is **compositional**: each operation returns a tensor, which feeds into the next operation. The final graph has these computation nodes:
-1. Transpose (K)
-2. Matmul (Q, K^T)
-3. Scale (scores) - compiles to constant fill + mul
-4. Softmax (scaled scores)
-5. Matmul (weights, V)
-
-Plus three input nodes (Q, K, V). The graph structure encodes dependencies: the first matmul depends on transpose, softmax depends on scale, and the final matmul depends on softmax.
-
-**Why Graphs?** You might wonder: why not compile each operation individually? Several reasons:
-
-1. **Optimization Opportunities**: With the full graph, we can fuse operations (Chapter 10's techniques), reorder for better cache locality, eliminate redundant computation.
-
-2. **Memory Planning**: Knowing all operations upfront lets us plan buffer allocation—reuse buffers for intermediate results when possible.
-
-3. **Batching**: If multiple inputs flow through the same graph, compile once, execute repeatedly (amortizing compilation cost).
-
-4. **Debugging**: Graph visualization shows computation structure, helping identify errors (wrong operation ordering, shape mismatches).
-
-Chapter 11's implementation is simple: compile on every `forward()` call. Production systems (PyTorch JIT, TensorFlow) cache compiled graphs, only recompiling when graph structure changes. But the principle is identical.
-
-## 11.5 JIT Compilation: From Graphs to Native Code
-
-Computation graph built, we now compile it to executable code. This section traces the compilation pipeline: graph → MLIR IR → LLVM IR → native machine code → execution via libffi. Each stage transforms the representation, eventually producing code running on the CPU.
+Computation graph built (using the tensor abstraction design from Chapter 10), we now compile it to executable code. This section traces the compilation pipeline: graph → MLIR IR → LLVM IR → native machine code → execution via libffi. Each stage transforms the representation, eventually producing code running on the CPU.
 
 **The forward() Entry Point**. Python users call:
 
@@ -812,7 +618,7 @@ py::array_t<float> forward(const Tensor& input) {
 
 Four stages: graph → MLIR, MLIR → LLVM, LLVM → native, native → execution. Let's examine each.
 
-**Stage 1: Graph to MLIR (Tensor-Based)**. The `buildGraphFunction()` traverses the graph, emitting tensor-based MLIR operations:
+**Stage 1: Graph to MLIR**. The `buildGraphFunction()` traverses the graph, emitting tensor-based MLIR operations:
 
 ```cpp
 void buildGraphFunction(OpBuilder& builder, ModuleOp module,
@@ -856,15 +662,7 @@ void buildGraphFunction(OpBuilder& builder, ModuleOp module,
 }
 ```
 
-**Key Changes from Memref-Based Approach**:
-
-1. **Tensor Types**: Function arguments are `tensor<?x?xf32>` (dynamic tensors), not `memref<?x?xf32>`.
-
-2. **Function Returns**: Functions return tensor values rather than writing to an output parameter.
-
-3. **Pure Functions**: All operations are pure—they compute and return results without mutation.
-
-**Emitting Operations (Tensor-Based)**. The `emitNode()` function returns tensor values:
+**Emitting Operations**. The `emitNode()` function returns tensor values:
 
 ```cpp
 Value emitNode(OpBuilder& builder, std::shared_ptr<GraphNode> node,
@@ -898,28 +696,6 @@ Value emitNode(OpBuilder& builder, std::shared_ptr<GraphNode> node,
       nodeToValue[node.get()] = result;
       return result;
     }
-    
-    case OpType::Transpose: {
-      Value input = emitNode(builder, node->inputs[0], nodeToValue);
-      auto inputType = mlir::cast<RankedTensorType>(input.getType());
-      // Swap last two dimensions for result type
-      SmallVector<int64_t> resultShape(inputType.getShape().begin(), inputType.getShape().end());
-      std::swap(resultShape[resultShape.size()-2], resultShape[resultShape.size()-1]);
-      auto resultType = RankedTensorType::get(resultShape, builder.getF32Type());
-      
-      Value result = builder.create<TransposeOp>(loc, resultType, input).getResult();
-      nodeToValue[node.get()] = result;
-      return result;
-    }
-    
-    case OpType::Softmax: {
-      Value input = emitNode(builder, node->inputs[0], nodeToValue);
-      auto resultType = input.getType();  // Softmax preserves shape
-      Value result = builder.create<SoftmaxOp>(loc, resultType, input).getResult();
-      nodeToValue[node.get()] = result;
-      return result;
-    }
-    
     // ... other cases ...
   }
 }
@@ -927,7 +703,7 @@ Value emitNode(OpBuilder& builder, std::shared_ptr<GraphNode> node,
 
 The pattern: emit dependencies recursively, compute result type, emit operation returning tensor result, cache result. No allocations—tensor operations are pure functions. The lowering patterns (Section 11.3) create `tensor.empty` operations, and bufferization (next) converts those to allocations.
 
-**Generated MLIR (Tensor-Based)**. For the attention graph, the emitted IR looks like:
+**Generated MLIR**. For the attention graph, the emitted IR looks like:
 
 ```mlir
 func.func @graph_func(%Q: tensor<?x?xf32>, %K: tensor<?x?xf32>,
@@ -962,21 +738,30 @@ bool TransformerCompiler::lowerToLLVM(ModuleOp module) {
 
   // Step 1: Lower transformer dialect to tensor-based linalg
   pm.addNestedPass<func::FuncOp>(createLowerTransformerToStandardPass());
+  pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
+  pm.addNestedPass<func::FuncOp>(createCSEPass());
   
-  // Step 2: Three-pass bufferization (tensor → memref)
+  // Step 2: Register bufferization interfaces for all relevant dialects
+  DialectRegistry registry;
+  arith::registerBufferizableOpInterfaceExternalModels(registry);
+  linalg::registerBufferizableOpInterfaceExternalModels(registry);
+  tensor::registerBufferizableOpInterfaceExternalModels(registry);
+  bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(registry);
+  context_.appendDialectRegistry(registry);
+  
+  // Step 3: Three-pass bufferization (tensor → memref)
   bufferization::OneShotBufferizePassOptions bufferizationOptions;
   bufferizationOptions.bufferizeFunctionBoundaries = true;
   pm.addPass(bufferization::createOneShotBufferizePass(bufferizationOptions));
   pm.addPass(bufferization::createBufferResultsToOutParamsPass());
   pm.addPass(createConvertBufferizationToMemRefPass());
+  pm.addPass(createCanonicalizerPass());
   
-  // Step 3: Lower linalg to loops (now operating on memrefs)
+  // Step 4: Lower linalg to loops (now operating on memrefs)
   pm.addPass(createConvertLinalgToLoopsPass());
-  
   pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
-  pm.addNestedPass<func::FuncOp>(createCSEPass());
 
-  // Step 4: Lower standard dialects to LLVM
+  // Step 5: Lower standard dialects to LLVM
   pm.addPass(createConvertMathToLLVMPass());
   pm.addPass(createConvertMathToLibmPass());
   pm.addPass(createSCFToControlFlowPass());
@@ -990,14 +775,18 @@ bool TransformerCompiler::lowerToLLVM(ModuleOp module) {
 }
 ```
 
-**The Bufferization Pipeline** (Critical for Tensor-First Architecture):
+**The Bufferization Interface Registration**: Before bufferization can work, we must register "bufferizable op interface" implementations for each dialect that uses tensors. This tells the bufferization pass how to convert operations from each dialect:
 
-1. **OneShotBufferize**: Converts tensor operations to memref operations. With `bufferizeFunctionBoundaries = true`, it handles function boundaries correctly—tensors in function signatures also convert to memrefs. This pass requires `func_ext` registration:
+- `arith::registerBufferizableOpInterfaceExternalModels`: Handle arithmetic ops on tensors
+- `linalg::registerBufferizableOpInterfaceExternalModels`: Handle linalg ops (matmul, generic, etc.)
+- `tensor::registerBufferizableOpInterfaceExternalModels`: Handle tensor creation/manipulation (empty, extract_slice, etc.)
+- `bufferization::func_ext::registerBufferizableOpInterfaceExternalModels`: Handle function signatures and calls
 
-```cpp
-// In compiler initialization
-bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(registry_);
-```
+Without these registrations, the bufferization pass would not know how to convert tensor operations to memref operations.
+
+**The Bufferization Pipeline**:
+
+1. **OneShotBufferize**: Converts tensor operations to memref operations. With `bufferizeFunctionBoundaries = true`, it handles function boundaries correctly—tensors in function signatures also convert to memrefs.
 
 After this pass:
 - `%result = linalg.matmul ins(%a, %b : tensor<?x?xf32>, tensor<?x?xf32>) -> tensor<?x?xf32>` becomes
@@ -1023,125 +812,34 @@ Trying to do all three in one pass would be extremely complex. The modular appro
 
 First, transformer ops → tensor-based linalg (Section 11.3's patterns). Then, bufferization converts tensors → memrefs. Then, linalg → scf.for loops (via `createConvertLinalgToLoopsPass()`). Finally, loops → LLVM IR (standard MLIR passes). Canonicalization and CSE (common subexpression elimination) clean up between major transformations. After this pipeline, the module contains only LLVM dialect operations—pointers, branches, arithmetic instructions.
 
-**Stage 3: LLVM IR to Native Code**. MLIR's ExecutionEngine compiles LLVM dialect to machine code:
+**Stage 3: LLVM IR to Native Code**. MLIR's ExecutionEngine compiles LLVM dialect to machine code. The process: register LLVM dialect translations, invoke `ExecutionEngine::create()` which runs LLVM's JIT compiler (OrcJIT) at optimization level 3, generate machine code for the target architecture, and look up the compiled function's entry point address—a raw pointer to executable code in memory.
+
+**Stage 4: Execution via libffi**. With a function pointer to the compiled code, we need to call it. MLIR's memref calling convention (Chapter 7) passes memrefs as expanded arguments: pointer, offset, sizes, strides. For 2D memrefs, that's 7 arguments per memref. The attention function with three 2D inputs (Q, K, V) and one 2D output requires 28 arguments total. Manually marshaling this is tedious and error-prone.
+
+**libffi** (Foreign Function Interface library) solves this by dynamically constructing function calls. The key steps:
 
 ```cpp
-void* TransformerCompiler::compileAndGetFunctionPtr(ModuleOp module,
-                                                      const std::string& funcName) {
-  registerBuiltinDialectTranslation(*module.getContext());
-  registerLLVMDialectTranslation(*module.getContext());
-
-  if (!lowerToLLVM(module)) {
-    llvm::errs() << "Failed to lower to LLVM dialect\n";
-    return nullptr;
-  }
-
-  ExecutionEngineOptions options;
-  auto transformer = makeOptimizingTransformer(3, 0, nullptr);
-  options.transformer = std::move(transformer);
-
-  auto maybeEngine = ExecutionEngine::create(module, options);
-  if (!maybeEngine) {
-    llvm::errs() << "Failed to create ExecutionEngine\n";
-    return nullptr;
-  }
-
-  auto engine = std::move(*maybeEngine);
-  auto expectedFPtr = engine->lookup(funcName);
-  if (!expectedFPtr) {
-    llvm::errs() << "Failed to lookup function: " << funcName << "\n";
-    return nullptr;
-  }
-
-  // Keep engine alive
-  engines_.emplace_back(engine.release());
-  return reinterpret_cast<void*>(*expectedFPtr);
+// Marshal each input memref
+std::vector<void*> arg_values;
+for (auto& arr : inputs) {
+  marshal_memref_2d(arg_types, arg_values, arr);
 }
-```
 
-The `ExecutionEngine::create()` call invokes LLVM's JIT compiler (OrcJIT). It parses LLVM IR, optimizes (the `makeOptimizingTransformer(3, ...)` sets optimization level 3—aggressive), generates machine code for the target architecture, loads it into memory. The `lookup()` finds the function's entry point address—a raw pointer to executable code.
+// Marshal output memref
+marshal_memref_2d(arg_types, arg_values, output);
 
-**Stage 4: Execution via libffi**. With a function pointer, how do we call it? The signature is:
-
-```c
-void graph_func(float* Q_data, intptr_t Q_offset, intptr_t Q_size0, intptr_t Q_size1, intptr_t Q_stride0, intptr_t Q_stride1,
-                float* K_data, intptr_t K_offset, ...,
-                float* V_data, intptr_t V_offset, ...,
-                float* out_data, intptr_t out_offset, ...);
-```
-
-MLIR's memref calling convention (Chapter 7) passes memrefs as expanded arguments: pointer, offset, sizes, strides. For 2D memrefs, that's 7 arguments per memref. Manually calling this is tedious and error-prone. Enter **libffi**:
-
-```cpp
-py::array_t<float> executeFunctionViaLibffi(void* funcPtr,
-                                             std::shared_ptr<GraphNode> outputNode) {
-  // Collect input data arrays
-  std::vector<py::array_t<float>> inputs;
-  collectInputData(outputNode, inputs);
-  
-  // Allocate output array
-  py::array_t<float> output(outputNode->shape);
-  
-  // Prepare libffi call
-  std::vector<ffi_type*> arg_types;
-  std::vector<void*> arg_values;
-  
-  // Marshal each input memref
-  for (auto& arr : inputs) {
-    marshal_memref_2d(arg_types, arg_values, arr);
-  }
-  
-  // Marshal output memref
-  marshal_memref_2d(arg_types, arg_values, output);
-  
-  // Build libffi CIF (Call Interface)
-  ffi_cif cif;
-  if (ffi_prep_cif(&cif, FFI_DEFAULT_ABI, arg_types.size(),
-                    &ffi_type_void, arg_types.data()) != FFI_OK) {
-    throw std::runtime_error("ffi_prep_cif failed");
-  }
-  
-  // Call function
-  ffi_call(&cif, FFI_FN(funcPtr), nullptr, arg_values.data());
-  
-  return output;
+// Build libffi CIF (Call Interface)
+ffi_cif cif;
+if (ffi_prep_cif(&cif, FFI_DEFAULT_ABI, arg_types.size(),
+                  &ffi_type_void, arg_types.data()) != FFI_OK) {
+  throw std::runtime_error("ffi_prep_cif failed");
 }
+
+// Call function
+ffi_call(&cif, FFI_FN(funcPtr), nullptr, arg_values.data());
 ```
 
-The `marshal_memref_2d()` function expands NumPy arrays into memref descriptor arguments:
-
-```cpp
-void marshal_memref_2d(std::vector<ffi_type*>& arg_types,
-                        std::vector<void*>& arg_values,
-                        py::array_t<float> arr) {
-  auto buf = arr.request();
-  float* data = static_cast<float*>(buf.ptr);
-  
-  // Allocate persistent storage for arguments
-  static std::vector<void*> persistent_args;
-  persistent_args.push_back(data);
-  persistent_args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(0)));  // offset
-  persistent_args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[0])));
-  persistent_args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[1])));
-  persistent_args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[1])));  // stride0
-  persistent_args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(1)));   // stride1
-  
-  // Add types
-  arg_types.push_back(&ffi_type_pointer);  // data
-  arg_types.push_back(&ffi_type_sint64);   // offset
-  arg_types.push_back(&ffi_type_sint64);   // size0
-  arg_types.push_back(&ffi_type_sint64);   // size1
-  arg_types.push_back(&ffi_type_sint64);   // stride0
-  arg_types.push_back(&ffi_type_sint64);   // stride1
-  
-  // Add value pointers
-  for (size_t i = persistent_args.size() - 6; i < persistent_args.size(); ++i) {
-    arg_values.push_back(&persistent_args[i]);
-  }
-}
-```
-
-libffi handles calling conventions, register allocation, stack management. We provide types and values; it invokes the function correctly.
+The `marshal_memref_2d()` function expands NumPy arrays into memref descriptor arguments, which has been discussed in previous chapters.
 
 **End-to-End Flow**. Putting it all together:
 
@@ -1245,752 +943,40 @@ Four transformer dialect operations (transpose, two matmuls, softmax) plus eleme
 
 **Two-Stage Lowering**: Section 11.3's patterns lower transformer operations to **linalg** operations first, then MLIR's `createConvertLinalgToLoopsPass()` converts linalg to scf.for loops. The intermediate linalg representation enables optimization passes (tiling, fusion, vectorization) before final loop generation.
 
-**After First Lowering** (transformer → linalg, abbreviated):
+**IR Transformation Stages**. To understand what the compiler generates, consider the transformation pipeline for attention:
 
-```mlir
-func.func @graph_func(%Q: memref<4x8xf32>, %K: memref<4x8xf32>,
-                       %V: memref<4x8xf32>, %output: memref<4x8xf32>) {
-  %K_T = memref.alloc() : memref<8x4xf32>
-  
-  // Transpose: structured operation with permutation
-  linalg.transpose ins(%K : memref<4x8xf32>)
-                   outs(%K_T : memref<8x4xf32>)
-                   permutation = [1, 0]
-  
-  // Matmul: Q @ K_T -> scores
-  %scores = memref.alloc() : memref<4x4xf32>
-  %zero = arith.constant 0.0 : f32
-  linalg.fill ins(%zero : f32) outs(%scores : memref<4x4xf32>)
-  linalg.matmul ins(%Q, %K_T : memref<4x8xf32>, memref<8x4xf32>)
-                outs(%scores : memref<4x4xf32>)
-  
-  // Scale: element-wise multiply via linalg.generic
-  %scale_buf = memref.alloc() : memref<4x4xf32>
-  %scale_factor = arith.constant 0.353553 : f32
-  linalg.generic { /* identity maps, parallel iterators */ }
-    ins(%scores, %scale_factor : memref<4x4xf32>, f32)
-    outs(%scale_buf : memref<4x4xf32>) {
-    ^bb0(%score: f32, %factor: f32, %out: f32):
-      %scaled = arith.mulf %score, %factor : f32
-      linalg.yield %scaled : f32
-  }
-  
-  // Softmax: reduce max, generic exp, reduce sum, generic divide
-  %attn_weights = memref.alloc() : memref<4x4xf32>
-  %max_vals = memref.alloc() : memref<4xf32>
-  linalg.reduce { arith.maximumf }
-    ins(%scale_buf : memref<4x4xf32>)
-    outs(%max_vals : memref<4xf32>)
-    dimensions = [1]
-  
-  // ... (exp, sum, divide steps via linalg.generic)
-  
-  // Final matmul: attn_weights @ V -> output
-  linalg.fill ins(%zero : f32) outs(%output : memref<4x8xf32>)
-  linalg.matmul ins(%attn_weights, %V : memref<4x4xf32>, memref<4x8xf32>)
-                outs(%output : memref<4x8xf32>)
-  
-  func.return
-}
-```
+**Stage 1: Transformer Dialect Operations** → The high-level `transformer.attention` operation and its components (matmul, transpose, softmax, scale) exist at this level. These are domain-specific operations that capture semantic meaning.
 
-This linalg representation is **semantically meaningful** to MLIR's optimizer—it knows `linalg.matmul` performs matrix multiplication, enabling transformations like tiling or fusion that raw loops wouldn't support.
+**Stage 2: Linalg Operations** → After lowering, operations become structured linalg ops: `linalg.matmul` for matrix operations, `linalg.generic` for element-wise operations (scaling), `linalg.reduce` for reductions (max, sum in softmax), and `linalg.transpose` with explicit permutations. This representation preserves semantic meaning—MLIR's optimizer understands what these operations do and can apply transformations like tiling and fusion.
 
-**After Second Lowering** (linalg → scf.for loops, abbreviated):
+**Stage 3: Explicit Loops** → After `createConvertLinalgToLoopsPass()`, linalg operations become nested `scf.for` loops with explicit indices, bounds, and strides. For attention with seq_len=4 and d_k=8, this produces approximately 18 nested loops: 2 for transpose, 3 for each matmul (2 total = 6 loops), 2 for scaling, 6 for softmax's three passes (find max per row, compute exp, normalize), plus memory allocations for intermediate buffers (K_T, scores, scale_buf, attn_weights, max_buf, sum_buf). The generated code explicitly iterates through memory, performs arithmetic operations, and manages intermediate storage—typically expanding a few high-level operations into ~100 lines of loop-based IR.
 
-```mlir
-func.func @graph_func(%Q: memref<4x8xf32>, %K: memref<4x8xf32>,
-                       %V: memref<4x8xf32>, %output: memref<4x8xf32>) {
-  %K_T = memref.alloc() : memref<8x4xf32>
-  
-  // Transpose: swap indices when copying
-  %c0 = arith.constant 0 : index
-  %c1 = arith.constant 1 : index
-  %c4 = arith.constant 4 : index
-  %c8 = arith.constant 8 : index
-  scf.for %i = %c0 to %c4 step %c1 {
-    scf.for %j = %c0 to %c8 step %c1 {
-      %val = memref.load %K[%i, %j] : memref<4x8xf32>
-      memref.store %val, %K_T[%j, %i] : memref<8x4xf32>
-    }
-  }
-  
-  // Matmul: Q @ K_T -> scores
-  %scores = memref.alloc() : memref<4x4xf32>
-  scf.for %i = %c0 to %c4 step %c1 {
-    scf.for %j = %c0 to %c4 step %c1 {
-      %zero = arith.constant 0.0 : f32
-      %sum = scf.for %k = %c0 to %c8 step %c1 iter_args(%s = %zero) -> (f32) {
-        %a = memref.load %Q[%i, %k] : memref<4x8xf32>
-        %b = memref.load %K_T[%k, %j] : memref<8x4xf32>
-        %prod = arith.mulf %a, %b : f32
-        %new_sum = arith.addf %s, %prod : f32
-        scf.yield %new_sum : f32
-      }
-      memref.store %sum, %scores[%i, %j] : memref<4x4xf32>
-    }
-  }
-  
-  // Scale: element-wise multiply by 0.353553
-  %scale_buf = memref.alloc() : memref<4x4xf32>
-  %scale_factor = arith.constant 0.353553 : f32
-  scf.for %i = %c0 to %c4 step %c1 {
-    scf.for %j = %c0 to %c4 step %c1 {
-      %val = memref.load %scores[%i, %j] : memref<4x4xf32>
-      %scaled = arith.mulf %val, %scale_factor : f32
-      memref.store %scaled, %scale_buf[%i, %j] : memref<4x4xf32>
-    }
-  }
-  
-  // Softmax: three-pass algorithm (max, exp, normalize)
-  %attn_weights = memref.alloc() : memref<4x4xf32>
-  %max_buf = memref.alloc() : memref<4xf32>
-  %sum_buf = memref.alloc() : memref<4xf32>
-  
-  // Pass 1: Find max per row
-  %neg_inf = arith.constant 0xFF800000 : f32  // -inf
-  scf.for %i = %c0 to %c4 step %c1 {
-    %max = scf.for %j = %c0 to %c4 step %c1 iter_args(%m = %neg_inf) -> (f32) {
-      %val = memref.load %scale_buf[%i, %j] : memref<4x4xf32>
-      %new_max = arith.maximumf %m, %val : f32
-      scf.yield %new_max : f32
-    }
-    memref.store %max, %max_buf[%i] : memref<4xf32>
-  }
-  
-  // Pass 2: Compute exp(x - max) and sum
-  %zero_f = arith.constant 0.0 : f32
-  scf.for %i = %c0 to %c4 step %c1 {
-    %max = memref.load %max_buf[%i] : memref<4xf32>
-    %sum = scf.for %j = %c0 to %c4 step %c1 iter_args(%s = %zero_f) -> (f32) {
-      %val = memref.load %scale_buf[%i, %j] : memref<4x4xf32>
-      %adjusted = arith.subf %val, %max : f32
-      %exp_val = math.exp %adjusted : f32
-      memref.store %exp_val, %attn_weights[%i, %j] : memref<4x4xf32>  // Temporary storage
-      %new_sum = arith.addf %s, %exp_val : f32
-      scf.yield %new_sum : f32
-    }
-    memref.store %sum, %sum_buf[%i] : memref<4xf32>
-  }
-  
-  // Pass 3: Normalize
-  scf.for %i = %c0 to %c4 step %c1 {
-    %sum = memref.load %sum_buf[%i] : memref<4xf32>
-    scf.for %j = %c0 to %c4 step %c1 {
-      %exp_val = memref.load %attn_weights[%i, %j] : memref<4x4xf32>
-      %normalized = arith.divf %exp_val, %sum : f32
-      memref.store %normalized, %attn_weights[%i, %j] : memref<4x4xf32>
-    }
-  }
-  
-  // Final matmul: attn_weights @ V -> output
-  scf.for %i = %c0 to %c4 step %c1 {
-    scf.for %j = %c0 to %c8 step %c1 {
-      %zero = arith.constant 0.0 : f32
-      %sum = scf.for %k = %c0 to %c4 step %c1 iter_args(%s = %zero) -> (f32) {
-        %a = memref.load %attn_weights[%i, %k] : memref<4x4xf32>
-        %b = memref.load %V[%k, %j] : memref<4x8xf32>
-        %prod = arith.mulf %a, %b : f32
-        %new_sum = arith.addf %s, %prod : f32
-        scf.yield %new_sum : f32
-      }
-      memref.store %sum, %output[%i, %j] : memref<4x8xf32>
-    }
-  }
-  
-  func.return
-}
-```
-
-**From High-Level Operations to ~100 Lines of Loops**. The transformer dialect's operations expanded into:
-- 2 nested loops (transpose)
-- 3 nested loops (matmul for scores)
-- 2 nested loops (filling scale constant buffer)
-- 2 nested loops (element-wise multiplication for scaling)
-- 6 nested loops (softmax's three passes, 2 loops each)
-- 3 nested loops (matmul for output)
-
-18 loops total, plus multiple memory allocations (intermediate buffers). This is the code actually running—explicit iteration, explicit arithmetic, explicit memory accesses.
-
-**Memory Usage**. For seq_len=4, d_k=8:
-- K_T: 8×4 = 32 floats = 128 bytes
-- scores: 4×4 = 16 floats = 64 bytes
-- scale_buf: 4×4 = 16 floats = 64 bytes
-- attn_weights: 4×4 = 16 floats = 64 bytes
-- max_buf: 4 floats = 16 bytes
-- sum_buf: 4 floats = 16 bytes
-- **Total**: 352 bytes
-
-Small. But for seq_len=512, d_k=64:
-- K_T: 512×64 = 32,768 floats = 128 KB
-- scores: 512×512 = 262,144 floats = 1 MB
-- scale_buf: 1 MB
-- attn_weights: 1 MB
-- **Total**: ~3.3 MB per attention operation
-
-Multiply by number of attention heads (8-12 typical), multiply by layers (12-24 typical), and memory becomes non-trivial. Chapter 14 discusses optimizations (fusing operations, eliminating intermediates, tiling for cache locality).
-
-**Optimization Opportunities**. Even without Chapter 14's techniques, MLIR applies standard optimizations:
-
-1. **Loop Fusion**: The scale operation could fuse into softmax's first pass—read from `scores`, scale, compute max. One fewer buffer.
-
-2. **Buffer Reuse**: `scores` and `scale_buf` have disjoint lifetimes—after scaling completes, `scores` is dead. Reuse the same memory.
-
-3. **Vectorization**: The element-wise loops (transpose, scale, softmax passes) are embarrassingly parallel. SIMD instructions can process 4-8 elements simultaneously.
-
-4. **Parallelization**: Each row of attention weights is independent. Multi-thread the computation.
-
-These optimizations are future work (Chapters 10, 14), but the point: **the IR structure enables optimization**. High-level operations preserve semantics; lowering patterns expose parallelism; standard passes apply transformations. Users write `ch11.attention(Q, K, V)`, compilers generate efficient code.
+**Memory Considerations**. For small inputs (seq_len=4, d_k=8), intermediate buffers total ~352 bytes. But at production scale (seq_len=512, d_k=64), attention requires ~3.3 MB per operation: transposed keys (128 KB), scores matrix (1 MB), scaled scores (1 MB), attention weights (1 MB), plus reduction buffers. Multiply by number of attention heads (8-12 typical) and layers (12-24 typical), and memory becomes significant. The explicit loop representation enables optimizations: loop fusion can eliminate intermediate buffers (scale directly into softmax's first pass), buffer reuse allows reusing memory for operations with disjoint lifetimes (scores buffer can become scale_buf), vectorization applies SIMD to element-wise operations, and parallelization distributes independent row computations across threads. These optimizations (explored in Chapters 10 and 14) leverage the IR structure—high-level operations preserve semantics for analysis, lowering patterns expose parallelism, and standard passes apply transformations automatically.
 
 ## 11.7 Numerical Validation: Testing Correctness
 
-Attention implementation complete, how do we know it's correct? This section discusses numerical validation: comparing against reference implementations, handling floating-point precision, designing test cases catching bugs. Correctness is non-negotiable—performance optimizations mean nothing if results are wrong.
+Attention implementation complete, how do we know it's correct? Numerical validation compares MLIR outputs against reference implementations, with careful attention to floating-point precision.
 
-**Reference Implementation**. NumPy provides a straightforward attention:
+**Testing Strategy**. A NumPy reference implementation provides ground truth, using the same numerically stable softmax (subtract max before exponentiating). The test harness compares MLIR-compiled results against NumPy using `np.testing.assert_allclose()` with tolerances (rtol=1e-4, atol=1e-6) that account for harmless floating-point differences from operation reordering, hardware approximations (exp, sqrt), and compiler optimizations. These tolerances are small enough to catch bugs but large enough to tolerate implementation differences.
 
-```python
-import numpy as np
+**Test Coverage**. Beyond random inputs, structured test cases target specific behaviors: identity matrices test sparse structured inputs, uniform values test symmetric attention weights, single-token sequences test degenerate cases. Testing individual operations (matmul, transpose, softmax) before testing full attention helps isolate bugs—if components pass but attention fails, the bug is in composition logic; if components fail, the bug is in lowering patterns.
 
-def attention_reference(Q, K, V):
-    """
-    Reference attention implementation.
-    Q, K, V: (seq_len, d_k) arrays
-    Returns: (seq_len, d_k) array
-    """
-    # Step 1: Compute scores = Q @ K^T
-    scores = Q @ K.T  # (seq_len, seq_len)
-    
-    # Step 2: Scale
-    d_k = Q.shape[1]
-    scaled_scores = scores / np.sqrt(d_k)
-    
-    # Step 3: Softmax
-    exp_scores = np.exp(scaled_scores - np.max(scaled_scores, axis=1, keepdims=True))
-    attn_weights = exp_scores / np.sum(exp_scores, axis=1, keepdims=True)
-    
-    # Step 4: Weight V
-    output = attn_weights @ V
-    
-    return output
-```
+**Common Debugging Scenarios**:
 
-Note the softmax implementation: subtract max before exponentiating (numerical stability, Section 11.1). This matches our MLIR implementation.
+**NaN outputs** typically indicate numerical instability (missing max subtraction in softmax, causing overflow) or uninitialized memory (accumulation buffers not zeroed). Isolate which operation produces NaN by testing intermediate results. Inspect the generated IR to verify softmax includes `math.maximumf` for finding max and proper subtraction, and that loop accumulators initialize with `arith.constant 0.0`.
 
-**Test Harness**. Compare MLIR output against NumPy:
+**Wrong values** suggest index errors (transpose with swapped indices), shape mismatches (wrong buffer allocations), or incorrect loop bounds. Compare expected vs actual element-wise, test with trivial inputs where results are manually computable, and try different sizes (does seq_len=2 work but seq_len=4 fail?). The classic transpose bug: iterating over input dimensions instead of output dimensions causes out-of-bounds access when shapes don't match.
 
-```python
-import ch11
-import numpy as np
+**Compilation failures** point to missing dialect registrations, unregistered lowering patterns, or type mismatches between operations. Use `-mlir-print-ir-after-all` to see IR evolution through the pass pipeline and identify which pass fails. Check that all patterns are added to the RewritePatternSet and all required dialects are loaded.
 
-def test_attention():
-    # Generate random inputs
-    np.random.seed(42)  # Reproducibility
-    seq_len, d_k = 4, 8
-    Q = np.random.randn(seq_len, d_k).astype(np.float32)
-    K = np.random.randn(seq_len, d_k).astype(np.float32)
-    V = np.random.randn(seq_len, d_k).astype(np.float32)
-    
-    # Compute reference
-    expected = attention_reference(Q, K, V)
-    
-    # Compute with MLIR
-    Q_t = ch11.Tensor(Q)
-    K_t = ch11.Tensor(K)
-    V_t = ch11.Tensor(V)
-    result_t = ch11.attention(Q_t, K_t, V_t)
-    actual = ch11.forward(result_t)
-    
-    # Compare
-    np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-6)
-    print("✓ Attention test passed")
+**Debugging Tools**: Insert `llvm::errs()` print statements in lowering patterns to trace execution, expose MLIR IR to Python for inspection, and use `-mlir-print-op-generic` for fully-qualified IR showing all attributes and types. Debugging is iterative: hypothesize, test simple cases, inspect IR, fix, repeat. MLIR's readable IR is your primary diagnostic tool.
 
-test_attention()
-```
+The test suite in [test_jit.py](ch.11.Attention/test_jit.py) validates all operations and attention mechanism, providing confidence in correctness through automated verification.
 
-**Tolerance Thresholds**. The `assert_allclose()` call specifies:
-- **rtol** (relative tolerance): 1e-4 (0.01% error allowed)
-- **atol** (absolute tolerance): 1e-6 (for values near zero)
+## 11.8 Conclusion
 
-Why tolerances? Floating-point arithmetic is not exact:
-- Different operation orderings can accumulate different rounding errors
-- `exp()` and `sqrt()` use approximations (hardware or library implementations)
-- Compiler optimizations might reorder operations (FMA instructions, for example)
+This chapter built a complete attention implementation in MLIR, from high-level operations to executable machine code. We defined a Transformer dialect with five operations (`matmul`, `add`, `mul`, `softmax`, `transpose`), wrote lowering patterns to tensor-based linalg operations, implemented a tensor abstraction for building computation graphs, and JIT-compiled graphs to native code via LLVM.
 
-For single-precision floats (f32), expecting exact bit-for-bit equality is unrealistic. Tolerances of 1e-4 to 1e-5 are standard—small enough to catch bugs, large enough to tolerate harmless differences.
+**Key insights**: Domain-specific dialects capture attention semantics naturally. Multi-level IR (Python API → transformer dialect → linalg → loops → LLVM IR) enables optimization at each abstraction level. Lowering to linalg rather than raw loops unlocks MLIR's optimization passes (tiling, fusion, vectorization). Pattern rewriting keeps transformations modular—adding operations means adding patterns without changing existing code. Numerical correctness requires careful attention to stability (max subtraction in softmax) and initialization (zeroed accumulators).
 
-**Edge Cases**. Random inputs catch many bugs, but structured test cases catch specific failure modes:
-
-```python
-def test_attention_identity():
-    """Test that attention with identical Q, K, V behaves reasonably."""
-    seq_len, d_k = 3, 4
-    X = np.eye(seq_len, d_k, dtype=np.float32)  # Identity matrix
-    
-    X_t = ch11.Tensor(X)
-    result_t = ch11.attention(X_t, X_t, X_t)
-    actual = ch11.forward(result_t)
-    expected = attention_reference(X, X, X)
-    
-    np.testing.assert_allclose(actual, expected, rtol=1e-4)
-    print("✓ Identity test passed")
-
-def test_attention_uniform():
-    """Test with uniform values—all entries equal."""
-    seq_len, d_k = 4, 4
-    Q = np.ones((seq_len, d_k), dtype=np.float32)
-    K = np.ones((seq_len, d_k), dtype=np.float32)
-    V = np.ones((seq_len, d_k), dtype=np.float32)
-    
-    Q_t, K_t, V_t = ch11.Tensor(Q), ch11.Tensor(K), ch11.Tensor(V)
-    result_t = ch11.attention(Q_t, K_t, V_t)
-    actual = ch11.forward(result_t)
-    expected = attention_reference(Q, K, V)
-    
-    # With uniform inputs, attention weights should be uniform (1/seq_len each)
-    # Output should be row-wise average of V (which is all ones)
-    np.testing.assert_allclose(actual, np.ones((seq_len, d_k)), rtol=1e-4)
-    print("✓ Uniform test passed")
-
-def test_attention_single_token():
-    """Test with seq_len=1 (trivial case)."""
-    d_k = 8
-    Q = np.random.randn(1, d_k).astype(np.float32)
-    K = np.random.randn(1, d_k).astype(np.float32)
-    V = np.random.randn(1, d_k).astype(np.float32)
-    
-    Q_t, K_t, V_t = ch11.Tensor(Q), ch11.Tensor(K), ch11.Tensor(V)
-    result_t = ch11.attention(Q_t, K_t, V_t)
-    actual = ch11.forward(result_t)
-    
-    # With 1 token, attention weight is 1.0, output equals V
-    np.testing.assert_allclose(actual, V, rtol=1e-4)
-    print("✓ Single token test passed")
-```
-
-Each test targets specific behavior:
-- **Identity**: Sparse, structured input
-- **Uniform**: Symmetric attention weights
-- **Single token**: Degenerate case (no choice in attention)
-
-**Testing Individual Operations**. Before testing full attention, test components:
-
-```python
-def test_matmul():
-    A = np.random.randn(3, 4).astype(np.float32)
-    B = np.random.randn(4, 5).astype(np.float32)
-    expected = A @ B
-    
-    A_t, B_t = ch11.Tensor(A), ch11.Tensor(B)
-    result_t = ch11.matmul(A_t, B_t)
-    actual = ch11.forward(result_t)
-    
-    np.testing.assert_allclose(actual, expected, rtol=1e-4)
-    print("✓ Matmul test passed")
-
-def test_transpose():
-    A = np.random.randn(4, 6).astype(np.float32)
-    expected = A.T
-    
-    A_t = ch11.Tensor(A)
-    result_t = ch11.transpose(A_t)
-    actual = ch11.forward(result_t)
-    
-    np.testing.assert_allclose(actual, expected, rtol=1e-6)
-    print("✓ Transpose test passed")
-
-def test_softmax():
-    A = np.random.randn(3, 5).astype(np.float32)
-    # NumPy softmax along last axis
-    exp_a = np.exp(A - np.max(A, axis=1, keepdims=True))
-    expected = exp_a / np.sum(exp_a, axis=1, keepdims=True)
-    
-    A_t = ch11.Tensor(A)
-    result_t = ch11.softmax(A_t)
-    actual = ch11.forward(result_t)
-    
-    np.testing.assert_allclose(actual, expected, rtol=1e-4)
-    print("✓ Softmax test passed")
-```
-
-If these pass but attention fails, the bug is in composition logic (wrong operation order, incorrect dimensions). If these fail, the bug is in lowering patterns (wrong loop bounds, index swaps, uninitialized memory).
-
-**Continuous Testing**. In production, tests run automatically:
-- Every code change triggers test suite
-- Pull requests require passing tests
-- Regressions caught immediately
-
-For this book chapter, tests validate the implementation actually works. Run [test_jit.py](ch.11.Attention/test_jit.py):
-
-```bash
-cd ch.11.Attention
-python test_jit.py
-```
-
-Output:
-```
-✓ Matmul test passed
-✓ Transpose test passed
-✓ Softmax test passed
-✓ Attention test passed
-✓ Identity test passed
-✓ Uniform test passed
-✓ Single token test passed
-All tests passed!
-```
-
-Each test validates a contract—if the contract changes (different tolerance, different expected behavior), update tests accordingly. The goal: high confidence in correctness, automated verification.
-
-## 11.8 Debugging: When Attention Fails
-
-Tests reveal bugs; debugging fixes them. This section discusses common attention implementation mistakes, diagnostic strategies, and tools for pinpointing errors. Attention is complex—many operations, many buffers, many indices—making debugging essential.
-
-**Common Bug Categories**:
-
-1. **Uninitialized Memory**: Forgetting to zero-initialize accumulation buffers (matmul, softmax sum)
-2. **Index Errors**: Swapping indices (transpose), off-by-one (loop bounds), wrong dimension queries
-3. **Shape Mismatches**: Allocating wrong-sized buffers, incompatible matmul dimensions
-4. **Numerical Instability**: Not subtracting max before softmax (overflow/NaN), division by zero
-5. **Compilation Failures**: Type mismatches, undefined symbols, pass pipeline errors
-
-**Symptom 1: NaN Output**. Run test, get:
-
-```
-actual: [[nan, nan, ...], [nan, nan, ...]]
-AssertionError: Arrays are not close
-```
-
-**Diagnostic Steps**:
-
-1. **Isolate the Operation**: Test matmul, transpose, softmax individually. Which produces NaN?
-
-   ```python
-   # Test intermediate steps
-   Q_t = ch11.Tensor(Q)
-   K_t = ch11.Tensor(K)
-   K_T = ch11.transpose(K_t)
-   scores_t = ch11.matmul(Q_t, K_T)
-   scores = ch11.forward(scores_t)
-   print("Scores:", scores)  # Check for NaN
-   ```
-
-2. **Softmax Overflow**: If NaN appears in softmax, check max subtraction. Dump IR:
-
-   ```python
-   import ch11
-   compiler = ch11.get_compiler()
-   module = compiler.build_module(result_tensor.node)
-   print(module)  # Inspect MLIR IR
-   ```
-
-   Look for the softmax lowering pattern. Is `math.maximumf` present? Is the max actually subtracted?
-
-3. **Uninitialized Accumulators**: If matmul produces NaN, check zero initialization:
-
-   ```mlir
-   // WRONG: Missing zero initialization
-   scf.for %i = %c0 to %rows step %c1 {
-     scf.for %j = %c0 to %cols step %c1 {
-       %sum = scf.for %k = %c0 to %dim step %c1 iter_args(%s = ???) -> (f32) {
-         // %s is uninitialized!
-         ...
-       }
-     }
-   }
-   
-   // CORRECT: Zero init
-   %zero = arith.constant 0.0 : f32
-   %sum = scf.for %k = %c0 to %dim step %c1 iter_args(%s = %zero) -> (f32) {
-     ...
-   }
-   ```
-
-   Search the IR for `iter_args`. Is the initial value `arith.constant 0.0`?
-
-4. **Division by Zero**: If softmax sums are zero, normalization divides by zero → NaN. Check input values—are all entries extremely negative? (exp(-1000) ≈ 0)
-
-**Symptom 2: Wrong Output Values**. Tests pass sometimes, fail others. Or output is wrong but not NaN.
-
-**Diagnostic Steps**:
-
-1. **Compare Element-Wise**: Print both expected and actual, inspect differences:
-
-   ```python
-   print("Expected:\n", expected)
-   print("Actual:\n", actual)
-   print("Difference:\n", actual - expected)
-   print("Max error:", np.max(np.abs(actual - expected)))
-   ```
-
-2. **Simplify Inputs**: Use trivial inputs where you can compute results manually:
-
-   ```python
-   # Identity matrices: Q @ K^T should be predictable
-   Q = np.eye(3, 4, dtype=np.float32)
-   K = np.eye(3, 4, dtype=np.float32)
-   # Compute expected by hand...
-   ```
-
-3. **Test at Different Sizes**: Does seq_len=2 work but seq_len=4 fail? Suggests loop bound issues.
-
-4. **Transpose Bugs**: The classic mistake (Section 11.3.2). Check generated IR:
-
-   ```mlir
-   // WRONG: Iterate input dimensions
-   scf.for %i = %c0 to %c4 step %c1 {   // Input rows
-     scf.for %j = %c0 to %c8 step %c1 { // Input cols
-       %val = memref.load %input[%i, %j]
-       memref.store %val, %output[%j, %i]  // OK so far
-     }
-   }
-   // If input is 4x8, this works. If input is 8x4, out-of-bounds!
-   
-   // CORRECT: Iterate output dimensions
-   scf.for %i = %c0 to %c8 step %c1 {   // Output rows (= input cols)
-     scf.for %j = %c0 to %c4 step %c1 { // Output cols (= input rows)
-       %val = memref.load %input[%j, %i]
-       memref.store %val, %output[%i, %j]
-     }
-   }
-   ```
-
-   Verify loop bounds match output shape, not input shape.
-
-**Symptom 3: Compilation Failure**. MLIR passes fail, or ExecutionEngine creation fails.
-
-**Diagnostic Steps**:
-
-1. **Check Pass Pipeline**: Ensure all required dialects are registered:
-
-   ```cpp
-   context_.loadDialect<TransformerDialect, func::FuncDialect,
-                         arith::ArithDialect, memref::MemRefDialect,
-                         scf::SCFDialect, math::MathDialect>();
-   ```
-
-2. **Verify Lowering Patterns**: Did you register all patterns in the pass?
-
-   ```cpp
-   void populateLowerTransformerToStandardPatterns(RewritePatternSet& patterns) {
-     patterns.add<LowerMatmulOp>(patterns.getContext());
-     patterns.add<LowerTransposeOp>(patterns.getContext());
-     patterns.add<LowerSoftmaxOp>(patterns.getContext());
-     patterns.add<LowerAddOp>(patterns.getContext());
-     patterns.add<LowerMulOp>(patterns.getContext());
-     // Did you forget one?
-   }
-   ```
-
-3. **Dump IR Between Passes**: Insert `-mlir-print-ir-after-all` to see IR evolution:
-
-   ```cpp
-   auto pm = PassManager::on<ModuleOp>(&context_);
-   pm.enableIRPrinting();
-   ```
-
-   Identify which pass fails, inspect IR before that pass.
-
-4. **Type Mismatches**: Check function signatures match calling convention:
-
-   ```cpp
-   // Function signature
-   func.func @foo(%arg0: memref<4x8xf32>) { ... }
-   
-   // Calling code
-   %wrong_type = ... : memref<8x4xf32>  // Incompatible!
-   func.call @foo(%wrong_type) : (memref<8x4xf32>) -> ()
-   ```
-
-   MLIR's type system catches these, but error messages can be cryptic. Read carefully.
-
-**Debugging Tools**:
-
-- **llvm::errs() in C++**: Print debug messages from lowering patterns:
-  ```cpp
-  llvm::errs() << "Lowering matmul with shape: " 
-               << lhsType.getShape() << " x " << rhsType.getShape() << "\n";
-  ```
-
-- **module.dump() in Python bindings**: Expose MLIR IR to Python for inspection.
-
-- **gdb/lldb**: Step through JIT-compiled code (requires debug symbols, non-trivial setup).
-
-- **MLIR Passes**: Use `-mlir-print-op-generic` for fully-qualified IR (shows all attributes, types).
-
-**Example Debugging Session**. Suppose transpose fails:
-
-```
-Expected: [[1, 4], [2, 5], [3, 6]]
-Actual:   [[1, 2], [3, 4], [5, 6]]
-```
-
-Output shape is correct (3x2), but values are wrong. Hypothesis: indices are not swapped. Inspect IR:
-
-```mlir
-scf.for %i = %c0 to %c2 step %c1 {
-  scf.for %j = %c0 to %c3 step %c1 {
-    %val = memref.load %input[%i, %j]
-    memref.store %val, %output[%i, %j]  // BUG: Should be [%j, %i]
-  }
-}
-```
-
-There it is: `memref.store ... [%i, %j]` instead of `[%j, %i]`. Fix the lowering pattern:
-
-```cpp
-builder.create<memref::StoreOp>(loc, val, output, ValueRange{j, i});  // Swapped
-```
-
-Recompile, retest—passes now.
-
-Debugging is iterative: hypothesize, test, inspect, fix, repeat. MLIR's IR is readable—leverage that. When stuck, simplify: smaller inputs, fewer operations, more print statements. Attention is deterministic; bugs are reproducible.
-
-## 11.9 Performance Characteristics
-
-Implementation correct, how fast is it? This section analyzes attention's performance, identifying bottlenecks and comparing against optimized libraries. Understanding performance guides optimization efforts—know what's slow before trying to speed it up.
-
-**Benchmarking Setup**. Timing attention with various input sizes:
-
-```python
-import ch11
-import numpy as np
-import time
-
-def benchmark_attention(seq_len, d_k, num_runs=100):
-    Q = np.random.randn(seq_len, d_k).astype(np.float32)
-    K = np.random.randn(seq_len, d_k).astype(np.float32)
-    V = np.random.randn(seq_len, d_k).astype(np.float32)
-    
-    Q_t = ch11.Tensor(Q)
-    K_t = ch11.Tensor(K)
-    V_t = ch11.Tensor(V)
-    result_t = ch11.attention(Q_t, K_t, V_t)
-    
-    # Warmup (JIT compilation)
-    _ = ch11.forward(result_t)
-    
-    # Timed runs
-    start = time.time()
-    for _ in range(num_runs):
-        output = ch11.forward(result_t)
-    elapsed = time.time() - start
-    
-    avg_time = elapsed / num_runs
-    return avg_time
-
-# Test different sizes
-sizes = [(64, 64), (128, 64), (256, 64), (512, 64)]
-for seq_len, d_k in sizes:
-    t = benchmark_attention(seq_len, d_k)
-    print(f"seq_len={seq_len}, d_k={d_k}: {t*1000:.2f} ms per forward pass")
-```
-
-Example output (on a modern CPU):
-```
-seq_len=64, d_k=64: 0.32 ms
-seq_len=128, d_k=64: 1.15 ms
-seq_len=256, d_k=64: 4.28 ms
-seq_len=512, d_k=64: 16.85 ms
-```
-
-**Complexity Analysis**. From Section 11.1:
-- Matmul (Q @ K^T): O(seq_len² × d_k)
-- Scaling: O(seq_len²)
-- Softmax: O(seq_len²)
-- Matmul (weights @ V): O(seq_len² × d_k)
-- **Total**: O(seq_len² × d_k)
-
-Doubling seq_len quadruples compute. The 64→128 jump (2x seq_len) should be ~4x slower: 0.32 ms × 4 = 1.28 ms. Actual: 1.15 ms—close, suggesting compute-bound behavior.
-
-**Bottleneck Breakdown**. Profile individual operations:
-
-```python
-def profile_attention(seq_len, d_k):
-    Q = np.random.randn(seq_len, d_k).astype(np.float32)
-    K = np.random.randn(seq_len, d_k).astype(np.float32)
-    V = np.random.randn(seq_len, d_k).astype(np.float32)
-    
-    Q_t = ch11.Tensor(Q)
-    K_t = ch11.Tensor(K)
-    V_t = ch11.Tensor(V)
-    
-    # Time transpose
-    start = time.time()
-    K_T = ch11.transpose(K_t)
-    _ = ch11.forward(K_T)
-    t_transpose = time.time() - start
-    
-    # Time first matmul
-    scores_t = ch11.matmul(Q_t, K_T)
-    start = time.time()
-    _ = ch11.forward(scores_t)
-    t_matmul1 = time.time() - start
-    
-    # ... (time scaling, softmax, second matmul similarly)
-    
-    print(f"Transpose: {t_transpose*1000:.2f} ms")
-    print(f"Matmul (Q@KT): {t_matmul1*1000:.2f} ms")
-    # ...
-```
-
-Typical results (seq_len=256, d_k=64):
-```
-Transpose: 0.05 ms (1%)
-Matmul (Q@KT): 2.80 ms (65%)
-Scaling: 0.03 ms (<1%)
-Softmax: 0.22 ms (5%)
-Matmul (weights@V): 1.18 ms (28%)
-Total: ~4.28 ms
-```
-
-**Key Observation**: The two matmuls dominate (93% of time). Softmax is 5%, transpose/scaling negligible. This matches theoretical expectations—matmuls are O(n³) (treating seq_len as n), while softmax is O(n²).
-
-**Performance Context**. Our implementation is **educational**, demonstrating MLIR compilation concepts. The naive nested loops execute on a single CPU core without SIMD vectorization, fusion, or threading. Production attention implementations—whether in PyTorch (using Intel MKL or OpenBLAS), TensorFlow (XLA compilation), or specialized libraries (cuDNN, FlashAttention)—are significantly faster through:
-
-1. **Optimized BLAS**: Hand-tuned assembly with SIMD instructions and cache blocking for matrix multiplication
-2. **Kernel Fusion**: Combining operations (scale + softmax) to reduce memory bandwidth
-3. **Multi-threading**: Parallelizing across CPU cores
-4. **GPU Acceleration**: Exploiting thousands of parallel cores for data-parallel operations
-
-The performance gap can be substantial (10-100× depending on problem size and hardware). For Chapter 11, the goal is correctness and understanding MLIR's compilation pipeline, not achieving peak performance. The infrastructure is in place; optimizations come in later chapters.
-
-**Optimization Roadmap** (future chapters):
-
-- **Chapter 10**: Apply vectorization, loop fusion, parallelization to generic operations
-- **Chapter 14**: Production-grade optimizations including advanced tiling techniques
-- **GPU**: Offload to accelerators where massive parallelism shines
-
-For Chapter 11, focus is on correctness and clarity. The MLIR infrastructure is established; performance optimizations layer on top in subsequent chapters.
-
-## 11.10 Conclusion
-
-This chapter built a complete attention implementation in MLIR, from high-level operations to structured linear algebra operations to executable machine code. We defined a Transformer dialect with five operations (`matmul`, `add`, `mul`, `softmax`, `transpose`), wrote lowering patterns converting those operations to linalg operations (which then lower to SCF loops and arithmetic), designed a Python API building computation graphs, and JIT-compiled graphs to native code via LLVM.
-
-**Key Takeaways**:
-
-1. **Domain-Specific Dialects**: Attention is naturally expressed as transformer.matmul, transformer.softmax, transformer.mul, etc. Custom operations capture domain semantics, simplifying user code. Higher-level API functions like `scale()` compose these primitives elegantly.
-
-2. **Multi-Level IR**: The same computation exists at four levels—Python API (user-facing), transformer dialect (semantic), linalg operations (structured), SCF+arith (imperative). Each level serves a purpose: Python for ergonomics, transformer for domain semantics, linalg for optimization, SCF for execution.
-
-3. **Linalg as Optimization Layer**: By lowering to linalg operations instead of raw loops, we enable MLIR's optimization passes (tiling, fusion, vectorization) to transform our code automatically. The transformer dialect becomes a thin wrapper providing ergonomic names while leveraging linalg's powerful infrastructure.
-
-4. **Pattern Rewriting**: Lowering patterns are modular—each operation lowers independently. MLIR's rewrite infrastructure handles orchestration. Adding new operations means adding new patterns; existing patterns remain unchanged.
-
-5. **Numerical Correctness**: Attention involves transcendental functions (exp), accumulation (matmul), and normalization (softmax). Numerical stability (max subtraction) and initialization (zero accumulators) are critical. Testing against references catches errors.
-
-6. **Compilation Pipeline**: Computation graph → transformer dialect → linalg operations → SCF loops → LLVM IR → machine code → execution. Each stage is well-defined, with clear inputs/outputs. This modularity enables experimentation—swap lowering patterns, change targets, insert optimization passes.
-
-**Limitations of Our Approach**:
-
-- **Performance**: Naive loops without vectorization, fusion, or parallelization. Significantly slower than production implementations.
-- **Memory**: Explicit intermediate buffers (scores, attn_weights) consume O(seq_len²) memory. Chapter 14's tiling reduces this.
-- **Batch Size**: We handle single examples (seq_len, d_k). Production systems batch multiple examples, amortizing overhead.
-- **Recompilation**: Every `forward()` call recompiles. Caching compiled modules is straightforward but omitted for clarity.
-
-**Looking Ahead**:
-
-- **Chapter 12** (Transformer Blocks): Compose attention with feed-forward networks, layer normalization, residual connections. Build full transformer layers.
-- **Chapter 13** (GPT Architecture): Stack transformer blocks, add positional encodings, implement autoregressive generation.
-- **Chapter 14** (Production Optimizations): Apply DRR for pattern matching, write custom interfaces, implement FlashAttention-inspired fusion, explore KV caching for inference.
-- **Chapter 15** (GPU Concepts): Port attention to GPUs, leveraging thousands of parallel threads.
-
-Attention is the heart of transformers. Mastering its implementation—understanding each operation, each lowering decision, each numerical consideration—provides the foundation for modern AI compilers. From here, we scale: more layers, more optimizations, more targets. MLIR gives us the tools; we provide the insights.
+**Next steps**: Chapter 12 composes attention with feed-forward networks and layer normalization to build full transformer blocks. Chapter 13 stacks these blocks into complete GPT architecture. Chapter 14 applies production optimizations (DRR pattern matching, FlashAttention-inspired fusion, KV caching). Chapter 15 explores GPU implementations. Attention is the heart of transformers—mastering its implementation provides the foundation for modern AI compilers.
