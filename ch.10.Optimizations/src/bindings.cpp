@@ -38,6 +38,11 @@
 #include <mlir/Dialect/Linalg/Passes.h>
 #include <mlir/Dialect/Linalg/Transforms/Transforms.h>
 #include <mlir/Dialect/Bufferization/Transforms/Passes.h>
+#include <mlir/Dialect/Bufferization/Transforms/OneShotAnalysis.h>
+#include <mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h>
+#include <mlir/Dialect/Linalg/Transforms/BufferizableOpInterfaceImpl.h>
+#include <mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h>
+#include <mlir/Dialect/Bufferization/Transforms/FuncBufferizableOpInterfaceImpl.h>
 #include <mlir/Dialect/Vector/Transforms/Passes.h>
 #include <mlir/Dialect/Vector/Transforms/VectorRewritePatterns.h>
 
@@ -86,6 +91,7 @@ public:
         context_.getOrLoadDialect<scf::SCFDialect>();
         context_.getOrLoadDialect<math::MathDialect>();
         context_.getOrLoadDialect<tensor::TensorDialect>();
+        context_.getOrLoadDialect<bufferization::BufferizationDialect>();
         context_.getOrLoadDialect<vector::VectorDialect>();
         context_.getOrLoadDialect<LLVM::LLVMDialect>();
     }
@@ -95,29 +101,44 @@ public:
     bool lowerToLLVM(ModuleOp module) {
         PassManager pm(&context_);
 
-        // 1. Lower NN dialect to standard dialects
+        // Register bufferization interfaces for tensor operations
+        DialectRegistry registry;
+        arith::registerBufferizableOpInterfaceExternalModels(registry);
+        linalg::registerBufferizableOpInterfaceExternalModels(registry);
+        tensor::registerBufferizableOpInterfaceExternalModels(registry);
+        bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(registry);
+        context_.appendDialectRegistry(registry);
+
+        // 1. Lower NN dialect to standard dialects (tensor-based linalg)
         pm.addPass(createConvertNNToStandardPass());
         pm.addPass(mlir::createCanonicalizerPass());
 
-        // 2. Linalg optimizations
+        // 2. Linalg optimizations (on tensors before bufferization)
         pm.addPass(mlir::createLinalgGeneralizeNamedOpsPass());
         pm.addPass(mlir::createCanonicalizerPass());
         pm.addPass(mlir::createLinalgElementwiseOpFusionPass());
         pm.addPass(mlir::createCanonicalizerPass());
 
-        // 3. Lower linalg to loops
+        // 3. Bufferization: tensor → memref conversion
+        bufferization::OneShotBufferizePassOptions bufferizationOptions;
+        bufferizationOptions.bufferizeFunctionBoundaries = true;
+        pm.addPass(bufferization::createOneShotBufferizePass(bufferizationOptions));
+        pm.addPass(bufferization::createBufferResultsToOutParamsPass());
+        pm.addPass(mlir::createCanonicalizerPass());
+
+        // 4. Lower linalg to loops (now on memrefs)
         pm.addPass(mlir::createConvertLinalgToLoopsPass());
 
-        // 4. SCF optimizations
+        // 5. SCF optimizations
         pm.addPass(mlir::createLoopInvariantCodeMotionPass());
         pm.addPass(mlir::createCanonicalizerPass());
 
-        // 5. Vectorization (NEW! Explicit SIMD)
+        // 6. Vectorization (NEW! Explicit SIMD)
         // Convert vector operations to SCF (for unrolling/lowering)
         pm.addPass(mlir::createConvertVectorToSCFPass());
         pm.addPass(mlir::createCanonicalizerPass());
 
-        // 6. Lower to LLVM
+        // 7. Lower to LLVM
         pm.addPass(createConvertVectorToLLVMPass());  // Vector → LLVM first
         pm.addPass(createConvertMathToLLVMPass());
         pm.addPass(createConvertMathToLibmPass());
@@ -321,15 +342,14 @@ private:
         auto module = ModuleOp::create(loc);
         builder.setInsertionPointToEnd(module.getBody());
 
-        // Build function signature types
+        // Build function signature types (tensor-based with return value)
         SmallVector<Type> inputTypes;
         for (auto& inp : inputs) {
-            inputTypes.emplace_back(getMemRefType(builder, inp->shape()));
+            inputTypes.emplace_back(getTensorType(builder, inp->shape()));
         }
-        // Add output parameter
-        inputTypes.emplace_back(getMemRefType(builder, output->shape()));
+        auto outputType = getTensorType(builder, output->shape());
 
-        auto funcType = builder.getFunctionType(inputTypes, {});
+        auto funcType = builder.getFunctionType(inputTypes, ArrayRef<Type>{outputType});
 
         // Create function
         auto func = builder.create<func::FuncOp>(loc, "compute", funcType);
@@ -341,56 +361,46 @@ private:
         for (size_t i = 0; i < inputs.size(); ++i) {
             valueMap[inputs[i].get()] = entryBlock->getArgument(i);
         }
-        Value outputVal = entryBlock->getArgument(inputs.size());
 
-        // Build operations
+        // Build operations (tensor-based, returning values)
         for (size_t i = 0; i < ops.size(); ++i) {
             auto& op = ops[i];
-            Value result;
 
-            // Allocate result buffer (unless it's the final output)
-            if (op.get() == output.get()) {
-                result = outputVal;
-            } else {
-                auto allocOp = builder.create<memref::AllocOp>(
-                    loc, 
-                    mlir::cast<MemRefType>(getMemRefType(builder, op->shape()))
-                );
-                result = allocOp.getResult();
-            }
-
-            valueMap[op.get()] = result;
-
-            // Create the operation
+            // Create the operation - get result type
+            auto resultType = getTensorType(builder, op->shape());
             Value input1 = valueMap[op->input1().get()];
             std::string op_name = op->op_type();
+            Value result;
 
             if (op_name == "add") {
                 Value input2 = valueMap[op->input2().get()];
-                builder.create<AddOp>(loc, input1, input2, result);
+                result = builder.create<AddOp>(loc, resultType, input1, input2);
             } else if (op_name == "mul") {
                 Value input2 = valueMap[op->input2().get()];
-                builder.create<MulOp>(loc, input1, input2, result);
+                result = builder.create<MulOp>(loc, resultType, input1, input2);
             } else if (op_name == "matmul") {
                 Value input2 = valueMap[op->input2().get()];
-                builder.create<MatMulOp>(loc, input1, input2, result);
+                result = builder.create<MatMulOp>(loc, resultType, input1, input2);
             } else if (op_name == "relu") {
-                builder.create<ReLUOp>(loc, input1, result);
+                result = builder.create<ReLUOp>(loc, resultType, input1);
             } else {
                 throw std::runtime_error("Unknown operation: " + op_name);
             }
+
+            valueMap[op.get()] = result;
         }
 
-        // Return from function
-        builder.create<func::ReturnOp>(loc);
+        // Return the final result tensor
+        Value finalResult = valueMap[output.get()];
+        builder.create<func::ReturnOp>(loc, finalResult);
 
         return OwningOpRef<ModuleOp>(module);
     }
 
-    // Helper: Create MemRefType from shape
-    static Type getMemRefType(OpBuilder& builder, const std::vector<ssize_t>& shape) {
+    // Helper: Create TensorType from shape
+    static Type getTensorType(OpBuilder& builder, const std::vector<ssize_t>& shape) {
         SmallVector<int64_t> mlirShape(shape.begin(), shape.end());
-        return MemRefType::get(mlirShape, builder.getF32Type());
+        return RankedTensorType::get(mlirShape, builder.getF32Type());
     }
 
     // Execute without parsing MLIR text

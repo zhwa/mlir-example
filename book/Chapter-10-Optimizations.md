@@ -605,28 +605,42 @@ Previous sections examined individual optimizations in isolation. Production pip
 void NNCompiler::lowerToLLVM(mlir::ModuleOp module) {
   mlir::PassManager pm(&context);
   
-  // Stage 1: Lower NN dialect to standard dialects
+  // Stage 1: Lower NN dialect to standard dialects (tensor-based)
   pm.addNestedPass<mlir::func::FuncOp>(nn::createConvertNNToStandardPass());
   pm.addPass(mlir::createCanonicalizerPass());
   
-  // Stage 2: Linalg optimizations
+  // Stage 2: Linalg optimizations (on tensors)
   pm.addPass(mlir::createLinalgGeneralizeNamedOpsPass());
   pm.addPass(mlir::createCanonicalizerPass());
   pm.addNestedPass<mlir::func::FuncOp>(mlir::createLinalgElementwiseOpFusionPass());
   pm.addPass(mlir::createCanonicalizerPass());
   
-  // Stage 3: Lower to explicit loops
+  // Stage 3: Bufferization (tensor → memref conversion)
+  DialectRegistry registry;
+  arith::registerBufferizableOpInterfaceExternalModels(registry);
+  linalg::registerBufferizableOpInterfaceExternalModels(registry);
+  tensor::registerBufferizableOpInterfaceExternalModels(registry);
+  bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(registry);
+  context.appendDialectRegistry(registry);
+  
+  bufferization::OneShotBufferizationOptions options;
+  options.bufferizeFunctionBoundaries = true;
+  pm.addPass(bufferization::createOneShotBufferizePass(options));
+  pm.addPass(bufferization::createBufferResultsToOutParamsPass());
+  pm.addPass(mlir::createCanonicalizerPass());
+  
+  // Stage 4: Lower to explicit loops (memrefs → SCF)
   pm.addPass(mlir::createConvertLinalgToLoopsPass());
   
-  // Stage 4: Loop optimizations
+  // Stage 5: Loop optimizations
   pm.addPass(mlir::createLoopInvariantCodeMotionPass());
   pm.addPass(mlir::createCanonicalizerPass());
   
-  // Stage 5: Handle vector operations (if any exist)
+  // Stage 6: Handle vector operations (if any exist)
   pm.addPass(mlir::createConvertVectorToSCFPass());
   pm.addPass(mlir::createCanonicalizerPass());
   
-  // Stage 6: Lower to LLVM
+  // Stage 7: Lower to LLVM
   pm.addPass(createConvertVectorToLLVMPass());  // Vector → LLVM first
   pm.addPass(mlir::createSCFToControlFlowPass());
   pm.addPass(mlir::createFinalizeMemRefToLLVMConversionPass());
@@ -641,7 +655,7 @@ void NNCompiler::lowerToLLVM(mlir::ModuleOp module) {
 }
 ```
 
-Six stages, each with specific goals and invariants. Let's walk through them.
+Seven stages, each with specific goals and invariants. Let's walk through them.
 
 **Stage 1: High-Level Lowering** (NN → Standard Dialects). Chapter 9's NN dialect operations (`nn.matmul`, `nn.linear`, `nn.relu`) lower to standard MLIR dialects (Linalg, Arith, Tensor):
 
@@ -649,35 +663,42 @@ Six stages, each with specific goals and invariants. Let's walk through them.
 // Before: NN dialect
 %result = nn.matmul(%A, %B) : (tensor<128x256xf32>, tensor<256x128xf32>) -> tensor<128x128xf32>
 
-// After: Linalg dialect
+// After: Linalg dialect (tensor-based)
 %empty = tensor.empty() : tensor<128x128xf32>
 %result = linalg.matmul ins(%A, %B : tensor<128x256xf32>, tensor<256x128xf32>)
                          outs(%empty : tensor<128x128xf32>) -> tensor<128x128xf32>
 ```
 
-This stage translates domain-specific operations (NN) to mathematical operations (Linalg structured ops). The NN dialect disappears—all subsequent passes work on standard dialects. Canonicalization afterward cleans up redundant tensor allocations and simplifies arithmetic.
+This stage translates domain-specific operations (NN) to mathematical operations (Linalg structured ops). **Crucially, operations remain tensor-based**—they return SSA values representing tensors, not write to pre-allocated buffers. The NN dialect disappears, and all subsequent passes work on standard dialects. Canonicalization afterward cleans up redundant tensor allocations and simplifies arithmetic.
 
 **Stage 2: Linalg Optimizations** (Fusion). With operations in Linalg, we apply structured-operation-level optimizations:
 
 1. **Generalize named ops**: Convert `linalg.matmul` → `linalg.generic` to expose loop bodies
 2. **Canonicalize**: Simplify the verbose generic ops
-3. **Fuse elementwise operations**: Merge producer-consumer pairs to eliminate intermediate buffers
+3. **Fuse elementwise operations**: Merge producer-consumer pairs to eliminate intermediate tensors
 4. **Canonicalize again**: Clean up fused operations
 
-After this stage, operations are still in Linalg but with fewer operations and less memory traffic. The IR represents optimized computation graphs, not yet lowered to loops.
+After this stage, operations are still **tensor-based Linalg** but with fewer operations and less memory traffic. The IR represents optimized computation graphs at the mathematical level, not yet converted to explicit memory operations or loops.
 
-**Stage 3: Lower to Explicit Loops** (Linalg → SCF). Now we lower structured operations to explicit loops:
+**Stage 3: Bufferization and Loop Lowering** (Tensor → MemRef → Loops). This critical stage performs two transformations:
 
+**3a. Bufferization** (Tensor → MemRef):
 ```mlir
-// Before: Linalg generic
-%result = linalg.generic {...} ins(%A, %B) outs(%C) {
-  ^bb0(%a: f32, %b: f32, %acc: f32):
-    %prod = arith.mulf %a, %b : f32
-    %sum = arith.addf %acc, %prod : f32
-    linalg.yield %sum : f32
-}
+// Before: Tensor-based (SSA values)
+%result = linalg.matmul ins(%A, %B : tensor<128x256xf32>, tensor<256x128xf32>)
+                         outs(%empty : tensor<128x128xf32>) -> tensor<128x128xf32>
 
-// After: SCF loops
+// After: MemRef-based (in-place updates)
+%C = memref.alloc() : memref<128x128xf32>
+linalg.matmul ins(%A, %B : memref<128x256xf32>, memref<256x128xf32>)
+              outs(%C : memref<128x128xf32>)
+```
+
+One-Shot Bufferize converts tensor-based operations (functional, immutable) to memref-based operations (imperative, in-place). Tensors become allocated buffers, operations that returned tensors now write to output buffers. This transformation is **semantics-preserving**—tensor semantics guarantee no aliasing, so bufferization can safely allocate buffers and reuse them.
+
+**3b. Lower to Explicit Loops** (Linalg → SCF):
+```mlir
+// After bufferization + loop lowering: SCF loops on memrefs
 scf.for %i = %c0 to %c128 step %c1 {
   scf.for %j = %c0 to %c128 step %c1 {
     scf.for %k = %c0 to %c256 step %c1 {
@@ -692,9 +713,16 @@ scf.for %i = %c0 to %c128 step %c1 {
 }
 ```
 
-Linalg's implicit iteration spaces become explicit `scf.for` loops. Tensor operations become memref (memory reference) operations with explicit loads/stores. This is a **large abstraction drop**—we've gone from "compute matmul" to "three nested loops with loads, arithmetic, and stores." But this explicitness enables loop-level optimizations.
+Linalg's implicit iteration spaces become explicit `scf.for` loops. This is a **large abstraction drop**—we've gone from "compute matmul on tensors" to "three nested loops with explicit memory loads, arithmetic, and stores." But this explicitness enables loop-level optimizations (LICM, later auto-vectorization in LLVM).
 
-**Stage 4: Loop Optimizations** (LICM). With explicit loops, apply loop-invariant code motion:
+**Why Bufferize After Fusion?** This ordering is critical:
+- **Tensor-based fusion** works on mathematical operations without worrying about memory layout or aliasing
+- Bufferization happens **after** fusion has eliminated intermediate tensors
+- The resulting memref code has fewer allocations than pre-fusion code would have
+
+If we bufferized before fusion, we'd need complex alias analysis to prove fusion safety. Tensor semantics make fusion straightforward.
+
+**Stage 5: Loop Optimizations** (LICM). With explicit loops, apply loop-invariant code motion:
 
 ```mlir
 // Before LICM
@@ -720,27 +748,27 @@ scf.for %i = ... {
 
 This stage reduces redundant computation, preparing loops for vectorization (smaller loop bodies vectorize more efficiently).
 
-**Stage 5: Vectorization** (Defer to LLVM). Chapter 10's pipeline prepares loops for LLVM's auto-vectorizer but doesn't explicitly generate vector dialect operations:
+**Stage 6: Vectorization** (Defer to LLVM). Chapter 10's pipeline prepares loops for LLVM's auto-vectorizer but doesn't explicitly generate vector dialect operations:
 
 ```mlir
-// After Stage 4: Clean scalar loops ready for LLVM
+// After Stage 5: Clean scalar loops ready for LLVM
 scf.for %i = %c0 to %c128 step %c1 {
   %val = memref.load %input[%i] : memref<128xf32>
   %squared = arith.mulf %val, %val : f32
   memref.store %squared, %output[%i] : memref<128xf32>
 }
 
-// Stage 5: Convert any existing vector ops to SCF (cleanup)
+// Stage 6: Convert any existing vector ops to SCF (cleanup)
 pm.addPass(mlir::createConvertVectorToSCFPass());
 pm.addPass(mlir::createCanonicalizerPass());
 
-// After Stage 6: LLVM's auto-vectorizer (with -O3) converts to SIMD
+// After Stage 7: LLVM's auto-vectorizer (with -O3) converts to SIMD
 // This happens in the ExecutionEngine's LLVM optimization pipeline
 ```
 
 The `createConvertVectorToSCFPass()` handles any vector operations that might exist (from earlier stages or manual insertion), but the main vectorization happens through LLVM's auto-vectorizer when the ExecutionEngine compiles with optimization level 3 (`makeOptimizingTransformer(3, 0, nullptr)`). LLVM analyzes the scalar loops and automatically generates AVX2/AVX-512 instructions where profitable.
 
-**Stage 6: Lower to LLVM** (Standard Dialects → LLVM). The final stage converts all high-level dialects to LLVM IR:
+**Stage 7: Lower to LLVM** (Standard Dialects → LLVM). The final stage converts all high-level dialects to LLVM IR:
 
 - **Vector → LLVM**: Convert any vector operations to LLVM vector intrinsics (first, before other conversions)
 - **SCF → CF**: Convert structured control flow (`scf.for`, `scf.if`) to unstructured control flow graph (basic blocks, branches)
@@ -753,22 +781,31 @@ After this stage, the ModuleOp contains only LLVM dialect operations—ready for
 
 **Why This Order?** The pipeline's ordering is deliberate:
 
-1. **High-level optimizations first**: Fusion works better on structured ops (Linalg) than loops; lower too early and you miss fusion opportunities
-2. **Lower gradually**: Multi-stage lowering (NN → Linalg—you can't apply these to Linalg ops
-4. **Canonicalize frequently**: Each major transformation creates cleanup opportunities; running canonicalizer prevents IR bloat
-5. **Vectorization via LLVM**: Rather than explicit vector dialect IR, rely on LLVM's mature auto-vectorizer (enabled by `-O3` in ExecutionEngine)
+1. **High-level optimizations first**: Fusion works better on structured ops (Linalg on tensors) than loops; lower too early and you miss fusion opportunities
+2. **Tensor-based optimization**: Tensors provide functional semantics (no aliasing) that make fusion analysis simple and safe
+3. **Bufferize after fusion**: Convert tensors to memrefs only after eliminating intermediate tensors through fusion
+4. **Lower gradually**: Multi-stage lowering (NN → Linalg → MemRef → SCF → CF → LLVM) exposes different optimization opportunities at each level
+5. **Canonicalize frequently**: Each major transformation creates cleanup opportunities; running canonicalizer prevents IR bloat
+6. **Loop optimizations on explicit loops**: LICM requires visible loop structure (SCF dialect)
+7. **Vectorization via LLVM**: Rather than explicit vector dialect IR, rely on LLVM's mature auto-vectorizer (enabled by `-O3` in ExecutionEngine)
 
-Swapping stages breaks optimizations. For example, lowering to loops before fusion prevents fusion (fusion patterns match Linalg ops, not SCF loops). Running LICM before lowering to loops would fail (LICM needs explicit loop structure)
-Swapping stages breaks optimizations. For example, lowering to loops before fusion prevents fusion (fusion patterns match Linalg ops, not SCF loops). Vectorizing before LICM might miss hoisting opportunities that would enable better vectorization. The pipeline is the result of understanding optimization interactions and MLIR's dialect abstractions.
+Swapping stages breaks optimizations. Examples:
+- **Bufferize before fusion**: Would require complex alias analysis to prove fusion safety; tensor semantics make this trivial
+- **Lower to loops before fusion**: Fusion patterns match Linalg ops, not SCF loops
+- **Run LICM before loop lowering**: LICM needs explicit loop structure (won't find Linalg operations)
+- **Vectorize before LICM**: Might miss hoisting opportunities that would enable better vectorization
+
+The pipeline reflects deep understanding of optimization interactions and MLIR's dialect abstractions. The tensor-first approach (Chapters 5-10) is the modern best practice.
 
 **Pipeline Invariants and Debugging**. Each stage maintains invariants:
 
-- After Stage 1: All NN operations converted to standard dialects
-- After Stage 2: Producer-consumer pairs fused where legal
-- After Stage 3: All Linalg operations lowered to explicit loops
-- After Stage 4: Any vector operations converted to SCF
-- After Stage 6: Only LLVM dialect remains (auto-vectorization happens during LLVM optimization in ExecutionEngine)erted to vector operations
-- After Stage 6: Only LLVM dialect remains
+- After Stage 1: All NN operations converted to standard dialects (tensor-based)
+- After Stage 2: Producer-consumer pairs fused where legal (still tensor-based)
+- After Stage 3: All tensors converted to memrefs, function signatures use output parameters
+- After Stage 4: All Linalg operations lowered to explicit loops (on memrefs)
+- After Stage 5: Loop-invariant computations hoisted
+- After Stage 6: Any vector operations converted to SCF
+- After Stage 7: Only LLVM dialect remains (auto-vectorization happens during LLVM optimization in ExecutionEngine)
 
 When debugging, verify invariants at each stage using `-mlir-print-ir-after-all`:
 

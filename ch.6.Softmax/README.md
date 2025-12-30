@@ -1,14 +1,14 @@
-# Chapter 6: Softmax with Math Dialect
+# Chapter 6: Softmax with Tensor Reductions
 
-This chapter demonstrates the **Math dialect** for mathematical functions and implements the softmax activation function using a numerically stable three-pass algorithm.
+This chapter demonstrates **tensor-first softmax** using `linalg.reduce` for reductions and `linalg.generic` for element-wise operations, implementing the numerically stable softmax activation function.
 
 ## What You'll Learn
 
-- **Math Dialect**: Using `math.exp` and other mathematical operations
-- **Multi-Pass Algorithms**: Breaking complex operations into sequential passes
+- **Linalg Reductions**: Using `linalg.reduce` for max and sum operations
+- **Multi-Pass Tensor Algorithm**: Four functional passes with tensors
+- **Math Dialect**: Using `math.exp` for exponential function
 - **Numerical Stability**: Avoiding overflow with max subtraction technique
-- **Reduction Patterns**: Finding maximum values and computing sums
-- **Loop-Carried Variables**: Using `scf.for` with iteration arguments
+- **Tensor Operations**: Element-wise operations with `linalg.generic`
 
 ## The Kernel: Softmax
 
@@ -28,191 +28,196 @@ output[i] = exp(input[i] - max_val) / sum(exp(input[j] - max_val))
 
 Subtracting the maximum value before `exp` prevents overflow while giving the same result.
 
-## Three-Pass Algorithm
+## Tensor-First Four-Pass Algorithm
 
-### Pass 1: Find Maximum Value
+### Pass 1: Find Maximum Value with linalg.reduce
 ```mlir
-%max = scf.for %i = %c0 to %size step %c1 
-       iter_args(%current_max = %neg_inf) -> (f32) {
-  %val = memref.load %input[%i] : memref<?xf32>
-  %new_max = arith.maximumf %current_max, %val : f32
-  scf.yield %new_max : f32
-}
+%neg_inf = arith.constant 0xFF800000 : f32
+%init_max = tensor.from_elements %neg_inf : tensor<f32>
+
+%max_tensor = linalg.reduce ins(%input : tensor<?xf32>)
+                            outs(%init_max : tensor<f32>)
+                            dimensions = [0]
+  (%in: f32, %init: f32) {
+    %new_max = arith.maximumf %in, %init : f32
+    linalg.yield %new_max : f32
+  }
+%max_val = tensor.extract %max_tensor[] : tensor<f32>
 ```
 
-### Pass 2: Compute exp(x - max) and Sum
+**Key Concepts:**
+- `linalg.reduce`: Reduces a tensor along specified dimensions
+- `tensor.from_elements`: Creates scalar tensor with initial value
+- `tensor.extract`: Extracts scalar value from 0-d tensor
+- Functional: No mutation, returns new tensor
+
+### Pass 2: Compute exp(x - max) with linalg.generic
 ```mlir
-%sum = scf.for %i = %c0 to %size step %c1 
-       iter_args(%current_sum = %c0_f32) -> (f32) {
-  %val = memref.load %input[%i] : memref<?xf32>
-  %shifted = arith.subf %val, %max : f32
+%empty = tensor.empty(%size) : tensor<?xf32>
+
+%exp_tensor = linalg.generic {
+  indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>],
+  iterator_types = ["parallel"]
+} ins(%input : tensor<?xf32>) outs(%empty : tensor<?xf32>) {
+^bb0(%in: f32, %out: f32):
+  %shifted = arith.subf %in, %max_val : f32
   %exp_val = math.exp %shifted : f32      // ← Math dialect!
-  memref.store %exp_val, %temp[%i] : memref<?xf32>
-  %new_sum = arith.addf %current_sum, %exp_val : f32
-  scf.yield %new_sum : f32
+  linalg.yield %exp_val : f32
+} -> tensor<?xf32>
+```
+
+**Key Concepts:**
+- `linalg.generic`: Element-wise operation on tensors
+- `tensor.empty`: Allocates uninitialized tensor for output
+- `math.exp`: Mathematical exponential function
+- Parallel iterator: All elements processed independently
+
+### Pass 3: Sum exp values with linalg.reduce
+```mlir
+%zero = arith.constant 0.0 : f32
+%init_sum = tensor.from_elements %zero : tensor<f32>
+
+%sum_tensor = linalg.reduce ins(%exp_tensor : tensor<?xf32>)
+                           outs(%init_sum : tensor<f32>)
+                           dimensions = [0]
+  (%in: f32, %init: f32) {
+    %new_sum = arith.addf %in, %init : f32
+    linalg.yield %new_sum : f32
+  }
+%sum_val = tensor.extract %sum_tensor[] : tensor<f32>
+```
+
+### Pass 4: Normalize with linalg.generic
+```mlir
+%result = linalg.generic {
+  indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>],
+  iterator_types = ["parallel"]
+} ins(%exp_tensor : tensor<?xf32>) outs(%empty2 : tensor<?xf32>) {
+^bb0(%in: f32, %out: f32):
+  %normalized = arith.divf %in, %sum_val : f32
+  linalg.yield %normalized : f32
+} -> tensor<?xf32>
+```
+
+## Function Signature: Tensor-First
+
+```mlir
+func.func @softmax(%input: tensor<?xf32>) -> tensor<?xf32> {
+  // Four-pass algorithm: find max, compute exp, sum, normalize
+  // All operations on tensors (functional, immutable)
+  return %result : tensor<?xf32>
 }
 ```
 
-### Pass 3: Normalize
+After bufferization, this becomes:
 ```mlir
-scf.for %i = %c0 to %size step %c1 {
-  %exp_val = memref.load %temp[%i] : memref<?xf32>
-  %normalized = arith.divf %exp_val, %sum : f32
-  memref.store %normalized, %output[%i] : memref<?xf32>
+func.func @softmax(%input: memref<?xf32>, %output: memref<?xf32>) {
+  // Return value converted to out-parameter
+  return
 }
 ```
 
-## Key MLIR Concepts
+## Why Tensor-First for Softmax?
 
-### Loop-Carried Variables
+### 1. **Industry Standard Pattern**
+- Torch-MLIR, IREE, StableHLO all use tensor reductions
+- `linalg.reduce` is the standard way to express reductions
+- Matches PyTorch/JAX high-level semantics
 
-`scf.for` can carry values across iterations:
+### 2. **Better Optimization**
+- Compiler can fuse passes (e.g., exp + sum into single loop)
+- Parallel reduction patterns recognized by optimizer
+- Bufferization chooses optimal memory layout
 
-```mlir
-%result = scf.for %i = %start to %end step %step 
-          iter_args(%arg = %init) -> (f32) {
-  // Use %arg (value from previous iteration)
-  %new_val = ... compute using %arg ...
-  scf.yield %new_val : f32  // Pass to next iteration
-}
-// %result contains the final value
-```
+### 3. **Cleaner Semantics**
+- No explicit loops or temporary buffers in high-level IR
+- Reduction intent is explicit (`linalg.reduce`)
+- Element-wise operations clearly parallel
 
-This is how we implement reductions (max, sum) without mutation.
+### 4. **Composability**
+- Easy to extend (e.g., add masking, axis parameter)
+- Works with higher-dimensional tensors
+- Can fuse with other tensor operations
 
-### Two Styles for Building `scf.for` Loops
-
-MLIR provides two ways to construct `scf.for` loops in C++. Chapter 6 uses the **lambda style** because it requires loop-carried variables.
-
-#### Style 1: Multi-Step Construction (Chapter 5 approach)
-
-Good for simple loops without loop-carried variables:
-
-```cpp
-// Step 1: Create the loop
-auto forOp = builder.create<scf::ForOp>(loc, c0, size, c1);
-
-// Step 2: Set insertion point inside loop body
-builder.setInsertionPointToStart(forOp.getBody());
-
-// Step 3: Get induction variable
-Value i = forOp.getInductionVar();
-
-// Step 4: Build loop body operations
-Value a = builder.create<memref::LoadOp>(loc, A, ValueRange{i});
-Value result = builder.create<arith::AddFOp>(loc, a, b);
-builder.create<memref::StoreOp>(loc, result, C, ValueRange{i});
-
-// Step 5: Return to parent level
-builder.setInsertionPointAfter(forOp);
-```
-
-**Pros:** 
-- Clear step-by-step construction
-- Easy to debug
-- Good for learning basics
-
-**Cons:**
-- More verbose
-- Manual insertion point management
-- Cannot easily use loop-carried variables
-
-#### Style 2: Lambda/Callback Construction (Chapter 6 approach)
-
-**Required** for loops with loop-carried variables (reductions):
-
-```cpp
-auto findMaxLoop = builder.create<scf::ForOp>(
-    loc, c0, size, c1, 
-    ValueRange{negInf},  // Initial value for iter_args
-    [&](OpBuilder& b, Location loc, Value i, ValueRange iterArgs) {
-        // Lambda receives: builder, location, induction var, iteration args
-        Value currentMax = iterArgs[0];  // Access loop-carried value
-        Value val = b.create<memref::LoadOp>(loc, input, ValueRange{i});
-        Value newMax = b.create<arith::MaximumFOp>(loc, currentMax, val);
-        b.create<scf::YieldOp>(loc, ValueRange{newMax});  // Must yield!
-    }
-);
-Value maxVal = findMaxLoop.getResult(0);  // Get final result
-```
-
-**Pros:**
-- Concise, functional style
-- Automatic insertion point management
-- **Only way** to handle `iter_args` easily
-- Lambda captures outer scope variables
-
-**Cons:**
-- Less explicit about control flow
-- Callback syntax may be unfamiliar
-
-#### When to Use Each
-
-| Use Case | Style | Example |
-|----------|-------|---------|
-| Simple iteration (no reduction) | Either | Element-wise operations |
-| Reduction (max, sum, product) | Lambda | **Required** for iter_args |
-| Complex body (50+ lines) | Multi-step | Easier to structure |
-| Multiple nested loops | Lambda | Less indentation chaos |
-
-#### Generated MLIR Comparison
-
-Both styles produce valid MLIR, but only the lambda style can produce loops with `iter_args`:
-
-**Without iter_args (Chapter 5):**
-```mlir
-scf.for %i = %c0 to %size step %c1 {
-  %val = memref.load %A[%i]
-  memref.store %val, %C[%i]
-}
-```
-
-**With iter_args (Chapter 6):**
-```mlir
-%result = scf.for %i = %c0 to %size step %c1 
-          iter_args(%acc = %init) -> (f32) {
-  %val = memref.load %input[%i]
-  %new_acc = arith.addf %acc, %val
-  scf.yield %new_acc : f32
-}
-```
-
-The lambda style in Chapter 6 enables functional-style programming where values flow through iterations, essential for implementing reductions like finding maximum or computing sums.
-
-### Math Dialect Lowering
-
-**math-to-libm pass** converts math operations to C library calls:
-
-```mlir
-// Before lowering
-%exp = math.exp %x : f32
-
-// After math-to-libm
-%exp = llvm.call @expf(%x) : (f32) -> f32
-```
-
-At link time, this calls the standard C library's `expf()` function.
-
-**Alternative**: `math-to-llvm` pass uses polynomial approximations (inline, faster, less accurate).
-
-## Lowering Pipeline
+## The Modern Pipeline
 
 ```
-High-Level MLIR
-  (scf.for, math.exp)
-    ↓ canonicalize
-  (simplify)
-    ↓ math-to-libm
-  (math.exp → llvm.call @expf)
-    ↓ scf-to-cf
-  (scf.for → cf.br branches)
-    ↓ convert-to-llvm
-  (all dialects → llvm.*)
-    ↓ mlir-translate
-LLVM IR
-    ↓ JIT compile
-Native Code (links with libm)
+High-Level Tensor IR                                    (Functional)
+  ├─ linalg.reduce (find max, compute sum)
+  ├─ linalg.generic (exp, normalize)
+  ├─ tensor.empty, tensor.extract
+  └─ math.exp
+          ↓ [Canonicalize]
+          ↓ [One-Shot Bufferize]
+Bufferized IR                                           (Imperative)
+  ├─ memref operations
+  ├─ linalg.generic on memrefs
+  └─ Function boundaries: out-parameters
+          ↓ [Linalg-to-Loops]
+Loop IR
+  ├─ scf.for loops
+  ├─ memref.load/store
+  └─ math.exp
+          ↓ [Math-to-Libm/LLVM]
+          ↓ [SCF-to-CF]
+          ↓ [Convert to LLVM]
+LLVM Dialect
+  ├─ llvm.* instructions
+  ├─ llvm.call @expf (libm)
+  └─ cf.br branches
+          ↓ [LLVM Translation]
+Machine Code                                            (Executable)
 ```
+
+## Comparison: Tensor-First vs Direct Loops
+
+| Aspect | Tensor-First (Chapter 6) | Direct SCF (Old) |
+|--------|-------------------------|------------------|
+| **Reductions** | `linalg.reduce` (declarative) | `scf.for` with `iter_args` |
+| **Element-wise** | `linalg.generic` (parallel) | Explicit `scf.for` loops |
+| **Function sig** | `tensor<?xf32> -> tensor<?xf32>` | `(memref, memref) -> ()` |
+| **Temp buffers** | Automatic (bufferization) | Manual `memref.alloca` |
+| **Optimization** | Fusion, parallelization | Limited |
+| **Industry** | ✅ Standard (Torch-MLIR, IREE) | ❌ Low-level |
+
+## Implementation Files
+
+### `ir.cpp` - Tensor-First Softmax IR Generation
+- Creates 4-pass algorithm with tensor operations
+- Uses `linalg.reduce` for max and sum reductions
+- Uses `linalg.generic` for exp and normalization
+- Function returns `tensor<?xf32>` (functional)
+
+Key points:
+- `tensor.from_elements`: Creates scalar tensor for reduction init
+- `tensor.extract`: Extracts scalar from 0-d tensor
+- `linalg.reduce`: Reduces tensor along dimension 0
+- Affine maps for element-wise indexing
+
+### `lowering.cpp` - Bufferization and Lowering Pipeline
+- Registers bufferization interfaces for tensor operations
+- Configures One-Shot Bufferize with function boundary handling
+- Converts linalg to loops, math to libm calls
+- Full pipeline: Tensor → MemRef → Loops → LLVM
+
+Passes:
+1. Canonicalize
+2. One-Shot Bufferize
+3. Buffer-Results-To-Out-Params
+4. Linalg-To-Loops
+5. Math-To-Libm/LLVM
+6. SCF-To-CF
+7. Convert-To-LLVM
+
+### `jit.cpp` - JIT Compilation
+- Compiles tensor-first softmax to native code
+- After bufferization, function signature becomes memref out-parameter
+- Links with libm for `expf` function
+- Demonstrates end-to-end execution
+
+### `bindings.cpp` - Python Bindings
+- Already compatible with tensor-first architecture
+- Wraps memref interface (after bufferization)
 
 ## Usage
 
@@ -243,6 +248,10 @@ Or rebuild everything:
 cmake --build --preset x64-release
 ```
 
+probs = ch6_softmax.softmax(x)
+# Result: still [0.09, 0.24, 0.67] - numerically stable!
+```
+
 ## Test
 
 ```bash
@@ -255,94 +264,49 @@ Expected output:
 - ✓ Large values handled correctly (numerical stability)
 - ✓ Edge cases (zeros) work
 - ✓ Random values match NumPy
-- Performance benchmark comparison
 
 ## Comparison with Chapter 5
 
 | Aspect | Chapter 5 (SAXPY) | Chapter 6 (Softmax) |
 |--------|-------------------|---------------------|
-| Operation | Element-wise linear | Non-linear with reduction |
-| Dialects | SCF, Arith | SCF, Arith, **Math** |
-| Algorithm | Single pass | Three passes |
-| Key Feature | Simple loops | Loop-carried variables |
+| Architecture | Tensor-first | Tensor-first |
+| Operation | Element-wise linear | Non-linear with reductions |
+| Linalg Ops | `linalg.generic` only | `linalg.reduce` + `linalg.generic` |
+| Algorithm | Single pass | Four passes |
+| Key Feature | Parallel element-wise | Reductions + element-wise |
 | Math Ops | +, × | +, ×, ÷, **exp**, max |
 | Numerical Concern | None | Overflow prevention |
-| Temp Storage | None | Needed for exp values |
 
-## Why Three Passes?
+## Why Four Passes?
 
 **Can't we do it in one pass?**
 
-No, because we need the maximum value *before* computing exponentials:
-1. First pass: Find max (need to see all values)
-2. Second pass: Now we can safely compute exp(x - max)
-3. Third pass: Normalize using the sum
+No, because:
+1. **Pass 1 (Find max)**: Need maximum value *before* computing exponentials
+2. **Pass 2 (Compute exp)**: Can only compute exp(x - max) after knowing max
+3. **Pass 3 (Sum)**: Need sum of all exp values *before* normalizing
+4. **Pass 4 (Normalize)**: Can only divide by sum after computing it
 
-This demonstrates an important pattern: some algorithms require multiple passes over data.
+This demonstrates that some algorithms inherently require multiple passes. The tensor-first approach makes these dependencies explicit.
 
-## Exercises
+## Next Steps
 
-- **Experiment**: Try using `math-to-llvm` **only** (remove `math-to-libm`) to see performance/accuracy trade-offs
-- **Experiment**: Try other math functions (log, sin, cos, sqrt, etc.)
-- **Challenge**: Implement log-softmax (more numerically stable for ML applications)
+- **Chapter 7**: Neural network operations (ReLU, batch normalization)
+- **Chapter 8**: Custom dialects for domain-specific operations
+- **Beyond**: Multi-dimensional tensors, tiling, GPU acceleration
+
+## Key Takeaways
+
+1. **linalg.reduce**: Standard pattern for reductions (max, sum, product)
+2. **Multi-pass algorithms**: Some operations require sequential stages
+3. **Math dialect**: Mathematical functions (`exp`, `log`, etc.) with proper lowering
+4. **Numerical stability**: Subtract max before exp to prevent overflow
+5. **Tensor-first**: Even complex algorithms benefit from high-level tensor representation
 
 ---
 
-## Common Issues and Solutions
-
-### Issue 1: "failed to legalize operation 'math.exp'"
-
-**Error message:**
-```
-error: failed to legalize operation 'math.exp' that was explicitly marked illegal
-Pass manager failed
-```
-
-**What went wrong:**
-The initial lowering pipeline only included `math-to-libm` pass, but this pass alone doesn't fully convert math operations to LLVM. The pass manager was trying to convert everything to LLVM dialect, but `math.exp` operations were still present and marked as illegal in the LLVM conversion target.
-
-**Why it failed:**
-MLIR's conversion infrastructure uses a "target legality" system. When we run `convert-*-to-llvm` passes, they mark certain operations as illegal (must be converted). However:
-1. `math-to-libm` creates function declarations for libm calls but doesn't always succeed for all math ops
-2. Without a fallback, unconverted math operations remain illegal
-3. The conversion fails because no pass can handle these remaining operations
-
-**The fix:**
-Add **both** `math-to-llvm` and `math-to-libm` passes in sequence:
-
-```cpp
-// Phase 2: Math to Libm
-pm.addPass(createConvertMathToLibmPass());
-
-// Phase 3: Math to LLVM (for remaining math ops)
-pm.addPass(createConvertMathToLLVMPass());
-```
-
-This creates a two-tier strategy:
-- First, try to lower to libm calls (more accurate, uses standard library)
-- Then, convert any remaining math ops to LLVM intrinsics or polynomial approximations
-
-**Key lesson:** When lowering dialects, always provide a complete lowering path. If one pass doesn't handle all cases, add fallback passes.
-
-### Issue 2: Missing headers in bindings.cpp
-
-**Error messages:**
-```
-error: variable has incomplete type 'mlir::MLIRContext'
-error: no member named 'func' in namespace 'mlir'
-error: no member named 'createSoftmaxModule' in namespace 'mlir'
-```
-
-**What went wrong:**
-The bindings file had forward declarations but missing the actual header includes for MLIR types and dialects.
-
-**The fix:**
-Add all necessary MLIR includes:
-
-```cpp
-#include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+**Previous**: [Chapter 5 - Vector Operations](../ch.5.Vector-ops/README.md)  
+**Next**: [Chapter 7 - Neural Operations](../ch.7.Neural-ops/README.md)
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"

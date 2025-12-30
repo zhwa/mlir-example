@@ -15,43 +15,45 @@ include "mlir/Interfaces/InferTypeOpInterface.td"
 // Element-wise Operations
 //===----------------------------------------------------------------------===//
 
-def NN_AddOp : NN_Op<"add"> {
+def NN_AddOp : NN_Op<"add", [Pure, SameOperandsAndResultType]> {
   let summary = "element-wise addition";
   let description = [{
-    Performs element-wise addition of two memrefs: `output = lhs + rhs`
+    Performs element-wise addition of two tensors: `result = lhs + rhs`
 
     Example:
     ```mlir
-    nn.add %lhs, %rhs, %output : memref<4xf32>, memref<4xf32>, memref<4xf32>
+    %result = nn.add %lhs, %rhs : tensor<4xf32>
     ```
   }];
 
-  let arguments = (ins AnyMemRef:$lhs, AnyMemRef:$rhs, AnyMemRef:$output);
+  let arguments = (ins AnyTensor:$lhs, AnyTensor:$rhs);
+  let results = (outs AnyTensor:$result);
 
-  let assemblyFormat = "$lhs `,` $rhs `,` $output attr-dict `:` type($lhs) `,` type($rhs) `,` type($output)";
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($result)";
 }
 
-def NN_MulOp : NN_Op<"mul"> {
+def NN_MulOp : NN_Op<"mul", [Pure, SameOperandsAndResultType]> {
   let summary = "element-wise multiplication";
   let description = [{
-    Performs element-wise multiplication: `output = lhs * rhs`
+    Performs element-wise multiplication: `result = lhs * rhs`
 
     Example:
     ```mlir
-    nn.mul %lhs, %rhs, %output : memref<4xf32>, memref<4xf32>, memref<4xf32>
+    %result = nn.mul %lhs, %rhs : tensor<4xf32>
     ```
   }];
 
-  let arguments = (ins AnyMemRef:$lhs, AnyMemRef:$rhs, AnyMemRef:$output);
+  let arguments = (ins AnyTensor:$lhs, AnyTensor:$rhs);
+  let results = (outs AnyTensor:$result);
 
-  let assemblyFormat = "$lhs `,` $rhs `,` $output attr-dict `:` type($lhs) `,` type($rhs) `,` type($output)";
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($result)";
 }
 
 //===----------------------------------------------------------------------===//
 // Matrix Operations
 //===----------------------------------------------------------------------===//
 
-def NN_MatMulOp : NN_Op<"matmul"> {
+def NN_MatMulOp : NN_Op<"matmul", [Pure]> {
   let summary = "matrix multiplication";
   let description = [{
     Performs matrix multiplication: `C = A @ B`
@@ -63,34 +65,36 @@ def NN_MatMulOp : NN_Op<"matmul"> {
 
     Example:
     ```mlir
-    nn.matmul %a, %b, %c : memref<2x3xf32>, memref<3x4xf32>, memref<2x4xf32>
+    %c = nn.matmul %a, %b : tensor<2x3xf32>, tensor<3x4xf32> -> tensor<2x4xf32>
     ```
   }];
 
-  let arguments = (ins AnyMemRef:$lhs, AnyMemRef:$rhs, AnyMemRef:$output);
+  let arguments = (ins AnyTensor:$lhs, AnyTensor:$rhs);
+  let results = (outs AnyTensor:$result);
 
-  let assemblyFormat = "$lhs `,` $rhs `,` $output attr-dict `:` type($lhs) `,` type($rhs) `,` type($output)";
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($lhs) `,` type($rhs) `->` type($result)";
 }
 
 //===----------------------------------------------------------------------===//
 // Activation Functions
 //===----------------------------------------------------------------------===//
 
-def NN_ReLUOp : NN_Op<"relu"> {
+def NN_ReLUOp : NN_Op<"relu", [Pure, SameOperandsAndResultType]> {
   let summary = "ReLU activation function";
   let description = [{
     Applies the Rectified Linear Unit activation function:
-    `output = max(0, input)`
+    `result = max(0, input)`
 
     Example:
     ```mlir
-    nn.relu %input, %output : memref<2x4xf32>, memref<2x4xf32>
+    %output = nn.relu %input : tensor<2x4xf32>
     ```
   }];
 
-  let arguments = (ins AnyMemRef:$input, AnyMemRef:$output);
+  let arguments = (ins AnyTensor:$input);
+  let results = (outs AnyTensor:$result);
 
-  let assemblyFormat = "$input `,` $output attr-dict `:` type($input) `,` type($output)";
+  let assemblyFormat = "$input attr-dict `:` type($result)";
 }
 
 def NN_SoftmaxOp : NN_Op<"softmax", [Pure, SameOperandsAndResultType]> {

@@ -1,16 +1,18 @@
 //===- jit.cpp - JIT Compilation for Softmax ----------------------------===//
 //
-// This file demonstrates JIT compilation and execution of softmax using
-// MLIR's ExecutionEngine.
+// This file demonstrates JIT compilation and execution of tensor-first softmax
+// using MLIR's ExecutionEngine with bufferization.
 //
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/ExecutionEngine/ExecutionEngine.h"
 #include "mlir/ExecutionEngine/OptUtils.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -31,13 +33,18 @@ LogicalResult applyLoweringPasses(ModuleOp module);
 // JIT Compilation Function
 //===----------------------------------------------------------------------===//
 
-/// JIT-compiles and executes softmax with dynamic shapes.
+/// JIT-compiles and executes softmax with tensor-first architecture.
 ///
 /// This function:
-///   1. Creates high-level MLIR IR (scf.for, math.exp)
-///   2. Applies lowering passes (math→libm, scf→cf, *→llvm)
-///   3. JIT compiles using ExecutionEngine
-///   4. Executes the compiled function
+///   1. Creates high-level tensor MLIR IR (linalg.reduce, linalg.generic)
+///   2. Applies bufferization to convert tensors → memrefs
+///   3. Applies lowering passes (linalg→loops, math→libm, scf→cf, *→llvm)
+///   4. JIT compiles using ExecutionEngine
+///   5. Executes the compiled function
+///
+/// Note: After bufferization, the function signature becomes:
+///   func @softmax(%input: memref<?xf32>, %output: memref<?xf32>)
+/// (return value converted to out-parameter by Buffer-Results-To-Out-Params)
 ///
 /// Args:
 ///   input: Input array

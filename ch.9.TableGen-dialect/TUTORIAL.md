@@ -4,6 +4,12 @@
 
 This tutorial provides a deep, operation-by-operation comparison between Chapter 8's Python approach and Chapter 9's TableGen/C++ approach for creating custom MLIR dialects.
 
+> **⚠️ IMPORTANT UPDATE (2024)**: This chapter has been migrated to use **tensor-based operations** (functional style with return values) for consistency with Chapters 5-8. The tutorial below was written for the original memref-based implementation (output parameter style). While the TableGen syntax and concepts remain identical, the actual implementation now uses:
+> - `%result = nn.add %lhs, %rhs : tensor<...>` (NEW - functional style)
+> - Instead of: `nn.add %lhs, %rhs, %output : memref<...>` (OLD - imperative style)
+> 
+> The tensor→memref conversion is handled automatically by the OneShotBufferize pass with proper interface registrations. See [bindings.cpp](src/bindings.cpp) for the modern implementation and [README.md](README.md) for the compilation pipeline.
+
 > **Note**: This tutorial references the original nested directory structure (`include/NN/`, `lib/NN/`, `lib/Conversion/`, `python/`) for pedagogical comparison with Chapter 8. The current Chapter 9 has been simplified to use flat directories (`inc/`, `src/`) and a PyTorch-like `forward()` API. The concepts remain identical - only the file organization changed.
 
 ---

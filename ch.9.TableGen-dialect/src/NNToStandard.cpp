@@ -32,26 +32,30 @@ struct NNAddOpLowering : public OpRewritePattern<AddOp> {
                                   PatternRewriter &rewriter) const override {
     // nn.add -> linalg.generic with arith.addf
     auto loc = op.getLoc();
-    auto outputType = cast<MemRefType>(op.getOutput().getType());
+    auto resultType = cast<RankedTensorType>(op.getResult().getType());
+    auto rank = resultType.getRank();
 
-    SmallVector<utils::IteratorType> iteratorTypes(outputType.getRank(), utils::IteratorType::parallel);
+    // Create empty output tensor
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(
+        loc, resultType.getShape(), resultType.getElementType());
 
-    rewriter.create<linalg::GenericOp>(
+    // Create linalg.generic for element-wise addition
+    SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
+    SmallVector<AffineMap> indexingMaps(3, rewriter.getMultiDimIdentityMap(rank));
+
+    Value result = rewriter.create<linalg::GenericOp>(
         loc, 
+        resultType,
         ValueRange{op.getLhs(), op.getRhs()},  // inputs
-        ValueRange{op.getOutput()},             // outputs
-        ArrayRef<AffineMap>{
-            rewriter.getMultiDimIdentityMap(outputType.getRank()),
-            rewriter.getMultiDimIdentityMap(outputType.getRank()),
-            rewriter.getMultiDimIdentityMap(outputType.getRank())
-        },
+        ValueRange{emptyTensor},                // outputs
+        indexingMaps,
         iteratorTypes,
         [&](OpBuilder &b, Location loc, ValueRange args) {
           Value sum = b.create<arith::AddFOp>(loc, args[0], args[1]);
           b.create<linalg::YieldOp>(loc, sum);
-        });
+        }).getResult(0);
 
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
@@ -66,26 +70,30 @@ struct NNMulOpLowering : public OpRewritePattern<MulOp> {
   LogicalResult matchAndRewrite(MulOp op,
                                   PatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
-    auto outputType = cast<MemRefType>(op.getOutput().getType());
+    auto resultType = cast<RankedTensorType>(op.getResult().getType());
+    auto rank = resultType.getRank();
 
-    SmallVector<utils::IteratorType> iteratorTypes(outputType.getRank(), utils::IteratorType::parallel);
+    // Create empty output tensor
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(
+        loc, resultType.getShape(), resultType.getElementType());
 
-    rewriter.create<linalg::GenericOp>(
+    // Create linalg.generic for element-wise multiplication
+    SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
+    SmallVector<AffineMap> indexingMaps(3, rewriter.getMultiDimIdentityMap(rank));
+
+    Value result = rewriter.create<linalg::GenericOp>(
         loc,
+        resultType,
         ValueRange{op.getLhs(), op.getRhs()},
-        ValueRange{op.getOutput()},
-        ArrayRef<AffineMap>{
-            rewriter.getMultiDimIdentityMap(outputType.getRank()),
-            rewriter.getMultiDimIdentityMap(outputType.getRank()),
-            rewriter.getMultiDimIdentityMap(outputType.getRank())
-        },
+        ValueRange{emptyTensor},
+        indexingMaps,
         iteratorTypes,
         [&](OpBuilder &b, Location loc, ValueRange args) {
           Value product = b.create<arith::MulFOp>(loc, args[0], args[1]);
           b.create<linalg::YieldOp>(loc, product);
-        });
+        }).getResult(0);
 
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
@@ -100,21 +108,25 @@ struct NNMatMulOpLowering : public OpRewritePattern<MatMulOp> {
   LogicalResult matchAndRewrite(MatMulOp op,
                                   PatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
-    auto outputType = cast<MemRefType>(op.getOutput().getType());
+    auto resultType = cast<RankedTensorType>(op.getResult().getType());
 
     // Create zero constant for initialization
-    auto zeroAttr = rewriter.getFloatAttr(outputType.getElementType(), 0.0);
-    auto zero = rewriter.create<arith::ConstantOp>(loc, zeroAttr);
+    auto zeroAttr = rewriter.getFloatAttr(resultType.getElementType(), 0.0);
+    Value zero = rewriter.create<arith::ConstantOp>(loc, zeroAttr);
 
-    // Fill output with zeros
-    rewriter.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{op.getOutput()});
+    // Create empty tensor and fill with zeros
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(
+        loc, resultType.getShape(), resultType.getElementType());
+    Value zeroTensor = rewriter.create<linalg::FillOp>(
+        loc, zero, emptyTensor).result();
 
     // Create linalg.matmul
-    rewriter.create<linalg::MatmulOp>(
-        loc, ValueRange{op.getLhs(), op.getRhs()},
-        ValueRange{op.getOutput()});
+    Value result = rewriter.create<linalg::MatmulOp>(
+        loc, resultType,
+        ValueRange{op.getLhs(), op.getRhs()},
+        ValueRange{zeroTensor}).getResult(0);
 
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
@@ -129,32 +141,35 @@ struct NNReLUOpLowering : public OpRewritePattern<ReLUOp> {
   LogicalResult matchAndRewrite(ReLUOp op,
                                   PatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
-    auto outputType = cast<MemRefType>(op.getOutput().getType());
+    auto resultType = cast<RankedTensorType>(op.getResult().getType());
+    auto rank = resultType.getRank();
 
     // Create zero constant
-    auto zeroAttr = rewriter.getFloatAttr(outputType.getElementType(), 0.0);
+    auto zeroAttr = rewriter.getFloatAttr(resultType.getElementType(), 0.0);
     auto zero = rewriter.create<arith::ConstantOp>(loc, zeroAttr);
 
-    SmallVector<utils::IteratorType> iteratorTypes(
-        outputType.getRank(),
-        utils::IteratorType::parallel);
+    // Create empty output tensor
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(
+        loc, resultType.getShape(), resultType.getElementType());
 
-    rewriter.create<linalg::GenericOp>(
+    // Create linalg.generic for ReLU
+    SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
+    SmallVector<AffineMap> indexingMaps(2, rewriter.getMultiDimIdentityMap(rank));
+
+    Value result = rewriter.create<linalg::GenericOp>(
         loc,
+        resultType,
         ValueRange{op.getInput()},
-        ValueRange{op.getOutput()},
-        ArrayRef<AffineMap>{
-            rewriter.getMultiDimIdentityMap(outputType.getRank()),
-            rewriter.getMultiDimIdentityMap(outputType.getRank())
-        },
+        ValueRange{emptyTensor},
+        indexingMaps,
         iteratorTypes,
         [&](OpBuilder &b, Location loc, ValueRange args) {
           // max(0, x)
           Value maxVal = b.create<arith::MaximumFOp>(loc, zero, args[0]);
           b.create<linalg::YieldOp>(loc, maxVal);
-        });
+        }).getResult(0);
 
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };

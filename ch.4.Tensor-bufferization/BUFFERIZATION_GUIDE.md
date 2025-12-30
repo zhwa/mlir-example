@@ -769,3 +769,234 @@ Expected progression:
 - **After buffer-results-to-out-params:** `func.func @gemm(%arg0: memref<?x?xf32>, ..., %arg2: memref<?x?xf32>)`
 
 - **After bufferization-to-memref:** All `bufferization.*` operations replaced with `memref.*` operations
+
+---
+
+# Part III: Best Practices & Modern MLIR Patterns
+
+## Best Practices for Tensor-First Architecture
+
+### When to Use Tensors vs MemRefs
+
+**Use Tensors (High-Level IR):**
+- ✅ Custom dialect operations (Chapter 8-9)
+- ✅ High-level transformations (fusion, tiling)
+- ✅ Operations that compose and transform
+- ✅ When matching ML framework semantics
+- ✅ Before optimization passes
+
+**Use MemRefs (Low-Level IR):**
+- ✅ After bufferization pass
+- ✅ Explicit memory management needed
+- ✅ Performance-critical inner loops
+- ✅ Direct LLVM lowering
+- ✅ C/C++ interop boundaries
+
+### The Modern MLIR Pipeline
+
+Production compilers follow this pattern:
+
+```
+┌─────────────────────────────────────────────────────┐
+│  1. High-Level IR (Tensors)                         │
+│     • Custom dialects with tensor types             │
+│     • Framework-specific operations                 │
+│     • Immutable, functional semantics               │
+└─────────────────┬───────────────────────────────────┘
+                  │
+                  ▼
+┌─────────────────────────────────────────────────────┐
+│  2. Tensor-Level Optimizations                      │
+│     • Operation fusion (multiple ops → single op)   │
+│     • Algebraic simplification                      │
+│     • Dead code elimination                         │
+│     • Shape propagation                             │
+└─────────────────┬───────────────────────────────────┘
+                  │
+                  ▼
+┌─────────────────────────────────────────────────────┐
+│  3. Bufferization (The Bridge)                      │
+│     • One-Shot Bufferize: tensor → memref           │
+│     • Buffer-Results-To-Out-Params: ABI adjustment  │
+│     • Bufferization-To-MemRef: finalize             │
+└─────────────────┬───────────────────────────────────┘
+                  │
+                  ▼
+┌─────────────────────────────────────────────────────┐
+│  4. MemRef-Level Optimizations                      │
+│     • Vectorization (SIMD instructions)             │
+│     • Loop tiling (cache optimization)              │
+│     • Memory layout optimization                    │
+│     • Parallel loop detection                       │
+└─────────────────┬───────────────────────────────────┘
+                  │
+                  ▼
+┌─────────────────────────────────────────────────────┐
+│  5. Lowering to Loops & LLVM                        │
+│     • Linalg → SCF loops                            │
+│     • SCF → Control Flow                            │
+│     • MemRef/Arith/Func → LLVM dialect              │
+└─────────────────┬───────────────────────────────────┘
+                  │
+                  ▼
+            [Native Code]
+```
+
+### Key Principle: Bufferize Late
+
+**Antipattern (Don't Do This):**
+```cpp
+// Bad: Define operations with memref types
+def MyOp : Op<"my_op"> {
+  let arguments = (ins MemRefOf<[F32]>:$input);
+  let results = (outs MemRefOf<[F32]>:$output);
+}
+```
+
+**Best Practice (Do This):**
+```cpp
+// Good: Define operations with tensor types
+def MyOp : Op<"my_op"> {
+  let arguments = (ins TensorOf<[F32]>:$input);
+  let results = (outs TensorOf<[F32]>:$output);
+}
+
+// Bufferization happens automatically in the pipeline
+// Your operation doesn't need to know about memory management
+```
+
+### Why Tensor-First Wins
+
+**Optimization Opportunities:**
+
+Tensor operations are easier to optimize:
+```mlir
+// Two separate tensor operations - easy to fuse!
+%tmp = custom.op1 ins(%A : tensor<?xf32>) -> tensor<?xf32>
+%result = custom.op2 ins(%tmp : tensor<?xf32>) -> tensor<?xf32>
+
+// Compiler can fuse into single operation:
+%result = custom.fused_op1_op2 ins(%A : tensor<?xf32>) -> tensor<?xf32>
+// No intermediate allocation needed!
+```
+
+With memrefs, this is harder:
+```mlir
+// Two separate memref operations - requires alias analysis
+%tmp = memref.alloc() : memref<?xf32>
+custom.op1 ins(%A : memref<?xf32>) outs(%tmp : memref<?xf32>)
+custom.op2 ins(%tmp : memref<?xf32>) outs(%result : memref<?xf32>)
+// Compiler must prove %tmp is not aliased before eliminating
+```
+
+**Framework Alignment:**
+
+ML frameworks use tensors:
+```python
+# PyTorch
+output = model(input)  # Returns new tensor
+
+# TensorFlow  
+output = tf.matmul(A, B)  # Returns new tensor
+
+# JAX
+output = jax.nn.relu(input)  # Returns new tensor
+```
+
+Tensor-based MLIR matches this naturally:
+```mlir
+%output = my_dialect.operation(%input) -> tensor<?xf32>
+```
+
+### Real-World Example: Torch-MLIR
+
+Torch-MLIR (PyTorch's MLIR backend) follows this pattern:
+
+```mlir
+// 1. High-level: Torch dialect with tensors
+%result = torch.aten.relu %input : !torch.tensor -> !torch.tensor
+
+// 2. Lower to Linalg (still tensors)
+%result = linalg.generic {...} ins(%input : tensor<?xf32>) -> tensor<?xf32>
+
+// 3. Bufferize (One-Shot Bufferize)
+%result_memref = memref.alloc() : memref<?xf32>
+linalg.generic {...} ins(%input_memref) outs(%result_memref)
+
+// 4. Lower to loops and LLVM
+// (as we've seen in this chapter)
+```
+
+### Guidelines for New Dialects
+
+When designing custom operations (Chapter 8-9):
+
+1. **Start with tensors**: Define your operations with tensor types
+2. **Mark as Pure**: Use `Pure` trait if operations have no side effects
+3. **Let bufferization handle memory**: Don't manually manage allocations
+4. **Provide lowering patterns**: Lower to Linalg/Arith with tensor types
+5. **Trust the pipeline**: Bufferization will convert to memrefs correctly
+
+Example:
+```tablegen
+// Custom dialect operation (Chapter 8-9 pattern)
+def MyDialect_ReluOp : MyDialect_Op<"relu", [Pure]> {
+  let summary = "ReLU activation function";
+  let arguments = (ins TensorOf<[F32]>:$input);
+  let results = (outs TensorOf<[F32]>:$result);
+  
+  // Lower to Linalg tensors, not memrefs!
+  let hasCanonicalizer = 1;
+}
+```
+
+### Performance Considerations
+
+**Common Question**: "Won't tensors be slower due to extra allocations?"
+
+**Answer**: No! One-Shot Bufferize is smart:
+
+1. **In-Place Updates**: Bufferization inserts allocations only when necessary
+2. **Alias Analysis**: Reuses buffers when safe
+3. **Copy Elimination**: Removes redundant copies
+4. **Same Final Code**: Both tensor and memref approaches produce identical machine code
+
+The tensor approach gives you:
+- ✅ Better optimization at high level
+- ✅ Same performance at low level
+- ✅ Cleaner code
+- ✅ Production-ready patterns
+
+### Migration Path (Chapters 5+)
+
+Starting from Chapter 5, you'll see this pattern consistently:
+
+```cpp
+// IR Generation (src/ir.cpp)
+auto tensorType = RankedTensorType::get(shape, f32);
+// Build operations with tensor types
+
+// Lowering Pipeline (src/lowering.cpp)
+pm.addPass(createMyDialectToLinalgPass());  // Still tensors
+pm.addPass(createCanonicalizer());           // Optimize tensors
+pm.addPass(bufferization::createOneShotBufferizePass());  // → memrefs
+pm.addPass(createConvertLinalgToLoopsPass());  // Lower memrefs
+```
+
+This is the **industry standard** and what you'll see in Chapters 5-14.
+
+### Summary: The Complete Picture
+
+You now understand:
+
+1. **Why both exist**: Tensors for optimization, memrefs for execution
+2. **When to use each**: Tensors at high level, memrefs after bufferization
+3. **How to convert**: One-Shot Bufferize with proper configuration
+4. **Production patterns**: Tensor-first architecture used in real compilers
+5. **The pipeline**: High-level → optimize → bufferize → low-level → codegen
+
+Armed with this knowledge, you're ready for Chapters 5+ where tensor-first architecture becomes the standard approach!
+
+---
+
+*End of Bufferization Guide. See Chapter 5+ for tensor-first patterns in practice.*

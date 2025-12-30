@@ -14,16 +14,16 @@ This chapter demonstrates how real-world MLIR projects define custom dialects us
 
 ## NN Dialect Operations
 
-The `nn` (Neural Network) dialect provides high-level memref-based operations:
+The `nn` (Neural Network) dialect provides high-level tensor-based operations:
 
 | Operation | Syntax | Description |
 |-----------|--------|-------------|
-| `nn.add` | `nn.add %a, %b, %out : memref<...>, memref<...>, memref<...>` | Element-wise addition |
-| `nn.mul` | `nn.mul %a, %b, %out : memref<...>, memref<...>, memref<...>` | Element-wise multiplication |
-| `nn.matmul` | `nn.matmul %a, %b, %out : memref<...>, memref<...>, memref<...>` | Matrix multiplication |
-| `nn.relu` | `nn.relu %x, %out : memref<...>, memref<...>` | ReLU activation |
+| `nn.add` | `%result = nn.add %a, %b : tensor<...>` | Element-wise addition |
+| `nn.mul` | `%result = nn.mul %a, %b : tensor<...>` | Element-wise multiplication |
+| `nn.matmul` | `%result = nn.matmul %a, %b : tensor<...>` | Matrix multiplication |
+| `nn.relu` | `%result = nn.relu %x : tensor<...>` | ReLU activation |
 
-**Note**: All operations use **output-parameter style** (memref-based) to avoid tensor bufferization complexity.
+**Note**: All operations use **functional tensor-based style** (returning values) for consistency with Chapters 5-8. The tensor→memref conversion is handled automatically by the OneShotBufferize pass.
 
 ## Usage
 
@@ -58,8 +58,25 @@ result = ch9.forward(C)
 - **TableGen/ODS**: Declarative operation definitions (~50 lines → ~1000 lines generated C++)
 - **OpBuilder**: Industrial-grade IR construction (same as Torch-MLIR, JAX, IREE)
 - **Pattern Rewriting**: Type-safe IR transformations in C++
+- **Tensor-First Design**: Modern MLIR approach with automatic bufferization
 - **Pythonic API**: `ch9.forward()` follows PyTorch conventions
 - **Graph Building**: Operations build computation graph lazily
+
+## Compilation Pipeline
+
+```
+NN Dialect (tensors)
+   ↓ createConvertNNToStandardPass()
+Linalg + Tensor (tensors)
+   ↓ OneShotBufferizePass()
+Linalg + MemRef (memrefs)
+   ↓ ConvertLinalgToLoopsPass()
+SCF + MemRef
+   ↓ ConvertToLLVM
+LLVM IR
+```
+
+The tensor→memref conversion is handled automatically using OneShotBufferize with proper interface registrations.
 
 ## Learn More
 

@@ -1,10 +1,9 @@
 #include "graph.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include <limits>
 
 using namespace mlir;
@@ -17,10 +16,9 @@ GraphOperation::GraphOperation(OpType t, std::vector<int> ins, std::vector<int64
 ComputationGraph::ComputationGraph(MLIRContext* ctx) : context(ctx), nextId(0) {
     context->getOrLoadDialect<func::FuncDialect>();
     context->getOrLoadDialect<arith::ArithDialect>();
-    context->getOrLoadDialect<memref::MemRefDialect>();
-    context->getOrLoadDialect<scf::SCFDialect>();
-    context->getOrLoadDialect<math::MathDialect>();
+    context->getOrLoadDialect<tensor::TensorDialect>();
     context->getOrLoadDialect<linalg::LinalgDialect>();
+    context->getOrLoadDialect<math::MathDialect>();
 }
 
 // Add a variable/tensor placeholder
@@ -75,85 +73,49 @@ int ComputationGraph::softmax(int input) {
 // Generate MLIR module from the computation graph
 ModuleOp ComputationGraph::generateMLIR(int outputId, const std::string& funcName) {
     OpBuilder builder(context);
-        auto module = ModuleOp::create(builder.getUnknownLoc());
-        builder.setInsertionPointToEnd(module.getBody());
+    auto module = ModuleOp::create(builder.getUnknownLoc());
+    builder.setInsertionPointToEnd(module.getBody());
 
-        // Collect all input operations
-        std::vector<int> inputIds;
-        for (const auto& op : operations) {
-            if (op.type == GraphOperation::OpType::Input) {
-                inputIds.push_back(op.id);
-            }
+    // Collect all input operations
+    std::vector<int> inputIds;
+    for (const auto& op : operations) {
+        if (op.type == GraphOperation::OpType::Input) {
+            inputIds.push_back(op.id);
         }
+    }
 
-        // Build function signature
-        std::vector<Type> inputTypes;
-        for (int inputId : inputIds) {
-            const auto& shape = operations[inputId].shape;
-            auto elemType = builder.getF32Type();
-            SmallVector<int64_t> mlirShape(shape.begin(), shape.end());
-            auto memrefType = MemRefType::get(mlirShape, elemType);
-            inputTypes.push_back(memrefType);
-        }
+    // Build function signature with tensors
+    std::vector<Type> inputTypes;
+    for (int inputId : inputIds) {
+        const auto& shape = operations[inputId].shape;
+        auto elemType = builder.getF32Type();
+        SmallVector<int64_t> mlirShape(shape.begin(), shape.end());
+        auto tensorType = RankedTensorType::get(mlirShape, elemType);
+        inputTypes.push_back(tensorType);
+    }
 
-        // Output type
-        const auto& outputShape = operations[outputId].shape;
-        SmallVector<int64_t> mlirOutputShape(outputShape.begin(), outputShape.end());
-        auto outputType = MemRefType::get(mlirOutputShape, builder.getF32Type());
-        inputTypes.push_back(outputType);
+    // Output type
+    const auto& outputShape = operations[outputId].shape;
+    SmallVector<int64_t> mlirOutputShape(outputShape.begin(), outputShape.end());
+    auto outputType = RankedTensorType::get(mlirOutputShape, builder.getF32Type());
 
-        auto funcType = builder.getFunctionType(inputTypes, {});
-        auto func = builder.create<func::FuncOp>(builder.getUnknownLoc(), funcName, funcType);
-        auto& entryBlock = *func.addEntryBlock();
-        builder.setInsertionPointToStart(&entryBlock);
+    auto funcType = builder.getFunctionType(inputTypes, {outputType});
+    auto func = builder.create<func::FuncOp>(builder.getUnknownLoc(), funcName, funcType);
+    auto& entryBlock = *func.addEntryBlock();
+    builder.setInsertionPointToStart(&entryBlock);
 
-        // Map input IDs to function arguments
-        std::unordered_map<int, Value> valueMap;
-        for (size_t i = 0; i < inputIds.size(); ++i) {
-            valueMap[inputIds[i]] = entryBlock.getArgument(i);
-        }
+    // Map input IDs to function arguments
+    std::unordered_map<int, Value> valueMap;
+    for (size_t i = 0; i < inputIds.size(); ++i) {
+        valueMap[inputIds[i]] = entryBlock.getArgument(i);
+    }
 
-        // Build the computation graph
-        std::vector<Value> funcArgs(entryBlock.args_begin(), entryBlock.args_end());
-        Value result = buildOperation(builder, builder.getUnknownLoc(), outputId, valueMap, funcArgs);
+    // Build the computation graph
+    std::vector<Value> funcArgs(entryBlock.args_begin(), entryBlock.args_end());
+    Value result = buildOperation(builder, builder.getUnknownLoc(), outputId, valueMap, funcArgs);
 
-        // Copy result to output buffer
-        Value outputBuffer = entryBlock.getArgument(inputIds.size());
-
-        // Create nested loops to copy data
-        const auto& shape = operations[outputId].shape;
-        if (shape.size() == 1) {
-            // 1D case
-            auto dim0 = builder.create<memref::DimOp>(builder.getUnknownLoc(), result, 0);
-            auto zero = builder.create<arith::ConstantIndexOp>(builder.getUnknownLoc(), 0);
-            auto one = builder.create<arith::ConstantIndexOp>(builder.getUnknownLoc(), 1);
-
-            builder.create<scf::ForOp>(builder.getUnknownLoc(), zero, dim0, one,
-                ValueRange{}, [&](OpBuilder& b, Location loc, Value i, ValueRange) {
-                    auto val = b.create<memref::LoadOp>(loc, result, ValueRange{i});
-                    b.create<memref::StoreOp>(loc, val, outputBuffer, ValueRange{i});
-                    b.create<scf::YieldOp>(loc);
-                });
-        } else if (shape.size() == 2) {
-            // 2D case
-            auto dim0 = builder.create<memref::DimOp>(builder.getUnknownLoc(), result, 0);
-            auto dim1 = builder.create<memref::DimOp>(builder.getUnknownLoc(), result, 1);
-            auto zero = builder.create<arith::ConstantIndexOp>(builder.getUnknownLoc(), 0);
-            auto one = builder.create<arith::ConstantIndexOp>(builder.getUnknownLoc(), 1);
-
-            builder.create<scf::ForOp>(builder.getUnknownLoc(), zero, dim0, one,
-                ValueRange{}, [&](OpBuilder& b, Location loc, Value i, ValueRange) {
-                    b.create<scf::ForOp>(loc, zero, dim1, one,
-                        ValueRange{}, [&](OpBuilder& b2, Location loc2, Value j, ValueRange) {
-                            auto val = b2.create<memref::LoadOp>(loc2, result, ValueRange{i, j});
-                            b2.create<memref::StoreOp>(loc2, val, outputBuffer, ValueRange{i, j});
-                            b2.create<scf::YieldOp>(loc2);
-                        });
-                    b.create<scf::YieldOp>(loc);
-                });
-        }
-
-    builder.create<func::ReturnOp>(builder.getUnknownLoc());
+    // Return result tensor
+    builder.create<func::ReturnOp>(builder.getUnknownLoc(), result);
     return module;
 }
 
@@ -206,217 +168,201 @@ Value ComputationGraph::buildOperation(OpBuilder& builder, Location loc, int opI
     return result;
 }
 
-// Build element-wise operations
+// Build element-wise operations using linalg.generic
 Value ComputationGraph::buildElementWiseOp(OpBuilder& builder, Location loc,
                                           Value lhs, Value rhs,
                                           GraphOperation::OpType opType) {
-    auto lhsType = mlir::cast<MemRefType>(lhs.getType());
-    auto resultType = lhsType;
+    auto lhsType = mlir::cast<RankedTensorType>(lhs.getType());
+    auto rank = lhsType.getRank();
 
-    // Allocate result buffer
-    SmallVector<Value> dynSizes;
-    for (int i = 0; i < lhsType.getRank(); ++i) {
-        if (lhsType.isDynamicDim(i)) {
-            dynSizes.push_back(builder.create<memref::DimOp>(loc, lhs, i));
+    // Create empty tensor for result
+    SmallVector<OpFoldResult> dynSizes;
+    for (int i = 0; i < rank; ++i) {
+        dynSizes.push_back(builder.create<tensor::DimOp>(loc, lhs, i).getResult());
+    }
+    Value empty = builder.create<tensor::EmptyOp>(loc, dynSizes, lhsType.getElementType());
+
+    // Create affine maps for indexing
+    auto identityMap = builder.getMultiDimIdentityMap(rank);
+    SmallVector<AffineMap> indexingMaps(3, identityMap); // lhs, rhs, out
+    SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
+
+    // Build linalg.generic operation
+    auto genericOp = builder.create<linalg::GenericOp>(
+        loc, lhsType, ValueRange{lhs, rhs}, ValueRange{empty},
+        indexingMaps, iteratorTypes,
+        [&](OpBuilder& b, Location l, ValueRange args) {
+            Value result;
+            if (opType == GraphOperation::OpType::Add) {
+                result = b.create<arith::AddFOp>(l, args[0], args[1]);
+            } else { // Mul
+                result = b.create<arith::MulFOp>(l, args[0], args[1]);
+            }
+            b.create<linalg::YieldOp>(l, result);
         }
-    }
-    Value result = builder.create<memref::AllocOp>(loc, resultType, dynSizes);
+    );
 
-    // Build nested loops
-    if (lhsType.getRank() == 1) {
-        auto dim0 = builder.create<memref::DimOp>(loc, lhs, 0);
-        auto zero = builder.create<arith::ConstantIndexOp>(loc, 0);
-        auto one = builder.create<arith::ConstantIndexOp>(loc, 1);
-
-        builder.create<scf::ForOp>(loc, zero, dim0, one,
-            ValueRange{}, [&](OpBuilder& b, Location l, Value i, ValueRange) {
-                auto lVal = b.create<memref::LoadOp>(l, lhs, ValueRange{i});
-                auto rVal = b.create<memref::LoadOp>(l, rhs, ValueRange{i});
-                Value resVal;
-                if (opType == GraphOperation::OpType::Add) {
-                    resVal = b.create<arith::AddFOp>(l, lVal, rVal);
-                } else {
-                    resVal = b.create<arith::MulFOp>(l, lVal, rVal);
-                }
-                b.create<memref::StoreOp>(l, resVal, result, ValueRange{i});
-                b.create<scf::YieldOp>(l);
-            });
-    } else if (lhsType.getRank() == 2) {
-        auto dim0 = builder.create<memref::DimOp>(loc, lhs, 0);
-        auto dim1 = builder.create<memref::DimOp>(loc, lhs, 1);
-        auto zero = builder.create<arith::ConstantIndexOp>(loc, 0);
-        auto one = builder.create<arith::ConstantIndexOp>(loc, 1);
-
-        builder.create<scf::ForOp>(loc, zero, dim0, one,
-            ValueRange{}, [&](OpBuilder& b, Location l, Value i, ValueRange) {
-                b.create<scf::ForOp>(l, zero, dim1, one,
-                    ValueRange{}, [&](OpBuilder& b2, Location l2, Value j, ValueRange) {
-                        auto lVal = b2.create<memref::LoadOp>(l2, lhs, ValueRange{i, j});
-                        auto rVal = b2.create<memref::LoadOp>(l2, rhs, ValueRange{i, j});
-                        Value resVal;
-                        if (opType == GraphOperation::OpType::Add) {
-                            resVal = b2.create<arith::AddFOp>(l2, lVal, rVal);
-                        } else {
-                            resVal = b2.create<arith::MulFOp>(l2, lVal, rVal);
-                        }
-                        b2.create<memref::StoreOp>(l2, resVal, result, ValueRange{i, j});
-                        b2.create<scf::YieldOp>(l2);
-                    });
-                b.create<scf::YieldOp>(l);
-            });
-    }
-
-    return result;
+    return genericOp.getResult(0);
 }
 
-// Build matrix multiplication
+// Build matrix multiplication using linalg.matmul
 Value ComputationGraph::buildMatMul(OpBuilder& builder, Location loc, Value lhs, Value rhs) {
-    auto lhsType = mlir::cast<MemRefType>(lhs.getType());
-    auto rhsType = mlir::cast<MemRefType>(rhs.getType());
+    auto lhsType = mlir::cast<RankedTensorType>(lhs.getType());
+    auto rhsType = mlir::cast<RankedTensorType>(rhs.getType());
 
-    auto m = builder.create<memref::DimOp>(loc, lhs, 0);
-    auto n = builder.create<memref::DimOp>(loc, rhs, 1);
+    // Get dimensions
+    Value m = builder.create<tensor::DimOp>(loc, lhs, 0);
+    Value n = builder.create<tensor::DimOp>(loc, rhs, 1);
 
-    SmallVector<int64_t> resultShape = {lhsType.getShape()[0], rhsType.getShape()[1]};
-    auto resultType = MemRefType::get(resultShape, builder.getF32Type());
+    // Determine result type shape - use static if both inputs are static
+    SmallVector<int64_t> resultShape;
+    if (lhsType.isDynamicDim(0)) {
+        resultShape.push_back(ShapedType::kDynamic);
+    } else {
+        resultShape.push_back(lhsType.getDimSize(0));
+    }
+    if (rhsType.isDynamicDim(1)) {
+        resultShape.push_back(ShapedType::kDynamic);
+    } else {
+        resultShape.push_back(rhsType.getDimSize(1));
+    }
+    
+    auto resultType = RankedTensorType::get(resultShape, builder.getF32Type());
 
-    SmallVector<Value> dynSizes;
-    if (lhsType.isDynamicDim(0)) dynSizes.push_back(m);
-    if (rhsType.isDynamicDim(1)) dynSizes.push_back(n);
-
-    Value result = builder.create<memref::AllocOp>(loc, resultType, dynSizes);
+    // Create empty output tensor with potentially static sizes
+    SmallVector<OpFoldResult> outputSizes;
+    outputSizes.push_back(lhsType.isDynamicDim(0) ? 
+        OpFoldResult(m.getDefiningOp()->getResult(0)) :
+        builder.getIndexAttr(lhsType.getDimSize(0)));
+    outputSizes.push_back(rhsType.isDynamicDim(1) ? 
+        OpFoldResult(n.getDefiningOp()->getResult(0)) :
+        builder.getIndexAttr(rhsType.getDimSize(1)));
+    
+    Value empty = builder.create<tensor::EmptyOp>(loc, outputSizes, builder.getF32Type());
 
     // Initialize to zero
-    auto zero = builder.create<arith::ConstantIndexOp>(loc, 0);
-    auto one = builder.create<arith::ConstantIndexOp>(loc, 1);
-    auto zeroF = builder.create<arith::ConstantOp>(loc, builder.getF32Type(),
+    Value zero = builder.create<arith::ConstantOp>(loc, builder.getF32Type(),
                                                    builder.getF32FloatAttr(0.0));
+    Value init = builder.create<linalg::FillOp>(loc, zero, empty).getResult(0);
 
-    builder.create<scf::ForOp>(loc, zero, m, one,
-        ValueRange{}, [&](OpBuilder& b, Location l, Value i, ValueRange) {
-            b.create<scf::ForOp>(l, zero, n, one,
-                ValueRange{}, [&](OpBuilder& b2, Location l2, Value j, ValueRange) {
-                    b2.create<memref::StoreOp>(l2, zeroF, result, ValueRange{i, j});
-                    b2.create<scf::YieldOp>(l2);
-                });
-            b.create<scf::YieldOp>(l);
-        });
+    // Perform matrix multiplication using linalg.matmul
+    auto matmulOp = builder.create<linalg::MatmulOp>(
+        loc, resultType,
+        ValueRange{lhs, rhs},
+        ValueRange{init}
+    );
 
-    // Perform matrix multiplication
-    auto k = builder.create<memref::DimOp>(loc, lhs, 1);
-
-    builder.create<scf::ForOp>(loc, zero, m, one,
-        ValueRange{}, [&](OpBuilder& b, Location l, Value i, ValueRange) {
-            b.create<scf::ForOp>(l, zero, n, one,
-                ValueRange{}, [&](OpBuilder& b2, Location l2, Value j, ValueRange) {
-                    b2.create<scf::ForOp>(l2, zero, k, one,
-                        ValueRange{}, [&](OpBuilder& b3, Location l3, Value kk, ValueRange) {
-                            auto lVal = b3.create<memref::LoadOp>(l3, lhs, ValueRange{i, kk});
-                            auto rVal = b3.create<memref::LoadOp>(l3, rhs, ValueRange{kk, j});
-                            auto prod = b3.create<arith::MulFOp>(l3, lVal, rVal);
-                            auto acc = b3.create<memref::LoadOp>(l3, result, ValueRange{i, j});
-                            auto sum = b3.create<arith::AddFOp>(l3, acc, prod);
-                            b3.create<memref::StoreOp>(l3, sum, result, ValueRange{i, j});
-                            b3.create<scf::YieldOp>(l3);
-                        });
-                    b2.create<scf::YieldOp>(l2);
-                });
-            b.create<scf::YieldOp>(l);
-        });
-
-    return result;
+    return matmulOp.getResult(0);
 }
 
-// Build ReLU activation
+// Build ReLU activation using linalg.generic
 Value ComputationGraph::buildReLU(OpBuilder& builder, Location loc, Value input) {
-    auto inputType = mlir::cast<MemRefType>(input.getType());
+    auto inputType = mlir::cast<RankedTensorType>(input.getType());
+    auto rank = inputType.getRank();
 
-    SmallVector<Value> dynSizes;
-    for (int i = 0; i < inputType.getRank(); ++i) {
-        if (inputType.isDynamicDim(i)) {
-            dynSizes.push_back(builder.create<memref::DimOp>(loc, input, i));
-        }
+    // Create empty tensor for result
+    SmallVector<OpFoldResult> dynSizes;
+    for (int i = 0; i < rank; ++i) {
+        dynSizes.push_back(builder.create<tensor::DimOp>(loc, input, i).getResult());
     }
-    Value result = builder.create<memref::AllocOp>(loc, inputType, dynSizes);
+    Value empty = builder.create<tensor::EmptyOp>(loc, dynSizes, inputType.getElementType());
 
-    auto zero = builder.create<arith::ConstantIndexOp>(loc, 0);
-    auto one = builder.create<arith::ConstantIndexOp>(loc, 1);
-    auto zeroF = builder.create<arith::ConstantOp>(loc, builder.getF32Type(),
+    // Create constant zero
+    Value zero = builder.create<arith::ConstantOp>(loc, builder.getF32Type(),
                                                    builder.getF32FloatAttr(0.0));
 
-    if (inputType.getRank() == 1) {
-        auto dim0 = builder.create<memref::DimOp>(loc, input, 0);
-        builder.create<scf::ForOp>(loc, zero, dim0, one,
-            ValueRange{}, [&](OpBuilder& b, Location l, Value i, ValueRange) {
-                auto val = b.create<memref::LoadOp>(l, input, ValueRange{i});
-                auto maxVal = b.create<arith::MaximumFOp>(l, val, zeroF);
-                b.create<memref::StoreOp>(l, maxVal, result, ValueRange{i});
-                b.create<scf::YieldOp>(l);
-            });
-    } else if (inputType.getRank() == 2) {
-        auto dim0 = builder.create<memref::DimOp>(loc, input, 0);
-        auto dim1 = builder.create<memref::DimOp>(loc, input, 1);
-        builder.create<scf::ForOp>(loc, zero, dim0, one,
-            ValueRange{}, [&](OpBuilder& b, Location l, Value i, ValueRange) {
-                b.create<scf::ForOp>(l, zero, dim1, one,
-                    ValueRange{}, [&](OpBuilder& b2, Location l2, Value j, ValueRange) {
-                        auto val = b2.create<memref::LoadOp>(l2, input, ValueRange{i, j});
-                        auto maxVal = b2.create<arith::MaximumFOp>(l2, val, zeroF);
-                        b2.create<memref::StoreOp>(l2, maxVal, result, ValueRange{i, j});
-                        b2.create<scf::YieldOp>(l2);
-                    });
-                b.create<scf::YieldOp>(l);
-            });
-    }
+    // Create affine maps
+    auto identityMap = builder.getMultiDimIdentityMap(rank);
+    SmallVector<AffineMap> indexingMaps = {identityMap, identityMap};
+    SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
 
-    return result;
+    // Build linalg.generic for ReLU: max(x, 0)
+    auto genericOp = builder.create<linalg::GenericOp>(
+        loc, inputType, ValueRange{input}, ValueRange{empty},
+        indexingMaps, iteratorTypes,
+        [&](OpBuilder& b, Location l, ValueRange args) {
+            Value maxVal = b.create<arith::MaximumFOp>(l, args[0], zero);
+            b.create<linalg::YieldOp>(l, maxVal);
+        }
+    );
+
+    return genericOp.getResult(0);
 }
 
-// Build Softmax (from Chapter 6)
+// Build Softmax using linalg.reduce and linalg.generic (from Chapter 6)
 Value ComputationGraph::buildSoftmax(OpBuilder& builder, Location loc, Value input) {
-    auto inputType = mlir::cast<MemRefType>(input.getType());
-    auto dim0 = builder.create<memref::DimOp>(loc, input, 0);
+    auto inputType = mlir::cast<RankedTensorType>(input.getType());
+    auto f32Type = builder.getF32Type();
+    auto scalarTensorType = RankedTensorType::get({}, f32Type);
 
-    SmallVector<Value> dynSizes;
-    if (inputType.isDynamicDim(0)) {
-        dynSizes.push_back(dim0);
-    }
-    Value result = builder.create<memref::AllocOp>(loc, inputType, dynSizes);
+    // Pass 1: Find maximum using linalg.reduce
+    Value negInf = builder.create<arith::ConstantOp>(
+        loc, builder.getFloatAttr(f32Type,
+            APFloat::getInf(f32Type.getFloatSemantics(), /*Negative=*/true)));
+    Value initMaxTensor = builder.create<tensor::FromElementsOp>(
+        loc, scalarTensorType, ValueRange{negInf});
 
-    auto zero = builder.create<arith::ConstantIndexOp>(loc, 0);
-    auto one = builder.create<arith::ConstantIndexOp>(loc, 1);
-    auto negInf = builder.create<arith::ConstantOp>(loc, builder.getF32Type(),
-        builder.getF32FloatAttr(-std::numeric_limits<float>::infinity()));
-    auto zeroF = builder.create<arith::ConstantOp>(loc, builder.getF32Type(),
-        builder.getF32FloatAttr(0.0));
+    auto reduceMaxOp = builder.create<linalg::ReduceOp>(
+        loc, input, initMaxTensor,
+        SmallVector<int64_t>{0},
+        [&](OpBuilder& b, Location l, ValueRange args) {
+            Value newMax = b.create<arith::MaximumFOp>(l, args[0], args[1]);
+            b.create<linalg::YieldOp>(l, newMax);
+        }
+    );
+    Value maxTensor = reduceMaxOp.getResult(0);
+    Value maxVal = builder.create<tensor::ExtractOp>(loc, maxTensor, ValueRange{});
 
-    // Pass 1: Find max
-    auto maxVal = builder.create<scf::ForOp>(loc, zero, dim0, one,
-        ValueRange{negInf}, [&](OpBuilder& b, Location l, Value i, ValueRange iterArgs) {
-            auto val = b.create<memref::LoadOp>(l, input, ValueRange{i});
-            auto currentMax = b.create<arith::MaximumFOp>(l, iterArgs[0], val);
-            b.create<scf::YieldOp>(l, ValueRange{currentMax});
-        }).getResult(0);
+    // Pass 2: Compute exp(x - max) using linalg.generic
+    Value c0 = builder.create<arith::ConstantIndexOp>(loc, 0);
+    SmallVector<OpFoldResult> dynamicSizes = {
+        builder.create<tensor::DimOp>(loc, input, c0).getResult()
+    };
+    Value emptyTensor = builder.create<tensor::EmptyOp>(loc, dynamicSizes, f32Type);
 
-    // Pass 2: Compute exp and sum
-    auto sum = builder.create<scf::ForOp>(loc, zero, dim0, one,
-        ValueRange{zeroF}, [&](OpBuilder& b, Location l, Value i, ValueRange iterArgs) {
-            auto val = b.create<memref::LoadOp>(l, input, ValueRange{i});
-            auto diff = b.create<arith::SubFOp>(l, val, maxVal);
-            auto expVal = b.create<math::ExpOp>(l, diff);
-            b.create<memref::StoreOp>(l, expVal, result, ValueRange{i});
-            auto newSum = b.create<arith::AddFOp>(l, iterArgs[0], expVal);
-            b.create<scf::YieldOp>(l, ValueRange{newSum});
-        }).getResult(0);
+    auto identityMap = builder.getMultiDimIdentityMap(1);
+    SmallVector<AffineMap> indexingMaps = {identityMap, identityMap};
+    SmallVector<utils::IteratorType> iteratorTypes = {utils::IteratorType::parallel};
 
-    // Pass 3: Normalize
-    builder.create<scf::ForOp>(loc, zero, dim0, one,
-        ValueRange{}, [&](OpBuilder& b, Location l, Value i, ValueRange) {
-            auto val = b.create<memref::LoadOp>(l, result, ValueRange{i});
-            auto normalized = b.create<arith::DivFOp>(l, val, sum);
-            b.create<memref::StoreOp>(l, normalized, result, ValueRange{i});
-            b.create<scf::YieldOp>(l);
-        });
+    auto expOp = builder.create<linalg::GenericOp>(
+        loc, inputType, input, emptyTensor,
+        indexingMaps, iteratorTypes,
+        [&](OpBuilder& b, Location l, ValueRange args) {
+            Value shifted = b.create<arith::SubFOp>(l, args[0], maxVal);
+            Value expVal = b.create<math::ExpOp>(l, shifted);
+            b.create<linalg::YieldOp>(l, expVal);
+        }
+    );
+    Value expTensor = expOp.getResult(0);
 
-    return result;
+    // Pass 3: Sum exp values using linalg.reduce
+    Value zeroFloat = builder.create<arith::ConstantOp>(
+        loc, builder.getFloatAttr(f32Type, APFloat(0.0f)));
+    Value initSumTensor = builder.create<tensor::FromElementsOp>(
+        loc, scalarTensorType, ValueRange{zeroFloat});
+
+    auto reduceSumOp = builder.create<linalg::ReduceOp>(
+        loc, expTensor, initSumTensor,
+        SmallVector<int64_t>{0},
+        [&](OpBuilder& b, Location l, ValueRange args) {
+            Value newSum = b.create<arith::AddFOp>(l, args[0], args[1]);
+            b.create<linalg::YieldOp>(l, newSum);
+        }
+    );
+    Value sumTensor = reduceSumOp.getResult(0);
+    Value sumVal = builder.create<tensor::ExtractOp>(loc, sumTensor, ValueRange{});
+
+    // Pass 4: Normalize using linalg.generic
+    Value outputEmpty = builder.create<tensor::EmptyOp>(loc, dynamicSizes, f32Type);
+
+    auto normalizeOp = builder.create<linalg::GenericOp>(
+        loc, inputType, expTensor, outputEmpty,
+        indexingMaps, iteratorTypes,
+        [&](OpBuilder& b, Location l, ValueRange args) {
+            Value normalized = b.create<arith::DivFOp>(l, args[0], sumVal);
+            b.create<linalg::YieldOp>(l, normalized);
+        }
+    );
+
+    return normalizeOp.getResult(0);
 }

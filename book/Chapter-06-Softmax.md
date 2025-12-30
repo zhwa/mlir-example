@@ -1,12 +1,52 @@
-# Chapter 6: Mathematical Operations — Implementing Softmax
+# Chapter 6: Mathematical Operations — Implementing Softmax with Tensor Reductions
 
-In the previous five chapters, we built a solid foundation in MLIR's fundamental concepts: from basic matrix operations with the Linalg dialect in Chapter 1, through dynamic shapes and bufferization in Chapters 2 and 4, to explicit control flow with SCF and Arith dialects in Chapter 5. We've learned how to work with tensors and memrefs, how to manage compilation infrastructure, and how to build explicit loops with arithmetic operations. Now we're ready to take the next step: implementing our first real machine learning operation.
+Starting from Chapter 5, we transitioned to **tensor-first architecture**, the modern MLIR pattern used by production compilers like Torch-MLIR and IREE. In this chapter, we continue this approach by implementing **softmax** using `linalg.reduce` for reductions and `linalg.generic` for element-wise operations. This represents a significant evolution from the explicit loop-based approach you might find in older MLIR examples.
 
-This chapter introduces the **Math dialect**, which provides mathematical functions like exponential, logarithm, trigonometric operations, and other transcendental functions commonly used in scientific computing and machine learning. We'll use the Math dialect to implement **softmax**, a fundamental activation function that appears everywhere in modern neural networks—particularly in transformers, where it powers the attention mechanism that we'll explore in Chapter 11. Unlike the simple element-wise operations we've built so far (like the SAXPY example in Chapter 5), softmax requires a multi-pass algorithm with reductions and introduces important concerns about numerical stability that every ML practitioner must understand.
+This chapter introduces the **Math dialect**, which provides mathematical functions like exponential, logarithm, and trigonometric operations. We'll use it to implement **softmax**, a fundamental activation function that appears everywhere in modern neural networks—particularly in transformers, where it powers the attention mechanism we'll explore in Chapter 11. Unlike the simple element-wise SAXPY from Chapter 5, softmax requires a four-pass algorithm with reductions and introduces important numerical stability concerns.
 
-The implementation in this chapter will demonstrate several new patterns: using loop-carried variables with `scf.for` to accumulate results across iterations (essential for computing maximum values and sums), employing a three-pass algorithm where each pass depends on results from the previous one, and applying numerical stability techniques to prevent floating-point overflow. We'll also explore how Math dialect operations lower to standard C library calls through the `math-to-libm` pass, connecting MLIR's high-level mathematical abstractions to the battle-tested implementations in `libm`.
+The tensor-first implementation demonstrates several key patterns: using `linalg.reduce` for maximum and sum operations (the standard MLIR way to express reductions), employing `linalg.generic` for element-wise exponential and normalization operations, and handling numerical stability through max subtraction. Through bufferization, these high-level tensor operations automatically transform into efficient memref code with explicit loops—giving us both expressiveness at the high level and performance at the low level.
 
-## 6.1 The Math Dialect
+## 6.1 Tensor-First Softmax Architecture
+
+Before diving into the math, let's understand the architectural shift from explicit loops to tensor operations with declarative reductions.
+
+### Traditional vs Modern Approach
+
+**Traditional Approach (Explicit Loops)**:
+```mlir
+%max = scf.for %i = %c0 to %size step %c1 
+       iter_args(%current_max = %neg_inf) -> (f32) {
+  %val = memref.load %input[%i]
+  %new_max = arith.maximumf %current_max, %val
+  scf.yield %new_max
+}
+```
+
+**Modern Approach (Tensor Reductions)**:
+```mlir
+%init_max = tensor.from_elements %neg_inf : tensor<f32>
+%max_tensor = linalg.reduce ins(%input : tensor<?xf32>)
+                           outs(%init_max : tensor<f32>)
+                           dimensions = [0]
+  (%in: f32, %init: f32) {
+    %new_max = arith.maximumf %in, %init : f32
+    linalg.yield %new_max : f32
+  }
+%max_val = tensor.extract %max_tensor[] : tensor<f32>
+```
+
+### The Four-Pass Tensor Algorithm
+
+Our tensor-first softmax uses four distinct passes, each operating on tensors:
+
+1. **linalg.reduce**: Find maximum value (reduction to scalar)
+2. **linalg.generic**: Compute exp(x - max) (element-wise transformation)
+3. **linalg.reduce**: Sum exp values (reduction to scalar)
+4. **linalg.generic**: Normalize by sum (element-wise division)
+
+Each pass is a high-level tensor operation. Bufferization automatically converts these to efficient loops with temporary buffers.
+
+## 6.2 The Math Dialect
 
 The Math dialect complements the Arith dialect we introduced in Chapter 5 by providing operations for mathematical functions beyond basic arithmetic. While Arith handles addition, multiplication, comparisons, and other elementary operations with precise semantics for integers and floating-point numbers, Math provides transcendental functions—operations whose results cannot be expressed as finite combinations of basic arithmetic operations.
 
@@ -437,21 +477,9 @@ Additional tests cover edge cases and random inputs. When all inputs are zero, s
 
 The test suite also includes functions to print the generated IR at different stages of lowering. We can examine the high-level IR (with `scf.for` and `math.exp`) to verify our IR generation, and the fully lowered IR (with only LLVM dialect operations) to see the final form before JIT compilation. These inspection capabilities are valuable for understanding MLIR's transformations and debugging when results don't match expectations.
 
-## 6.11 Comparison with SAXPY
+## 6.11 Looking Ahead
 
-Comparing softmax (this chapter) with SAXPY (Chapter 5) illustrates the progression in complexity as we move toward real machine learning operations. SAXPY performed element-wise operations (multiply and add) that could be computed independently for each element, requiring a single pass over the data with no dependence between iterations. In contrast, softmax requires multiple passes with dependencies: we must find the maximum before computing exponentials, and we must sum exponentials before normalizing.
-
-The dialects used reflect this increased complexity. SAXPY only needed SCF for loops and Arith for basic arithmetic (addition and multiplication). Softmax requires the same dialects plus Math for the exponential function—a transcendental operation beyond basic arithmetic. The addition of Math dialect brings new considerations: lowering strategy (libm vs inline approximations), numerical accuracy, and special case handling (infinities, NaNs). These concerns don't arise with simple arithmetic operations.
-
-Algorithmic structure differs significantly. SAXPY's single loop performed independent operations, with no loop-carried variables and no coordination between iterations. Each iteration was essentially a pure function from input indices to output values. Softmax requires two reduction operations (maximum and sum) using loop-carried variables, plus storage to a temporary buffer for reuse in the third pass. The iterations in passes 1 and 2 are not independent—they accumulate state across the loop, and pass 3 depends on the results of previous passes.
-
-Most importantly, softmax introduces **numerical stability** as a central concern. SAXPY had no numerical issues—addition and multiplication of normal floating-point values produce accurate results without special precautions. Softmax, however, can easily overflow without the max subtraction technique. This highlights a crucial principle in numerical computing: some algorithms are inherently unstable in finite-precision arithmetic and require reformulation for reliable implementation. As we implement more ML operations in subsequent chapters, we'll encounter similar situations where the straightforward mathematical formulation isn't suitable for direct implementation.
-
-Memory usage also differs. SAXPY required no additional memory beyond inputs and outputs—each element's computation was self-contained. Softmax allocates a temporary buffer the same size as the input, doubling the memory footprint. This pattern is common in multi-pass algorithms: intermediate results must be stored for later use. In Chapter 11, when we implement attention mechanisms, we'll see even more complex memory patterns with multiple temporary buffers storing intermediate values for various stages of the computation.
-
-## 6.12 Looking Ahead
-
-With softmax implemented, we've completed our first real machine learning operation and demonstrated essential patterns we'll use throughout the rest of this book: multi-pass algorithms, loop-carried variables for reductions, the Math dialect for mathematical functions, and numerical stability techniques. The three-pass structure we used here—global reduction, element-wise transformation, element-wise normalization—appears in many ML operations with variations.
+With tensor-first softmax implemented, we've mastered reduction operations and multi-pass algorithms. The patterns learned here—`linalg.reduce` for aggregations, `linalg.generic` for transformations, numerical stability techniques—will appear throughout the remaining chapters.
 
 Chapter 7 will introduce **neural network operations** like matrix multiplication with bias and ReLU activation, building on the patterns established here but working with higher-dimensional tensors. We'll see how operations compose into computation graphs, how Linalg dialect provides high-level representations for common ML operations, and how the patterns we've learned (bufferization, lowering, Python integration) scale to more complex workloads.
 

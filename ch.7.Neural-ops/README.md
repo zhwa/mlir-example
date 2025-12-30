@@ -1,13 +1,13 @@
 # Chapter 7: Operator Composition with Computation Graphs
 
-This chapter introduces **operator composition** using computation graphs before diving into custom dialects. It demonstrates how to build complex ML operations by composing simpler ones using a deferred execution model.
+This chapter introduces **operator composition** using computation graphs. It demonstrates how to build complex ML operations by composing simpler ones using a deferred execution model, generating MLIR with tensors and linalg operations.
 
 ## Learning Objectives
 
 - Build a computation graph that tracks operations symbolically
 - Implement deferred execution (build graph first, compile later)
 - Compose multiple operations (add, mul, matmul, relu, softmax)
-- Generate MLIR from a high-level computation graph
+- Generate MLIR with tensors and linalg operations from high-level graphs
 - Understand the bridge between imperative Python code and declarative MLIR
 
 ## Key Concepts
@@ -51,31 +51,46 @@ This is similar to:
 
 ### Element-wise Operations
 
-- **Add**: `z = g.add(x, y)` - Element-wise addition
-- **Mul**: `z = g.mul(x, y)` - Element-wise multiplication
+- **Add**: `z = g.add(x, y)` - Element-wise addition with `linalg.generic`
+- **Mul**: `z = g.mul(x, y)` - Element-wise multiplication with `linalg.generic`
 
-```python
-g = ch7.Graph()
-x = g.variable([4])
-y = g.variable([4])
-z = g.mul(g.add(x, y), g.variable([4]))  # (x + y) * w
+Generated MLIR:
+```mlir
+%result = linalg.generic {
+  indexing_maps = [affine_map<(d0) -> (d0)>, ...],
+  iterator_types = ["parallel"]
+} ins(%lhs, %rhs) outs(%empty) {
+^bb0(%arg0: f32, %arg1: f32, %arg2: f32):
+  %sum = arith.addf %arg0, %arg1 : f32
+  linalg.yield %sum : f32
+}
 ```
 
 ### Matrix Operations
 
-- **MatMul**: `z = g.matmul(A, B)` - Matrix multiplication
+- **MatMul**: `z = g.matmul(A, B)` - Matrix multiplication with `linalg.matmul`
 
-```python
-g = ch7.Graph()
-x = g.variable([2, 3])   # 2x3 matrix
-W = g.variable([3, 4])   # 3x4 weight matrix
-y = g.matmul(x, W)        # 2x4 output
+Generated MLIR:
+```mlir
+%init = linalg.fill ins(%zero : f32) outs(%empty)
+%result = linalg.matmul ins(%A, %B) outs(%init) -> tensor<2x4xf32>
 ```
 
 ### Activation Functions
 
-- **ReLU**: `y = g.relu(x)` - Rectified Linear Unit (max(0, x))
-- **Softmax**: `y = g.softmax(x)` - Softmax normalization (Σe^x_i = 1)
+- **ReLU**: `y = g.relu(x)` - Rectified Linear Unit using `linalg.generic`
+- **Softmax**: `y = g.softmax(x)` - Softmax normalization using `linalg.reduce` + `linalg.generic`
+
+ReLU example:
+```mlir
+%relu = linalg.generic {
+  iterator_types = ["parallel"]
+} ins(%input) outs(%empty) {
+^bb0(%arg0: f32, %arg1: f32):
+  %max = arith.maximumf %arg0, %zero : f32
+  linalg.yield %max : f32
+}
+```
 
 ## Implementation Details
 
@@ -87,12 +102,12 @@ Python API (bindings.cpp)
 ComputationGraph (ir.cpp)
     ├─ Track operations symbolically
     ├─ Store operation types and dependencies
-    └─ Generate MLIR on demand
+    └─ Generate MLIR with tensors and linalg ops
         ↓
-Lowering (lowering.cpp)
-    ├─ SCF → Control Flow
-    ├─ Math → Libm/LLVM
-    └─ All dialects → LLVM
+Bufferization (lowering.cpp)
+    ├─ Tensor → MemRef
+    ├─ Linalg → Loops
+    └─ Math → Libm/LLVM
         ↓
 JIT Compilation (jit.cpp)
     ├─ MLIR → LLVM IR
@@ -104,27 +119,58 @@ JIT Compilation (jit.cpp)
 The `ComputationGraph::generateMLIR()` method:
 
 1. **Collect variables**: Find all `Variable` operations
-2. **Build function signature**: Create func.func with memref arguments
+2. **Build function signature**: Create func.func with tensor arguments and return type
 3. **Recursive generation**: Build operations depth-first, memoizing results
-4. **Copy to output**: Transfer result to output buffer
+4. **Return tensor result**: Function returns computed tensor
 
-### Operation Building Patterns
+### Operation Building with Linalg
 
-#### Multi-step Style (simple loops)
+#### Element-wise Operations
 ```cpp
-auto zero = builder.create<arith::ConstantIndexOp>(loc, 0);
-auto one = builder.create<arith::ConstantIndexOp>(loc, 1);
-builder.create<scf::ForOp>(loc, zero, dim, one, ...);
+// Build linalg.generic for element-wise ops
+auto genericOp = builder.create<linalg::GenericOp>(
+    loc, lhsType, ValueRange{lhs, rhs}, ValueRange{empty},
+    indexingMaps, iteratorTypes,
+    [&](OpBuilder& b, Location l, ValueRange args) {
+        Value result = b.create<arith::AddFOp>(l, args[0], args[1]);
+        b.create<linalg::YieldOp>(l, result);
+    }
+);
 ```
 
-#### Lambda Style (with loop-carried variables)
+#### Matrix Multiplication
 ```cpp
-auto sum = builder.create<scf::ForOp>(loc, zero, dim, one,
-    ValueRange{zeroF}, [&](OpBuilder& b, Location l, Value i, ValueRange iterArgs) {
-        // Use iterArgs[0] for accumulation
-        auto newSum = b.create<arith::AddFOp>(l, iterArgs[0], val);
-        b.create<scf::YieldOp>(l, ValueRange{newSum});
-    }).getResult(0);
+// Use linalg.matmul directly
+Value init = builder.create<linalg::FillOp>(loc, zero, empty);
+auto matmulOp = builder.create<linalg::MatmulOp>(
+    loc, resultType, ValueRange{lhs, rhs}, ValueRange{init}
+);
+```
+
+## Pipeline
+
+```
+High-Level Graph                                        (Python/C++)
+  ├─ Operations stored as DAG nodes
+  ├─ Symbolic execution (no values yet)
+  └─ Dependencies tracked
+          ↓ [generateMLIR]
+Tensor IR                                               (Functional)
+  ├─ func.func with tensor arguments/results
+  ├─ linalg.generic (element-wise)
+  ├─ linalg.matmul (matrix multiply)
+  ├─ linalg.reduce (reductions)
+  └─ math.exp (mathematical functions)
+          ↓ [Canonicalize + Bufferize]
+MemRef IR                                               (Imperative)
+  ├─ func.func with memref out-parameters
+  ├─ scf.for loops
+  └─ memref.load/store
+          ↓ [Lower to LLVM]
+LLVM Dialect
+  └─ llvm.* instructions
+          ↓ [JIT Compile]
+Machine Code                                            (Executable)
 ```
 
 ## MLIR Calling Convention

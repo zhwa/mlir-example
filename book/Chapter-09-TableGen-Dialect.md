@@ -28,7 +28,7 @@ Before diving into syntax and implementation, let's understand why MLIR's design
 
 This automation eliminates entire classes of bugs. If you change an operand's type from `AnyMemRef` to `Float32MemRef` in TableGen, the generated C++ code automatically enforces this constraint everywhere the operation is used. No manual updates needed, no risk of forgetting to update the verifier or builder.
 
-**Type Safety and Compile-Time Validation**. Beyond code generation, TableGen enables compile-time correctness checking. When you build IR using generated OpBuilder methods, C++ type checking ensures arguments match the operation's signature. Try passing a `tensor<4xf32>` to an operation expecting `memref<4xf32>`, and the compiler rejects it. With Chapter 8's string generation, this error appears at runtime during MLIR parsing; with TableGen, it's caught at C++ compile time before any MLIR is generated. This shift-left of error detection accelerates development: fewer test-edit-debug cycles, more confidence in transformations.
+**Type Safety and Compile-Time Validation**. Beyond code generation, TableGen enables compile-time correctness checking. When you build IR using generated OpBuilder methods, C++ type checking ensures arguments match the operation's signature. Try passing an incompatible type to an operation, and the compiler rejects it. With Chapter 8's string generation, type errors appear at runtime during MLIR parsing; with TableGen, they're caught at C++ compile time before any MLIR is generated. This shift-left of error detection accelerates development: fewer test-edit-debug cycles, more confidence in transformations.
 
 **Integration with Optimization Infrastructure**. MLIR's pattern rewriting framework (used for optimization and lowering) works naturally with TableGen-defined operations. The `OpRewritePattern<AddOp>` base class provides type-safe access to operation fields, automatic matching, and integration with the rewrite driver. Dialect conversion passes compose seamlessly—you specify conversion targets (legal/illegal operations), provide rewrite patterns, and the framework handles application ordering, fixpoint computation, and rollback on failure. This infrastructure assumes operations are proper C++ classes with known structure, not text strings parsed at runtime.
 
@@ -63,24 +63,25 @@ The operation's syntax, semantics, and constraints existed only in this Python f
 **Chapter 9: Explicit Declaration in TableGen**. With TableGen, operations are declared formally in `.td` files before any IR is generated. The `nn.add` operation in [inc/NNOps.td](../ch.9.TableGen-dialect/inc/NNOps.td):
 
 ```tablegen
-def NN_AddOp : NN_Op<"add"> {
+def NN_AddOp : NN_Op<"add", [Pure, SameOperandsAndResultType]> {
   let summary = "element-wise addition";
   let description = [{
-    Performs element-wise addition of two memrefs: `output = lhs + rhs`
+    Performs element-wise addition of two tensors: `result = lhs + rhs`
 
     Example:
     ```mlir
-    nn.add %lhs, %rhs, %output : memref<4xf32>, memref<4xf32>, memref<4xf32>
+    %result = nn.add %lhs, %rhs : tensor<4xf32>
     ```
   }];
 
-  let arguments = (ins AnyMemRef:$lhs, AnyMemRef:$rhs, AnyMemRef:$output);
+  let arguments = (ins AnyTensor:$lhs, AnyTensor:$rhs);
+  let results = (outs AnyTensor:$result);
 
-  let assemblyFormat = "$lhs `,` $rhs `,` $output attr-dict `:` type($lhs) `,` type($rhs) `,` type($output)";
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($result)";
 }
 ```
 
-This 12-line declaration specifies everything about the operation: its mnemonic (`add`), what operands it takes (three memrefs named `lhs`, `rhs`, `output`), how it appears in MLIR text (the `assemblyFormat`), and what it means (the `description`). From this specification, mlir-tblgen generates approximately 200 lines of C++ code handling construction, parsing, printing, and verification.
+This 12-line declaration specifies everything about the operation: its mnemonic (`add`), what operands it takes (two tensors named `lhs`, `rhs`), what it returns (a tensor named `result`), how it appears in MLIR text (the `assemblyFormat`), and what it means (the `description`). From this specification, mlir-tblgen generates approximately 200 lines of C++ code handling construction, parsing, printing, and verification.
 
 **The TableGen Advantage**. TableGen's declarative approach provides several benefits:
 
@@ -243,14 +244,15 @@ Each `let` assigns a value to a field inherited from the parent class. The `Op` 
 **DAG Syntax (Directed Acyclic Graph)**. TableGen uses **DAG notation** for structured lists. A DAG looks like `(operator arg1:$name1, arg2:$name2, ...)`:
 
 ```tablegen
-let arguments = (ins AnyMemRef:$lhs, AnyMemRef:$rhs, AnyMemRef:$output);
-//              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+let arguments = (ins AnyTensor:$lhs, AnyTensor:$rhs);
+let results = (outs AnyTensor:$result);
+//              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 //              This is a DAG
 ```
 
 Breaking down the syntax:
 - `ins` - The DAG operator (means "input operands")
-- `AnyMemRef:$lhs` - First element: type `AnyMemRef` with name `$lhs`
+- `AnyTensor:$lhs` - First element: type `AnyTensor` with name `$lhs`
 - `,` - Separator between elements
 - `$name` - The dollar sign indicates a bind variable (accessible in generated code)
 
@@ -291,15 +293,15 @@ def NN_AddOp : NN_Op<"add"> { ... }
 
 This is like C++ single inheritance: `NN_AddOp` gets all fields from `NN_Op` (which got them from `Op`), plus any you add in the `{ }` body. Changes to the base class automatically affect all inheritors—modify `NN_Op` to add a trait, and all operations get it.
 
-**Type Constraints**. The types (`AnyMemRef`, `F64Tensor`) are predefined type constraints from `mlir/IR/OpBase.td`. Common ones:
+**Type Constraints**. The types (`AnyTensor`, `F64Tensor`) are predefined type constraints from `mlir/IR/OpBase.td`. Common ones:
 
 - `AnyType` - Any MLIR type
-- `AnyMemRef` - Any memref type (any shape, any element type)
-- `F32MemRef` - Memref with f32 elements specifically
+- `AnyTensor` - Any tensor type (any shape, any element type)
+- `F32Tensor` - Tensor with f32 elements specifically
 - `1DTensorOf<[F32]>` - One-dimensional tensor of f32 values
 - `AnyTypeOf<[...list...]>` - Union type (any of the listed types)
 
-These constraints integrate with verification—if you specify `F32MemRef:$input`, the generated verifier ensures the operand is actually a memref with f32 elements. Type violations cause early errors, not runtime surprises.
+These constraints integrate with verification—if you specify `F32Tensor:$input`, the generated verifier ensures the operand is actually a tensor with f32 elements. Type violations cause early errors, not runtime surprises.
 
 **Traits as Lists**. Traits (operation properties) are specified as lists in angle brackets:
 
@@ -334,60 +336,65 @@ Individual operations are defined in [inc/NNOps.td](../ch.9.TableGen-dialect/inc
 **The Complete Definition**:
 
 ```tablegen
-def NN_AddOp : NN_Op<"add"> {
+def NN_AddOp : NN_Op<"add", [Pure, SameOperandsAndResultType]> {
   let summary = "element-wise addition";
   let description = [{
-    Performs element-wise addition of two memrefs: `output = lhs + rhs`
+    Performs element-wise addition of two tensors: `result = lhs + rhs`
 
     Example:
     ```mlir
-    nn.add %lhs, %rhs, %output : memref<4xf32>, memref<4xf32>, memref<4xf32>
+    %result = nn.add %lhs, %rhs : tensor<4xf32>
     ```
   }];
 
-  let arguments = (ins AnyMemRef:$lhs, AnyMemRef:$rhs, AnyMemRef:$output);
+  let arguments = (ins AnyTensor:$lhs, AnyTensor:$rhs);
+  let results = (outs AnyTensor:$result);
 
-  let assemblyFormat = "$lhs `,` $rhs `,` $output attr-dict `:` type($lhs) `,` type($rhs) `,` type($output)";
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($result)";
 }
 ```
 
-**Operation Name and Inheritance**. The definition starts with `def NN_AddOp : NN_Op<"add">`. The `NN_AddOp` identifier is the name of the generated C++ class—you'll write `AddOp op` (namespace-qualified as `mlir::nn::AddOp`) when working with this operation in C++. The inheritance `: NN_Op<"add">` specifies the operation's mnemonic (what appears after `nn.` in MLIR text). When combined with the dialect name from `NN_Dialect`, this produces the fully-qualified operation name `nn.add`.
+**Operation Name and Inheritance**. The definition starts with `def NN_AddOp : NN_Op<"add", [Pure, SameOperandsAndResultType]>`. The `NN_AddOp` identifier is the name of the generated C++ class—you'll write `AddOp op` (namespace-qualified as `mlir::nn::AddOp`) when working with this operation in C++. The inheritance `: NN_Op<"add">` specifies the operation's mnemonic (what appears after `nn.` in MLIR text). The traits `[Pure, SameOperandsAndResultType]` indicate this operation has no side effects and that all operands and results have the same type. When combined with the dialect name from `NN_Dialect`, this produces the fully-qualified operation name `nn.add`.
 
 **Documentation Fields**. The `summary` and `description` fields serve multiple purposes. The summary is a single line appearing in error messages and quick-reference documentation—think of it as a docstring or tooltip. The description is comprehensive documentation supporting markdown formatting, code examples, and detailed semantic explanations. This documentation becomes accessible through mlir-opt's `--help` flag, IDE hover tooltips, and generated HTML documentation. For production dialects, thorough descriptions are critical—they're the primary way users learn operation semantics without reading implementation code.
 
 The `[{...}]` syntax for multi-line strings is TableGen-specific. Inside these delimiters, you can write multi-paragraph text with embedded code blocks, markdown formatting, and examples. The code example showing `nn.add %lhs, %rhs, %output : ...` demonstrates the operation's syntax, providing a template for users. When writing descriptions, include typical use cases, constraints (e.g., "shapes must match"), and semantic details (e.g., "uses IEEE 754 addition").
 
-**Arguments Specification**. The `let arguments = (ins AnyMemRef:$lhs, AnyMemRef:$rhs, AnyMemRef:$output);` line defines the operation's operands. This uses TableGen's `DAG` syntax, which looks like function call syntax but represents structured data. The breakdown:
+**Arguments and Results Specification**. The `let arguments = (ins AnyTensor:$lhs, AnyTensor:$rhs);` and `let results = (outs AnyTensor:$result);` lines define the operation's operands and results. This uses TableGen's `DAG` syntax, which looks like function call syntax but represents structured data. The breakdown:
 
 - **`ins`** - Keyword indicating these are input operands (as opposed to attributes, which use `attr`).
-- **`AnyMemRef`** - A type constraint from MLIR's OpBase.td. This constraint accepts any memref type (`memref<4xf32>`, `memref<2x3xi32>`, etc.) but rejects other types (tensors, integers, etc.). Type constraints enable compile-time verification: if you try to pass a `tensor<4xf32>` to an operation expecting `AnyMemRef`, C++ compilation fails with a clear error.
+- **`AnyTensor`** - A type constraint from MLIR's OpBase.td. This constraint accepts any tensor type (`tensor<4xf32>`, `tensor<2x3xi32>`, etc.) but rejects other types (memrefs, integers, etc.). Type constraints enable compile-time verification: if you try to pass a `memref<4xf32>` to an operation expecting `AnyTensor`, C++ compilation fails with a clear error.
 - **`:$lhs`** - The colon followed by a dollar-sign name assigns the operand a C++ accessor name. This generates a method `Value getLhs()` in the operation class. The dollar-sign syntax ($name) is TableGen's way of defining named values within dags.
+- **`outs`** - Keyword indicating these are output results (values returned by the operation).
+- **`:$result`** - Names the result, generating a method `Value getResult()` in the operation class.
 
-Our add operation takes three operands—two inputs and one output—all memrefs. The out-parameter pattern (`%output` is written to, not returned) matches the convention from Chapters 7 and 8: caller allocates result buffers, operations write in-place. This avoids tensor-to-memref bufferization complexity (a topic Chapter 4 covered extensively). For operations returning values, you'd use `let results = (outs AnyMemRef:$result);` instead of putting the output in `arguments`.
+Our add operation takes two tensor inputs and returns one tensor result. This functional style (returning values) matches modern MLIR conventions and enables optimizations. For operations that need to modify memory in-place, you can still use memref types, but tensor-based operations are preferred for their immutability and value semantics.
 
 **Assembly Format Specification**. The `assemblyFormat` field defines how the operation appears in MLIR text. This format string generates both parser (text → IR) and printer (IR → text) code automatically. The syntax:
 
 ```tablegen
-let assemblyFormat = "$lhs `,` $rhs `,` $output attr-dict `:` type($lhs) `,` type($rhs) `,` type($output)";
+let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($result)";
 ```
 
 Each element in the format string has specific meaning:
 
-- **`$lhs`, `$rhs`, `$output`** - References to the operands defined in `arguments`. These print the SSA value names (e.g., `%0`, `%1`, `%2`) and parse SSA values from text.
+- **`$lhs`, `$rhs`** - References to the operands defined in `arguments`. These print the SSA value names (e.g., `%0`, `%1`) and parse SSA values from text.
 - **`,` (comma)** - Literal comma in the syntax. Backquoted literals (`\`,\``) are printed/parsed exactly as written.
 - **`attr-dict`** - Placeholder for operation attributes (if any). Even though our add operation has no attributes, including `attr-dict` is conventional—it allows future additions without syntax breakage.
 - **`:`** - Literal colon, conventional separator before type information.
-- **`type($lhs)`, `type($rhs)`, `type($output)`** - Print the type of each operand. This produces output like `memref<4xf32>, memref<4xf32>, memref<4xf32>`.
+- **`type($result)`** - Print the type of the result. This produces output like `tensor<4xf32>`. Since we use the `SameOperandsAndResultType` trait, we only need to print one type (they're all the same).
 
 The generated parser reads text matching this pattern and constructs an `AddOp` instance. The generated printer writes text in this format. This bidirectional generation is powerful: one format specification ensures parsing and printing are consistent (no "I print X but parse Y" bugs).
 
-**Generated C++ Class**. From this 10-line TableGen definition, mlir-tblgen generates approximately 200 lines of C++ in `NNOps.h.inc` and `NNOps.cpp.inc`. The generated `AddOp` class includes:
+**Generated C++ Class**. From this 12-line TableGen definition, mlir-tblgen generates approximately 200 lines of C++ in `NNOps.h.inc` and `NNOps.cpp.inc`. The generated `AddOp` class includes:
 
 ```cpp
 class AddOp : public ::mlir::Op<AddOp, 
-                                 ::mlir::OpTrait::ZeroResults,
+                                 ::mlir::OpTrait::OneResult,
                                  ::mlir::OpTrait::ZeroSuccessors,
-                                 ::mlir::OpTrait::NOperands<3>::Impl> {
+                                 ::mlir::OpTrait::NOperands<2>::Impl,
+                                 ::mlir::OpTrait::Pure,
+                                 ::mlir::OpTrait::SameOperandsAndResultType> {
 public:
   using Op::Op;
   static constexpr ::llvm::StringLiteral getOperationName() {
@@ -397,14 +404,14 @@ public:
   // Accessor methods
   ::mlir::Value getLhs() { return getOperand(0); }
   ::mlir::Value getRhs() { return getOperand(1); }
-  ::mlir::Value getOutput() { return getOperand(2); }
+  ::mlir::Value getResult() { return getOpResult(0); }
 
   // Builder methods
   static void build(::mlir::OpBuilder &builder,
                     ::mlir::OperationState &state,
+                    ::mlir::Type resultType,
                     ::mlir::Value lhs,
-                    ::mlir::Value rhs,
-                    ::mlir::Value output);
+                    ::mlir::Value rhs);
 
   // Parser and printer
   static ::mlir::ParseResult parse(::mlir::OpAsmParser &parser,
@@ -416,7 +423,7 @@ public:
 };
 ```
 
-We'll examine this generated code in detail in the next section. For now, understand that the TableGen definition—10 lines of declarative specification—produces all boilerplate code needed for a fully functional MLIR operation. You don't write parsers, you don't write printers, you don't write accessor methods. You declare **what** the operation is, TableGen generates **how** it works.
+We'll examine this generated code in detail in the next section. For now, understand that the TableGen definition—12 lines of declarative specification—produces all boilerplate code needed for a fully functional MLIR operation. You don't write parsers, you don't write printers, you don't write accessor methods. You declare **what** the operation is, TableGen generates **how** it works.
 
 This operation definition pattern—`def` record, documentation, arguments, assembly format—repeats for every operation in the dialect.
 
@@ -427,7 +434,7 @@ The `matmul` operation demonstrates how TableGen handles operations with richer 
 **The MatMul Definition**:
 
 ```tablegen
-def NN_MatMulOp : NN_Op<"matmul"> {
+def NN_MatMulOp : NN_Op<"matmul", [Pure]> {
   let summary = "matrix multiplication";
   let description = [{
     Performs matrix multiplication: `C = A @ B`
@@ -439,17 +446,18 @@ def NN_MatMulOp : NN_Op<"matmul"> {
 
     Example:
     ```mlir
-    nn.matmul %a, %b, %c : memref<2x3xf32>, memref<3x4xf32>, memref<2x4xf32>
+    %c = nn.matmul %a, %b : tensor<2x3xf32>, tensor<3x4xf32> -> tensor<2x4xf32>
     ```
   }];
 
-  let arguments = (ins AnyMemRef:$lhs, AnyMemRef:$rhs, AnyMemRef:$output);
+  let arguments = (ins AnyTensor:$lhs, AnyTensor:$rhs);
+  let results = (outs AnyTensor:$result);
 
-  let assemblyFormat = "$lhs `,` $rhs `,` $output attr-dict `:` type($lhs) `,` type($rhs) `,` type($output)";
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($lhs) `,` type($rhs) `->` type($result)";
 }
 ```
 
-**Structural Similarity to Add**. Notice the definition structure mirrors `AddOp` almost exactly: same `arguments` specification (three memrefs), same `assemblyFormat`, identical accessor generation. This consistency is intentional—MLIR's operation model treats all operations uniformly at the structural level. Whether an operation performs element-wise addition or matrix multiplication is semantic detail, not structural difference. Both have operands (values they consume) and follow the same IR construction patterns.
+**Structural Similarity to Add**. Notice the definition structure mirrors `AddOp` almost exactly: same pattern of `arguments` and `results`, similar `assemblyFormat`. This consistency is intentional—MLIR's operation model treats all operations uniformly at the structural level. Whether an operation performs element-wise addition or matrix multiplication is semantic detail, not structural difference. Both have operands (values they consume), results (values they produce), and follow the same IR construction patterns.
 
 **Semantic Constraints**. The difference lies in semantics, which the description explains: matmul requires 2D matrices with compatible shapes. The first operand's second dimension (K) must equal the second operand's first dimension (K). These constraints aren't encoded in the TableGen definition—`AnyMemRef` accepts any memref type, including incompatible shapes. Instead, constraints are verified at IR construction time (in generated builder methods) or through custom verifiers.
 
@@ -492,20 +500,21 @@ This restricts operations to 2D float32 memrefs at the type system level. For ou
 **Element-Wise Multiplication**:
 
 ```tablegen
-def NN_MulOp : NN_Op<"mul"> {
+def NN_MulOp : NN_Op<"mul", [Pure, SameOperandsAndResultType, Commutative]> {
   let summary = "element-wise multiplication";
   let description = [{
-    Performs element-wise multiplication: `output = lhs * rhs`
+    Performs element-wise multiplication: `result = lhs * rhs`
 
     Example:
     ```mlir
-    nn.mul %lhs, %rhs, %output : memref<4xf32>, memref<4xf32>, memref<4xf32>
+    %result = nn.mul %lhs, %rhs : tensor<4xf32>
     ```
   }];
 
-  let arguments = (ins AnyMemRef:$lhs, AnyMemRef:$rhs, AnyMemRef:$output);
+  let arguments = (ins AnyTensor:$lhs, AnyTensor:$rhs);
+  let results = (outs AnyTensor:$result);
 
-  let assemblyFormat = "$lhs `,` $rhs `,` $output attr-dict `:` type($lhs) `,` type($rhs) `,` type($output)";
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($result)";
 }
 ```
 
@@ -514,7 +523,7 @@ Identical structure to `AddOp`, only the operation name and description differ. 
 **ReLU Activation**:
 
 ```tablegen
-def NN_ReLUOp : NN_Op<"relu"> {
+def NN_ReLUOp : NN_Op<"relu", [Pure, SameOperandsAndResultType]> {
   let summary = "ReLU activation function";
   let description = [{
     Applies the Rectified Linear Unit activation function:
@@ -522,17 +531,18 @@ def NN_ReLUOp : NN_Op<"relu"> {
 
     Example:
     ```mlir
-    nn.relu %input, %output : memref<2x4xf32>, memref<2x4xf32>
+    %output = nn.relu %input : tensor<2x4xf32>
     ```
   }];
 
-  let arguments = (ins AnyMemRef:$input, AnyMemRef:$output);
+  let arguments = (ins AnyTensor:$input);
+  let results = (outs AnyTensor:$result);
 
-  let assemblyFormat = "$input `,` $output attr-dict `:` type($input) `,` type($output)";
+  let assemblyFormat = "$input attr-dict `:` type($result)";
 }
 ```
 
-A **unary** operation (one input, one output) rather than binary. The pattern is the same: arguments specify operands, assemblyFormat defines syntax. The semantic difference (unary vs. binary) doesn't change the definition structure.
+A **unary** operation (one input, one output) rather than binary. The pattern is the same: arguments specify operands, results specify outputs, assemblyFormat defines syntax. The semantic difference (unary vs. binary) doesn't change the definition structure.
 
 **Advanced Operations: Softmax and Linear**. Our dialect includes operations with different patterns:
 
@@ -1061,51 +1071,57 @@ The `using OpRewritePattern<AddOp>::OpRewritePattern;` line inherits the constru
 ```cpp
 LogicalResult matchAndRewrite(AddOp op, PatternRewriter &rewriter) const override {
   auto loc = op.getLoc();
-  auto outputType = cast<MemRefType>(op.getOutput().getType());
+  auto resultType = cast<RankedTensorType>(op.getResult().getType());
+
+  // Create empty output tensor
+  Value emptyTensor = rewriter.create<tensor::EmptyOp>(
+      loc, resultType.getShape(), resultType.getElementType());
 
   SmallVector<utils::IteratorType> iteratorTypes(
-      outputType.getRank(),
+      resultType.getRank(),
       utils::IteratorType::parallel);
 
-rewriter.create<linalg::GenericOp>(
+  Value result = rewriter.create<linalg::GenericOp>(
       loc, 
-      ValueRange{op.getLhs(), op.getRhs()},  // inputs
-      ValueRange{op.getOutput()},             // outputs
+      TypeRange{resultType},                  // result types
+      ValueRange{op.getLhs(), op.getRhs()},   // inputs
+      ValueRange{emptyTensor},                // outputs
       ArrayRef<AffineMap>{
-          rewriter.getMultiDimIdentityMap(outputType.getRank()),
-          rewriter.getMultiDimIdentityMap(outputType.getRank()),
-          rewriter.getMultiDimIdentityMap(outputType.getRank())
+          rewriter.getMultiDimIdentityMap(resultType.getRank()),
+          rewriter.getMultiDimIdentityMap(resultType.getRank()),
+          rewriter.getMultiDimIdentityMap(resultType.getRank())
       },
       iteratorTypes,
       [&](OpBuilder &b, Location loc, ValueRange args) {
         Value sum = b.create<arith::AddFOp>(loc, args[0], args[1]);
         b.create<linalg::YieldOp>(loc, sum);
-      });
+      }).getResult(0);
 
-  rewriter.eraseOp(op);
+  rewriter.replaceOp(op, result);
   return success();
 }
 ```
 
 **Step-by-Step Breakdown**:
 
-1. **Extract Metadata**: `op.getLoc()` gets source location for debugging. `op.getOutput().getType()` retrieves the output memref type, which we cast to `MemRefType` for shape queries.
+1. **Extract Metadata**: `op.getLoc()` gets source location for debugging. `op.getResult().getType()` retrieves the result tensor type, which we cast to `RankedTensorType` for shape queries.
 
-2. **Build Iterator Types**: Element-wise operations use parallel iterators (no dependencies between elements). We create a vector of `parallel` iterators, one per dimension. For 2D memrefs, this is `[parallel, parallel]`.
+2. **Create Empty Tensor**: Instead of allocating a memref buffer, we create an empty tensor using `tensor::EmptyOp`. This tensor serves as the output destination for the linalg operation. The tensor→memref conversion happens later during bufferization.
 
-3. **Create Linalg.Generic**: The `rewriter.create<linalg::GenericOp>()` call constructs the lowered operation. Arguments:
+3. **Build Iterator Types**: Element-wise operations use parallel iterators (no dependencies between elements). We create a vector of `parallel` iterators, one per dimension. For 2D tensors, this is `[parallel, parallel]`.
+
+4. **Create Linalg.Generic**: The `rewriter.create<linalg::GenericOp>()` call constructs the lowered operation. Arguments:
    - **Location**: `loc` for debug info
-   - **Inputs**: `ValueRange{op.getLhs(), op.getRhs()}` - the two input memrefs
-   - **Outputs**: `ValueRange{op.getOutput()}` - the output memref (in-place)
-   - **Indexing Maps**: Three identity maps (one per operand), meaning each iterator index directly maps to memref dimensions
+   - **Result Types**: `TypeRange{resultType}` - the tensor type this operation produces
+   - **Inputs**: `ValueRange{op.getLhs(), op.getRhs()}` - the two input tensors
+   - **Outputs**: `ValueRange{emptyTensor}` - the empty tensor to write into
+   - **Indexing Maps**: Three identity maps (one per operand), meaning each iterator index directly maps to tensor dimensions
    - **Iterator Types**: Our parallel iterator vector
    - **Body Builder Lambda**: A C++ lambda constructing the region body
 
-  Note: We use `SmallVector` (LLVM's optimized vector container) instead of `std::vector` because it stores small arrays inline without heap allocation, improving performance for the common case where vectors contain few elements—critical in compiler code that creates millions of temporary vectors.
+5. **Body Construction**: The lambda receives an `OpBuilder` (for building IR inside the region) and `ValueRange args` (scalar arguments extracted from input/output tensors). We create `arith.addf %arg0, %arg1` and yield the result.
 
-4. **Body Construction**: The lambda receives an `OpBuilder` (for building IR inside the region) and `ValueRange args` (scalar arguments extracted from input/output memrefs). We create `arith.addf %arg0, %arg1` and yield the result.
-
-5. **Erase Original**: `rewriter.eraseOp(op)` removes the `nn.add` operation from IR. The rewriter tracks this replacement, updating all uses of the operation automatically.
+6. **Replace Original**: `rewriter.replaceOp(op, result)` removes the `nn.add` operation from IR and replaces all uses with the new linalg.generic result. The rewriter tracks this replacement, updating all uses of the operation automatically.
 
 **Comparison with Chapter 8**. Chapter 8's Python lowering generated strings:
 
@@ -1129,27 +1145,33 @@ struct NNMatMulOpLowering : public OpRewritePattern<MatMulOp> {
 
   LogicalResult matchAndRewrite(MatMulOp op, PatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
-    auto outputType = cast<MemRefType>(op.getOutput().getType());
+    auto resultType = cast<RankedTensorType>(op.getResult().getType());
+
+    // Create empty tensor for output
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(
+        loc, resultType.getShape(), resultType.getElementType());
 
     // Zero constant for initialization
-    auto zeroAttr = rewriter.getFloatAttr(outputType.getElementType(), 0.0);
-    auto zero = rewriter.create<arith::ConstantOp>(loc, zeroAttr);
+    auto zeroAttr = rewriter.getFloatAttr(resultType.getElementType(), 0.0);
+    Value zero = rewriter.create<arith::ConstantOp>(loc, zeroAttr);
 
-    // Fill output with zeros
-    rewriter.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{op.getOutput()});
+    // Fill output tensor with zeros
+    Value filledTensor = rewriter.create<linalg::FillOp>(
+        loc, zero, emptyTensor).getResult(0);
 
-    // Matrix multiply (accumulates into output)
-    rewriter.create<linalg::MatmulOp>(
-        loc, ValueRange{op.getLhs(), op.getRhs()},
-        ValueRange{op.getOutput()});
+    // Matrix multiply (accumulates into filled tensor)
+    Value result = rewriter.create<linalg::MatmulOp>(
+        loc, TypeRange{resultType},
+        ValueRange{op.getLhs(), op.getRhs()},
+        ValueRange{filledTensor}).getResult(0);
 
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
 ```
 
-This follows the same pattern as add: extract metadata, create constants, build target operations (`linalg.fill` and `linalg.matmul`), erase original. The `linalg.MatmulOp` creation is simpler than generic—it's a named structured operation, not a generic with custom body.
+This follows the same pattern as add: extract metadata, create empty tensor, fill with zeros, build target operations (`linalg.fill` and `linalg.matmul`), replace original. The `linalg.MatmulOp` creation is simpler than generic—it's a named structured operation, not a generic with custom body. Note that we pass `TypeRange{resultType}` to specify the output type.
 
 **ReLU Lowering with Max**:
 
@@ -1159,35 +1181,41 @@ struct NNReLUOpLowering : public OpRewritePattern<ReLUOp> {
 
   LogicalResult matchAndRewrite(ReLUOp op, PatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
-    auto outputType = cast<MemRefType>(op.getOutput().getType());
+    auto resultType = cast<RankedTensorType>(op.getResult().getType());
     
-    auto zeroAttr = rewriter.getFloatAttr(outputType.getElementType(), 0.0);
-    auto zero = rewriter.create<arith::ConstantOp>(loc, zeroAttr);
+    // Create empty output tensor
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(
+        loc, resultType.getShape(), resultType.getElementType());
+    
+    // Zero constant for ReLU comparison
+    auto zeroAttr = rewriter.getFloatAttr(resultType.getElementType(), 0.0);
+    Value zero = rewriter.create<arith::ConstantOp>(loc, zeroAttr);
     
     SmallVector<utils::IteratorType> iteratorTypes(
-        outputType.getRank(), utils::IteratorType::parallel);
+        resultType.getRank(), utils::IteratorType::parallel);
 
-    rewriter.create<linalg::GenericOp>(
+    Value result = rewriter.create<linalg::GenericOp>(
         loc,
+        TypeRange{resultType},
         ValueRange{op.getInput()},
-        ValueRange{op.getOutput()},
+        ValueRange{emptyTensor},
         ArrayRef<AffineMap>{
-            rewriter.getMultiDimIdentityMap(outputType.getRank()),
-            rewriter.getMultiDimIdentityMap(outputType.getRank())
+            rewriter.getMultiDimIdentityMap(resultType.getRank()),
+            rewriter.getMultiDimIdentityMap(resultType.getRank())
         },
         iteratorTypes,
         [&](OpBuilder &b, Location loc, ValueRange args) {
           Value maxVal = b.create<arith::MaximumFOp>(loc, zero, args[0]);
           b.create<linalg::YieldOp>(loc, maxVal);
-        });
+        }).getResult(0);
 
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
 ```
 
-ReLU uses `linalg.generic` with `arith.maximumf` instead of `addf`. The structure is identical—same pattern class, same rewriter usage, same operation erasure. This consistency is OpRewritePattern's strength: once you understand the pattern, all lowerings follow the same structure.
+ReLU uses `linalg.generic` with `arith.maximumf` instead of `addf`. The structure is identical—same pattern class, same rewriter usage, same operation replacement. This consistency is OpRewritePattern's strength: once you understand the pattern, all lowerings follow the same structure.
 
 **The Conversion Pass**. Patterns are collected into a pass:
 
@@ -1203,7 +1231,7 @@ struct ConvertNNToStandardPass
     
     // Standard dialects are legal (lowering targets)
     target.addLegalDialect<arith::ArithDialect, linalg::LinalgDialect, 
-                          memref::MemRefDialect, func::FuncDialect>();
+                          tensor::TensorDialect, func::FuncDialect>();
     
     // Register rewrite patterns
     RewritePatternSet patterns(&getContext());
@@ -1236,9 +1264,127 @@ For our pedagogical dialect, explicit pattern classes suffice. But understand th
 
 This C++ pattern rewriting approach—type-safe, composable, integrated with MLIR's infrastructure—is how production compilers implement transformations. It's more complex than Python string manipulation, but the benefits (type safety, verifiability, tooling support) justify the investment.
 
+### 9.7.4 The Complete Compilation Pipeline with Bufferization
+
+After lowering our `nn` dialect operations to tensor-based `linalg` operations, we still need to convert those high-level tensor operations all the way down to LLVM IR for execution. This requires a multi-stage compilation pipeline that includes a critical step: **bufferization**—converting immutable tensors to mutable memrefs. Let's examine the complete pipeline in [src/bindings.cpp](../ch.9.TableGen-dialect/src/bindings.cpp).
+
+**The Full Pipeline**:
+
+```cpp
+bool lowerToLLVM(ModuleOp module) {
+  PassManager pm(&context_);
+
+  // Register bufferization interfaces for tensor operations
+  DialectRegistry registry;
+  arith::registerBufferizableOpInterfaceExternalModels(registry);
+  linalg::registerBufferizableOpInterfaceExternalModels(registry);
+  tensor::registerBufferizableOpInterfaceExternalModels(registry);
+  bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(registry);
+  context_.appendDialectRegistry(registry);
+
+  // 1. Lower NN dialect to linalg (tensor-based)
+  pm.addPass(createConvertNNToStandardPass());
+  pm.addPass(mlir::createCanonicalizerPass());
+
+  // 2. Bufferize tensors to memrefs  
+  bufferization::OneShotBufferizePassOptions bufferizationOptions;
+  bufferizationOptions.bufferizeFunctionBoundaries = true;
+  pm.addPass(bufferization::createOneShotBufferizePass(bufferizationOptions));
+  pm.addPass(bufferization::createBufferResultsToOutParamsPass());
+  pm.addPass(mlir::createCanonicalizerPass());
+
+  // 3. Lower linalg to loops
+  pm.addPass(mlir::createConvertLinalgToLoopsPass());
+
+  // 4. Lower to LLVM
+  pm.addPass(createConvertMathToLLVMPass());
+  pm.addPass(createConvertMathToLibmPass());
+  pm.addPass(createSCFToControlFlowPass());
+  pm.addPass(createArithToLLVMConversionPass());
+  pm.addPass(createConvertControlFlowToLLVMPass());
+  pm.addPass(createFinalizeMemRefToLLVMConversionPass());
+  pm.addPass(createConvertFuncToLLVMPass());
+  pm.addPass(createReconcileUnrealizedCastsPass());
+
+  return succeeded(pm.run(module));
+}
+```
+
+**Pipeline Stages Explained**:
+
+**Stage 1: NN → Linalg (Tensor-based)**. Our custom `ConvertNNToStandardPass` lowers high-level operations like `nn.add` and `nn.matmul` to tensor-based `linalg.generic` and `linalg.matmul` operations. At this stage, we're still working with immutable tensors—functional style operations that return new values rather than modifying memory in-place.
+
+**Stage 2: Bufferization (Tensors → Memrefs)**. This is where the magic happens! The `OneShotBufferizePass` systematically converts:
+- `tensor<4xf32>` types → `memref<4xf32>` types
+- `tensor.empty()` operations → `memref.alloc()` allocations
+- `linalg.generic` on tensors → `linalg.generic` on memrefs
+- Function signatures returning tensors → Functions with output parameters
+
+**Critical: Bufferization Interface Registration**. The key to making bufferization work is registering **bufferization interfaces** before running the pass:
+
+```cpp
+arith::registerBufferizableOpInterfaceExternalModels(registry);       // For arith ops
+linalg::registerBufferizableOpInterfaceExternalModels(registry);      // For linalg ops
+tensor::registerBufferizableOpInterfaceExternalModels(registry);      // For tensor ops
+bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(registry);  // For func ops ← CRITICAL!
+```
+
+Each of these registrations tells OneShotBufferize how to handle specific operations. The `func_ext` registration is particularly important—it tells the pass how to bufferize function signatures and block arguments. Without these registrations, OneShotBufferize fails with "op was not bufferized" errors.
+
+**Bufferization Options**:
+- `bufferizeFunctionBoundaries = true`: Allows bufferization to modify function signatures, converting tensor parameters and results to memrefs
+- `BufferResultsToOutParamsPass()`: Converts functions that return memrefs into functions with output parameters (the calling convention we need for execution)
+
+**Stage 3: Linalg → Loops**. After bufferization, `linalg.generic` operations on memrefs are lowered to explicit `scf.for` loops. This converts high-level structured operations into explicit iteration.
+
+**Stage 4: Standard Dialects → LLVM**. The final stage converts all remaining high-level operations to LLVM dialect:
+- Math operations (`math.sqrt`) → LLVM intrinsics or libm calls
+- SCF loops → Control flow branches
+- Arithmetic operations (`arith.addf`) → LLVM arithmetic
+- MemRef operations (`memref.load`) → LLVM pointers and loads
+- Function operations (`func.func`) → LLVM functions
+
+**The Complete Transform**:
+
+```mlir
+// Start: High-level NN dialect
+%result = nn.add %a, %b : tensor<4xf32>
+
+// After NN lowering: Tensor-based linalg
+%empty = tensor.empty() : tensor<4xf32>
+%result = linalg.generic {...} ins(%a, %b) outs(%empty) : tensor<4xf32>
+
+// After bufferization: Memref-based linalg
+%alloc = memref.alloc() : memref<4xf32>
+linalg.generic {...} ins(%a, %b : memref<4xf32>, memref<4xf32>) 
+                     outs(%alloc : memref<4xf32>)
+
+// After linalg lowering: Explicit loops
+scf.for %i = %c0 to %c4 step %c1 {
+  %val_a = memref.load %a[%i] : memref<4xf32>
+  %val_b = memref.load %b[%i] : memref<4xf32>
+  %sum = arith.addf %val_a, %val_b : f32
+  memref.store %sum, %alloc[%i] : memref<4xf32>
+}
+
+// After LLVM lowering: LLVM IR
+// (machine instructions, pointer arithmetic, etc.)
+```
+
+**Why This Staging Matters**. Each stage operates at a different abstraction level:
+1. NN dialect: Domain-specific ML operations
+2. Linalg + Tensor: Structured linear algebra (optimizable, portable)
+3. Linalg + MemRef: Explicit memory operations (ready for loop optimization)
+4. SCF: Explicit control flow (ready for backend)
+5. LLVM: Machine-level operations (ready for execution)
+
+This staged lowering enables optimizations at each level. Tensor-based linalg enables fusion and tiling. Memref-based linalg enables buffer reuse and memory planning. SCF loops enable loop transformations. LLVM enables machine-specific optimizations.
+
+**Comparison with Chapter 8**. Chapter 8 generated low-level MLIR text directly (linalg on memrefs). Chapter 9 starts higher (linalg on tensors) and uses MLIR's bufferization infrastructure to systematically lower. This approach is more modular, enables more optimizations, and matches production ML compilers like JAX (HLO → Linalg → Bufferize → LLVM) and Torch-MLIR (Torch → Linalg → Bufferize → LLVM).
+
 ### 9.7.5 TypeConverter: Managing Type Transformations in Dialect Lowering
 
-The pattern rewriters we've implemented (Add, MatMul, ReLU) share a subtle assumption: **input and output types remain unchanged during lowering**. An `nn.add` operating on `memref<128x128xf32>` lowers to `linalg.generic` operating on the same memref type. But many real-world dialect lowerings require **type conversions**—transforming not just operations but the types they work with. A prime example is **bufferization** (covered in Chapter 4), which converts immutable tensor types to mutable memref types, fundamentally changing how data is represented in memory. This section explores MLIR's `TypeConverter` mechanism, showing how to handle such type changes systematically during dialect lowering.
+The pattern rewriters we've implemented (Add, MatMul, ReLU) operate at the first lowering stage: NN dialect → Linalg on tensors. The types don't change in this stage—tensors remain tensors. But the bufferization stage we just examined in 9.7.4 fundamentally transforms types: tensors become memrefs. This section explores MLIR's `TypeConverter` mechanism in depth, showing how bufferization and other type-changing transformations work systematically.
 
 **When Type Conversion Matters**. Consider lowering from high-level tensor types to low-level memref types:
 
@@ -1551,12 +1697,12 @@ py::array_t<float> forward(const Tensor& output_tensor) {
   SmallVector<Type> inputTypes, resultTypes;
   for (auto& [id, array] : graph.tensors) {
     if (is_input(id)) {
-      inputTypes.push_back(getMemRefType(builder, array));
+      inputTypes.push_back(getTensorType(builder, array));
     }
   }
-  resultTypes.push_back(getMemRefType(builder, output_array));
+  auto outputType = getTensorType(builder, output_array);
   
-  auto funcType = builder.getFunctionType(inputTypes, resultTypes);
+  auto funcType = builder.getFunctionType(inputTypes, ArrayRef<Type>{outputType});
   auto func = builder.create<func::FuncOp>(
       builder.getUnknownLoc(), "main", funcType);
   
@@ -1574,26 +1720,25 @@ py::array_t<float> forward(const Tensor& output_tensor) {
     Value lhs = valueMap[node.inputs[0]];
     Value rhs = valueMap[node.inputs[1]];
     
-    // Allocate output
-    auto outputType = getMemRefType(builder, node.shape);
-    Value output = builder.create<memref::AllocOp>(
-        builder.getUnknownLoc(), outputType);
-    
-    // Create operation
+    // Create operation (returns tensor result)
+    Value result;
     if (node.op_type == "add") {
-      builder.create<AddOp>(builder.getUnknownLoc(), lhs, rhs, output);
+      result = builder.create<AddOp>(
+          builder.getUnknownLoc(), outputType, lhs, rhs);
     } else if (node.op_type == "mul") {
-      builder.create<MulOp>(builder.getUnknownLoc(), lhs, rhs, output);
+      result = builder.create<MulOp>(
+          builder.getUnknownLoc(), outputType, lhs, rhs);
     } else if (node.op_type == "matmul") {
-      builder.create<MatMulOp>(builder.getUnknownLoc(), lhs, rhs, output);
+      result = builder.create<MatMulOp>(
+          builder.getUnknownLoc(), outputType, lhs, rhs);
     }
     
-    valueMap[node.output_id] = output;
+    valueMap[node.output_id] = result;
   }
   
   builder.create<func::ReturnOp>(builder.getUnknownLoc(), valueMap[output_tensor.id]);
   
-  // Compile and execute (same as Chapter 8: lower to LLVM, JIT, call via libffi)
+  // Compile and execute (lower to LLVM, JIT, call via libffi)
   lowerToLLVM(module);
   void* fnPtr = compile(module, "main");
   return execute(fnPtr, input_arrays, output_shape);
@@ -1605,11 +1750,11 @@ py::array_t<float> forward(const Tensor& output_tensor) {
 **OpBuilder Methods**. Key OpBuilder APIs:
 
 ```cpp
-// Create operations
-Value result = builder.create<AddOp>(loc, lhs, rhs, output);
+// Create operations (tensor-based)
+Value result = builder.create<AddOp>(loc, resultType, lhs, rhs);
 
 // Get types
-MemRefType type = MemRefType::get({4}, builder.getF32Type());
+TensorType type = RankedTensorType::get({4}, builder.getF32Type());
 
 // Manage insertion point
 builder.setInsertionPointToStart(block);

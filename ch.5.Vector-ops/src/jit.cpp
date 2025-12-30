@@ -1,12 +1,14 @@
 //===- jit.cpp - JIT Execution for SAXPY ---------------------------------===//
 //
-// JIT compilation workflow:
-//   1. Generate MLIR IR with SCF
-//   2. Lower to LLVM IR
-//   3. JIT compile to native code using ExecutionEngine
-//   4. Execute with dynamic sizes
+// JIT compilation workflow (Tensor-First):
+//   1. Generate MLIR IR with tensors (linalg.generic)
+//   2. Bufferize: tensor → memref with out-parameters
+//   3. Lower to LLVM IR
+//   4. JIT compile to native code using ExecutionEngine
+//   5. Execute with dynamic sizes
 //
-// Key difference from Chapter 1: Dynamic memrefs (memref<?xf32>)
+// After bufferization, the function signature becomes:
+//   void saxpy(float alpha, memref<?xf32> A, memref<?xf32> B, memref<?xf32> C)
 //
 //===----------------------------------------------------------------------===//
 
@@ -29,10 +31,16 @@ LogicalResult applyLoweringPasses(ModuleOp module);
 
 /// JIT-compiles and executes SAXPY with dynamic sizes.
 ///
+/// After bufferization, the tensor-based signature:
+///   func.func @saxpy(%alpha: f32, %A: tensor<?xf32>, %B: tensor<?xf32>) -> tensor<?xf32>
+///
+/// Becomes the memref-based signature with out-parameter:
+///   func.func @saxpy(%alpha: f32, %A: memref<?xf32>, %B: memref<?xf32>, %C: memref<?xf32>)
+///
 /// MemRef descriptor for memref<?xf32> expands to 5 arguments:
 ///   (ptr, ptr, offset, size, stride)
 ///
-/// Full signature:
+/// Full LLVM signature:
 ///   void saxpy(float alpha,
 ///              float* A_allocated, float* A_aligned, int64_t A_offset, int64_t A_size, int64_t A_stride,
 ///              float* B_allocated, float* B_aligned, int64_t B_offset, int64_t B_size, int64_t B_stride,

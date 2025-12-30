@@ -112,247 +112,302 @@ The separation between graph construction (recording operations) and IR generati
 
 ## 7.5 Element-Wise Operations: Add and Multiply
 
-Element-wise operations apply the same scalar operation to corresponding elements of input tensors: addition, multiplication, maximum, and so forth. These operations are embarrassingly parallel—each output element can be computed independently—and map naturally to explicit loops iterating over indices. We implement `add` and `mul` as our first graph operations, establishing patterns we'll reuse for more complex operations.
+Element-wise operations apply the same scalar operation to corresponding elements of input tensors: addition, multiplication, maximum, and so forth. These operations are embarrassingly parallel—each output element can be computed independently—and our implementation uses **linalg.generic**, a high-level operation that expresses element-wise computations through affine maps and region-based computation.
 
-Building an element-wise operation follows a standard template: allocate a result buffer matching the input shape, create nested loops iterating over all indices, load values from both inputs at the current index, apply the scalar operation, and store the result. The loop structure mirrors what we did manually in Chapter 5's SAXPY implementation, but now we're generating it programmatically from a graph specification. For 1D tensors, we need a single loop; for 2D tensors (matrices), we need nested loops over rows and columns; higher-dimensional tensors require deeper loop nests.
+**Linalg.generic** is MLIR's Swiss Army knife for structured array operations. It takes a set of input and output tensors, affine maps describing how to access elements, iterator types (parallel or reduction), and a region containing the scalar computation. For element-wise operations, all iterators are parallel (no reductions), the affine maps are all identity maps (element i,j in output corresponds to element i,j in inputs), and the region contains the scalar arithmetic operation.
 
-The MLIR generated for element-wise operations is straightforward: nested `scf.for` loops surrounding load-operate-store sequences. For addition of two 4-element vectors, we generate a single loop from 0 to 4, loading `input1[i]` and `input2[i]`, adding them with `arith.addf`, and storing to `result[i]`. For 2×3 matrices, we generate nested loops over rows (i from 0 to 2) and columns (j from 0 to 3), with loads `input1[i,j]` and `input2[i,j]`, and store to `result[i,j]`. This explicit loop form gives LLVM's optimizer complete visibility into access patterns, enabling vectorization and other low-level optimizations.
+For addition of two tensors, we create a `linalg.generic` operation with:
+- Two input tensors and one output tensor (initialized with `tensor.empty`)
+- Identity affine maps for all operands: `(d0, d1) -> (d0, d1)`
+- All parallel iterators: `["parallel", "parallel"]` for 2D
+- A region that adds the two scalar elements: `%sum = arith.addf %lhs, %rhs`
+
+This high-level specification generates the same efficient loops as explicit SCF code but provides more optimization opportunities—the Linalg dialect knows this is element-wise and can apply fusion, tiling, and vectorization transformations automatically.
 
 ## 7.6 Matrix Multiplication with Linalg Dialect
 
-Matrix multiplication is the computational heart of neural networks—every linear layer, every attention mechanism, every learned transformation performs matrix multiplication. Unlike element-wise operations where output position (i,j) depends only on inputs at (i,j), matrix multiply has complex dependencies: output[i,j] depends on all elements in row i of the left matrix and column j of the right matrix. We could implement this with three nested loops (over output rows, output columns, and the reduction dimension), but MLIR provides a better approach: the **Linalg dialect**.
+Matrix multiplication is the computational heart of neural networks—every linear layer, every attention mechanism, every learned transformation performs matrix multiplication. Unlike element-wise operations where output position (i,j) depends only on inputs at (i,j), matrix multiply has complex dependencies: output[i,j] depends on all elements in row i of the left matrix and column j of the right matrix. The **Linalg dialect** provides `linalg.matmul`, a structured operation that encapsulates this computation at a high semantic level.
 
-The Linalg dialect (short for "linear algebra") provides structured operations for common array computations. Operations like `linalg.matmul`, `linalg.conv_2d`, and `linalg.pooling` encapsulate common access patterns at a high semantic level, avoiding manual loop writing while preserving optimization opportunities. `linalg.matmul` specifically represents C = A × B as a single operation, leaving the actual loop implementation to lowering passes. This high-level representation enables optimizations that would be difficult to recognize from explicit loops: tiling for cache locality, fusion with adjacent operations, or replacement with vendor-optimized BLAS libraries.
+The Linalg dialect (short for "linear algebra") provides structured operations for common array computations. Operations like `linalg.matmul`, `linalg.conv_2d`, and `linalg.reduce` encapsulate common access patterns at a high semantic level, avoiding manual loop writing while preserving optimization opportunities. `linalg.matmul` specifically represents C = A × B as a single operation, leaving the actual loop implementation to lowering passes. This high-level representation enables optimizations that would be difficult to recognize from explicit loops: tiling for cache locality, fusion with adjacent operations, or replacement with vendor-optimized BLAS libraries.
 
-Using `linalg.matmul` in our graph is remarkably simple compared to writing explicit loops. We allocate a result buffer with appropriate shape (if A is M×K and B is K×N, result is M×N), then create a single `linalg::MatmulOp` taking the two inputs and output buffer. The operation is semantically defined by its access patterns and computation: for each output element C[i,j], compute the sum over k of A[i,k] × B[k,j]. The MLIR lowering infrastructure knows how to convert this high-level specification into efficient loops, potentially with tiling, vectorization, and other optimizations we haven't written explicitly.
+Using `linalg.matmul` involves two steps: **initialize the output** and **perform the multiply-accumulate**. First, we create an output tensor using `tensor.empty` with the appropriate shape (if A is M×K and B is K×N, result is M×N). The output needs initialization to zero since matmul accumulates results. We use `linalg.fill` to create a zero-initialized tensor:
 
-The C++ API for creating matrix multiplication demonstrates how different dialects serve different purposes. After allocating the output buffer using `memref::AllocOp`, we create the operation with:
-
-```cpp
-builder.create<linalg::MatmulOp>(
-    loc,
-    ValueRange{lhs, rhs},  // Inputs
-    ValueRange{result}      // Output (accumulator)
-);
+```mlir
+%c0 = arith.constant 0.0 : f32
+%empty = tensor.empty() : tensor<2x4xf32>
+%zero_init = linalg.fill ins(%c0 : f32) outs(%empty : tensor<2x4xf32>) -> tensor<2x4xf32>
 ```
 
-This single line replaces dozens of lines of loop construction code we'd need for manual implementation. The operation takes two input tensors and one output tensor (which serves as an accumulator—the operation computes `result += lhs × rhs`, so we initialize `result` to zero if we want pure multiplication). The Linalg dialect's design philosophy is that structured operations should be composable, analyzable, and transformable, which high-level single-operation nodes provide better than explicit loops.
+Then we create the matmul operation:
 
-The lowering of `linalg.matmul` happens in multiple stages. The `linalg-bufferize` pass converts Linalg operations on tensors to operations on buffers (memrefs). The `convert-linalg-to-loops` pass expands the matmul into three nested loops: outer loop over output rows, middle loop over output columns, inner loop over the reduction dimension. These loops use `scf.for` with loop-carried variables for the accumulation (very similar to the patterns we learned in Chapter 6). Further passes then lower SCF to control flow, and eventually to LLVM. The key point is that we write high-level intent (matrix multiply), and the infrastructure handles low-level details.
+```mlir
+%result = linalg.matmul ins(%lhs, %rhs : tensor<2x3xf32>, tensor<3x4xf32>)
+                        outs(%zero_init : tensor<2x4xf32>) -> tensor<2x4xf32>
+```
+
+The operation semantics are: for each output element C[i,j], compute the sum over k of A[i,k] × B[k,j] and add it to the output accumulator. Since we initialized the output to zero, we get the standard matrix product. The generated IR works directly with tensors—no explicit memory allocation, no manual buffer management, just high-level operations that will be lowered to efficient code later.
+
+When `linalg.matmul` lowers to loops (via the `convert-linalg-to-loops` pass), it expands into three nested SCF loops: outer over rows, middle over columns, inner over the reduction dimension with loop-carried variables for accumulation. The bufferization passes then convert tensors to memrefs with proper memory allocation. This layered approach separates concerns: at the graph level, we think about mathematical operations on tensors; at the lowering level, we handle memory and loops.
 
 ## 7.7 Activation Functions: ReLU and Softmax
 
-Activation functions introduce non-linearity into neural networks. Without them, stacking multiple linear layers would just compute another linear function—we'd gain nothing from depth. ReLU (Rectified Linear Unit) and softmax are two of the most common activations, appearing in nearly every modern architecture. ReLU is simple: output max(0, input) element-wise. Softmax is more complex: the operation we implemented in Chapter 6, normalizing a vector into a probability distribution.
+Activation functions introduce non-linearity into neural networks. Without them, stacking multiple linear layers would just compute another linear function—we'd gain nothing from depth. ReLU (Rectified Linear Unit) and softmax are two of the most common activations, appearing in nearly every modern architecture. Both are implemented using high-level linalg operations that will be efficiently lowered during compilation.
 
-**ReLU** is computationally trivial but critically important. We implement it as an element-wise operation: iterate over all elements, compare each with zero using `arith.cmpf` with "ordered greater than or equal" predicate, and select between the input value and zero using `arith.select`. The comparison produces a boolean (i1 in MLIR terms), and `select` chooses the first value if the condition is true, the second otherwise. For GPUs and modern CPUs, this maps to efficient branch-free instructions—no actual conditional jumps, just predicated moves.
+**ReLU** is computationally trivial but critically important: output max(0, input) element-wise. We implement it using `linalg.generic` with a scalar computation region that compares with zero and selects the maximum. The operation takes one input tensor and produces one output tensor, with identity affine maps and parallel iterators.
 
-The C++ implementation follows the same nested-loop pattern as element-wise operations, but inside the loop body we have three operations instead of two: compare with zero, select based on comparison, store result. Here's the core pattern for the innermost operation:
-
-```cpp
-auto zero = builder.create<arith::ConstantFloatOp>(loc, APFloat(0.0f), f32Type);
-auto val = builder.create<memref::LoadOp>(loc, input, indices);
-auto cmp = builder.create<arith::CmpFOp>(
-    loc, arith::CmpFPredicate::OGE, val, zero);  // Ordered Greater-or-Equal
-auto selected = builder.create<arith::SelectOp>(loc, cmp, val, zero);
-builder.create<memref::StoreOp>(loc, selected, result, indices);
+Inside the linalg.generic region, we have scalar operations:
+```mlir
+^bb0(%in: f32, %out: f32):
+  %c0 = arith.constant 0.0 : f32
+  %max = arith.maximumf %in, %c0 : f32
+  linalg.yield %max : f32
 ```
 
-The "ordered" in the predicate name means NaN values compare as false, consistent with IEEE 754 semantics. This matters for robustness—if input data contains NaNs (from numerical errors elsewhere), we want predictable behavior rather than undefined comparisons.
+The `arith.maximumf` operation computes the maximum of two floating-point values, handling NaN values according to IEEE 754 semantics (NaN propagates). This maps to efficient instructions on modern hardware—typically a single MAXSS/MAXPS instruction on x86 or FMAX on ARM, with no branching required.
 
-**Softmax** in the computation graph context reuses the implementation from Chapter 6 almost verbatim. We apply the same three-pass algorithm (find maximum, compute exponentials and sum, normalize), generating the same IR structure we built manually before. The key difference is architectural: in Chapter 6, we wrote a standalone function specifically for softmax. Here, softmax is one operation in a larger graph, and its implementation is generated by our graph's IR generation logic. The code is nearly identical—we copy the patterns from Chapter 6's `createSoftmaxModule()` function into our graph's `buildSoftmax()` helper method.
+**Softmax** in the computation graph reuses the multi-pass algorithm from Chapter 6, but now implemented with linalg operations. The four-pass algorithm remains the same:
+1. **Find maximum**: Use `linalg.reduce` with `arith.maximumf` to find max value
+2. **Subtract and exponentiate**: Use `linalg.generic` with `math.exp` to compute exp(x - max)
+3. **Sum exponentials**: Use `linalg.reduce` with `arith.addf` to compute the normalizing sum
+4. **Normalize**: Use `linalg.generic` with `arith.divf` to divide each exp by the sum
 
-This reuse demonstrates a powerful principle: once we've learned to build an operation manually (Chapter 6), we can package it into a higher-level API (this chapter) with minimal additional work. The same patterns apply: lambda-style loops for reductions, multi-step loops for simple iteration, careful management of temporary buffers for multi-pass algorithms. Building a library of neural network operations is largely a matter of identifying operation patterns, implementing them with MLIR's C++ APIs using the patterns we've learned, and wrapping them in a clean API that hides implementation details.
+Each pass is a structured linalg operation. The reductions use `linalg.reduce` which specifies:
+- Input and output tensors
+- The dimensions to reduce over (dimension 0 for 1D)
+- A combiner region with the reduction operation (max or add)
 
-Softmax in a computation graph often operates on a specific dimension of multi-dimensional tensors—for example, normalizing each row of a matrix independently (useful for batch operations where each row is an independent sample). Our implementation currently handles 1D tensors only. Extending to per-dimension softmax requires adding an outer loop over the non-normalized dimensions, similar to how we extend element-wise operations to higher dimensions. The core three-pass algorithm stays the same; we just wrap it in additional loops.
+For the element-wise passes (exp and normalize), we use `linalg.generic` as in element-wise operations, but the scalar computation is more complex—calling `math.exp` or `arith.divf`.
+
+This multi-level approach provides excellent separation of concerns: at the graph level, we compose four linalg operations; at the lowering level, each linalg operation becomes efficient loops; at the LLVM level, the math operations become vectorized or library calls. The algorithm structure is clear at the high level, but performance comes from systematic lowering.
 
 ## 7.8 Recursive IR Generation from Graph Structure
 
-The `generateMLIR()` method transforms our symbolic graph into concrete MLIR operations through depth-first traversal with memoization. Understanding this process is crucial for building your own graph-based systems or extending our implementation with new operations. Let's walk through the algorithm step by step, showing how high-level graph descriptions become executable MLIR code.
+The `generateMLIR()` method transforms our symbolic graph into concrete MLIR operations through depth-first traversal with memoization. The generated IR follows the **tensor-first** pattern: operations work on immutable tensor values, with bufferization handled by later passes.
 
 **Step 1: Identify Variables**
 
-We scan all operations in the graph, collecting those with type `Input`—these are variables, placeholders for actual data that will be provided at execution time. Each variable becomes a function parameter. If we have three variables with shapes [4], [4], and [2,3], our function signature will take three memref parameters: `memref<4xf32>`, `memref<4xf32>`, and `memref<2x3xf32>`. We also add an output parameter matching the output operation's shape.
+We scan all operations in the graph, collecting those with type `Input`—these are variables, placeholders for actual data that will be provided at execution time. Each variable becomes a function parameter. If we have three variables with shapes [4], [4], and [2,3], our function signature will take three tensor parameters: `tensor<4xf32>`, `tensor<4xf32>`, and `tensor<2x3xf32>`.
 
 **Step 2: Create Function Signature**
 
-Using the collected variables, we construct a `FunctionType` mapping input types to empty output (we use out-parameters). We create a `func::FuncOp` with this signature and add an entry block. The entry block receives arguments corresponding to our parameters—these become the initial entries in our `valueMap`, associating variable operation IDs with MLIR `Value` objects representing the function's parameters. Now we're ready to build the computation.
+Using the collected variables, we construct a `FunctionType` taking tensor inputs and returning a single tensor output:
+
+```mlir
+func.func @compute(%x: tensor<4xf32>, %y: tensor<4xf32>) -> tensor<4xf32>
+```
+
+This functional style (explicit return value rather than out-parameters) is cleaner and more composable. The conversion to out-parameters happens during bufferization via the `buffer-results-to-out-params` pass.
 
 **Step 3: Recursive Operation Building**
 
-The `buildOperation()` method is the workhorse. Given an operation ID, it:
+The `buildOperation()` method recursively generates tensor operations. Given an operation ID:
 
-1. Checks if that operation's result is already in `valueMap`. If so, return the cached value immediately—this is our memoization.
+1. Check if that operation's result is already in `valueMap` (memoization)
+2. If it's a variable, return the corresponding function parameter
+3. Otherwise, recursively build all input operations to get their tensor results
+4. Call the appropriate builder (`buildElementWiseOp`, `buildMatMul`, etc.)
+5. Cache the resulting tensor value and return it
 
-2. If it's a variable, return the corresponding function parameter (already in the map from step 2).
+Each builder returns a tensor value—the result of the linalg operation. These values flow through subsequent operations without any explicit memory management at this level.
 
-3. Otherwise, recursively build all input operations, obtaining their result values. This is the depth-first traversal: to build operation N, we first build all operations it depends on.
+**Step 4: Return Result**
 
-4. With input values available, call the appropriate builder function (`buildElementWiseOp`, `buildMatMul`, `buildReLU`, or `buildSoftmax`) to generate the operation's MLIR.
+After building the output operation, we have a tensor value representing the final result. We simply return it from the function:
 
-5. Cache the resulting value in `valueMap` and return it.
+```cpp
+builder.create<func::ReturnOp>(loc, ValueRange{outputValue});
+```
 
-The base case is variables (already in map), and each recursive call processes operations topologically—dependencies before dependents. The memoization ensures we never build the same operation twice, even if multiple downstream operations use its result.
+No explicit copy loops, no buffer management—just return the tensor. The bufferization passes later will:
+- Allocate buffers for intermediate results
+- Convert return value to output parameter
+- Insert necessary buffer copies
+- Manage buffer lifetimes and deallocations
 
-**Step 4: Copy Result to Output**
+This separation of concerns is powerful: graph construction focuses on mathematical semantics (what to compute), while bufferization handles implementation details (where to store data, when to copy, etc.).
 
-After building the output operation, we have a `Value` representing its result—typically a memref allocated with `memref.alloc`. We need to copy this to the output buffer (the function's last parameter) so Python can access the results. We generate a copy loop: for 1D results, a single `scf.for` loading from the result and storing to the output buffer; for 2D results, nested loops. This explicit copy is necessary because different operations allocate result buffers in different ways, and we need a consistent interface.
+**Generated IR Structure**
 
-The complete generated module contains a single function that takes input memrefs, builds the entire computation graph inline, and writes results to the output memref. There are no intermediate functions, no calls—everything is inlined because we generated it as one continuous function body. This inlining is typical of compilers' early stages; later optimization passes may extract common subgraphs into functions if that improves code size or cache behavior, but we start with everything inline for simplicity.
+The complete module contains a function with tensor operations:
+
+```mlir
+func.func @compute(%arg0: tensor<2x3xf32>, %arg1: tensor<3x4xf32>) -> tensor<2x4xf32> {
+  %cst = arith.constant 0.0 : f32
+  %0 = tensor.empty() : tensor<2x4xf32>
+  %1 = linalg.fill ins(%cst : f32) outs(%0 : tensor<2x4xf32>) -> tensor<2x4xf32>
+  %2 = linalg.matmul ins(%arg0, %arg1 : tensor<2x3xf32>, tensor<3x4xf32>)
+                      outs(%1 : tensor<2x4xf32>) -> tensor<2x4xf32>
+  return %2 : tensor<2x4xf32>
+}
+```
+
+Clean, high-level, optimizable. The bufferization and lowering passes transform this into efficient imperative code with explicit loops and memory management.
 
 ## 7.9 Building Element-Wise Operations: C++ Implementation
 
-Let's examine the C++ implementation of element-wise operations in detail, showing how to construct nested loops programmatically and manage insertion points correctly. This implementation pattern recurs throughout MLIR code generation, so understanding it thoroughly pays dividends. We'll use addition as our example, but multiplication follows an identical pattern.
+Let's examine the C++ implementation of element-wise operations using `linalg.generic`, showing how to construct affine maps and scalar computation regions. This implementation pattern is fundamental to many tensor operations and demonstrates MLIR's composability—complex operations built from simple primitives.
 
-**Allocating the Result Buffer**
+**Creating Affine Maps**
 
-Element-wise operations need a result buffer matching the input shape:
+Element-wise operations access corresponding elements from inputs and output, expressed via **identity affine maps**. For 2D tensors:
 
 ```cpp
 Value buildElementWiseOp(OpBuilder& builder, Location loc, 
                          Value lhs, Value rhs, OpType opType) {
-    auto lhsType = lhs.getType().cast<MemRefType>();
-    auto shape = lhsType.getShape();
+    auto lhsType = lhs.getType().cast<RankedTensorType>();
+    auto rank = lhsType.getRank();
     
-    // Allocate result buffer
-    Value result = builder.create<memref::AllocOp>(loc, lhsType);
+    // Create identity affine maps: (d0, d1, ...) -> (d0, d1, ...)
+    SmallVector<AffineMap> indexingMaps;
+    auto identityMap = builder.getMultiDimIdentityMap(rank);
+    indexingMaps.push_back(identityMap);  // lhs
+    indexingMaps.push_back(identityMap);  // rhs
+    indexingMaps.push_back(identityMap);  // output
 ```
 
-We extract the memref type from the left operand, get its shape, and allocate a new memref with the same type. The `memref::AllocOp` allocates heap memory (unlike `memref::AllocaOp` which uses stack) because we don't know the size statically and the result might be large. The allocation will be freed automatically when the function returns, as MLIR's buffer deallocation pass inserts appropriate `memref.dealloc` operations during lowering.
+The identity map means: for position (i,j) in the output, read from position (i,j) in both inputs. All maps are identical because element-wise operations have 1:1 correspondence across all tensors.
 
-**Query Runtime Dimensions**
+**Defining Iterator Types**
 
-We need to iterate over all elements, but we don't know the sizes statically (our types use dynamic dimensions). We query sizes at runtime using `memref.dim`:
+Element-wise operations have all-parallel iteration—no reductions, every output element is independent:
 
 ```cpp
-auto rank = lhsType.getRank();
-SmallVector<Value> dims;
-for (int64_t i = 0; i < rank; ++i) {
-    auto dim = builder.create<memref::DimOp>(loc, lhs, i);
-    dims.push_back(dim);
+    SmallVector<StringRef> iteratorTypes(rank, getParallelIteratorTypeName());
+```
+
+For 2D, this creates `["parallel", "parallel"]`. For 3D, `["parallel", "parallel", "parallel"]`. Parallel iterators tell the compiler these can execute in any order or concurrently, enabling optimizations like parallelization and vectorization.
+
+**Creating Output Tensor**
+
+We need an output tensor with the same shape as inputs:
+
+```cpp
+    auto outputType = lhsType;  // Same type as input
+    Value emptyTensor = builder.create<tensor::EmptyOp>(loc, outputType.getShape(), 
+                                                        outputType.getElementType());
+```
+
+`tensor.empty` declares a tensor without allocating or initializing—it's a placeholder that bufferization will turn into actual memory allocation later.
+
+**Building linalg.generic with Region**
+
+The core operation specifies inputs, outputs, indexing, iterators, and the scalar computation:
+
+```cpp
+    auto genericOp = builder.create<linalg::GenericOp>(
+        loc,
+        /*resultTensorTypes=*/TypeRange{outputType},
+        /*inputs=*/ValueRange{lhs, rhs},
+        /*outputs=*/ValueRange{emptyTensor},
+        /*indexingMaps=*/indexingMaps,
+        /*iteratorTypes=*/iteratorTypes,
+        /*bodyBuilder=*/[&](OpBuilder& b, Location loc, ValueRange args) {
+            // args[0] = lhs element, args[1] = rhs element, args[2] = output element
+            Value result;
+            if (opType == OpType::Add) {
+                result = b.create<arith::AddFOp>(loc, args[0], args[1]);
+            } else {  // Mul
+                result = b.create<arith::MulFOp>(loc, args[0], args[1]);
+            }
+            b.create<linalg::YieldOp>(loc, result);
+        });
+    
+    return genericOp.getResult(0);
 }
 ```
 
-Each dimension is queried separately, producing an index-typed value representing that dimension's runtime size. For a 2D matrix, `dims[0]` is the number of rows, `dims[1]` is the number of columns. These values will be our loop upper bounds.
+The lambda defines the scalar computation: given elements from lhs and rhs, compute the result and yield it. The linalg infrastructure will generate loops that:
+1. Iterate over all indices in parallel
+2. Load elements from lhs and rhs at each index
+3. Call the scalar computation
+4. Store the result to the output
 
-**Building Nested Loops**
+This high-level specification is much shorter than explicit loop construction, yet produces equally efficient (or better) code after lowering and optimization.
 
-For a 1D tensor, we need a single loop. For 2D, we need nested loops. The nesting is constructed by setting insertion points: create the outer loop, set the insertion point inside its body, create the inner loop there, set the insertion point inside the inner loop's body, and finally build the element operation. Here's the 2D case:
+**Key Advantages**
 
-```cpp
-auto zero = builder.create<arith::ConstantIndexOp>(loc, 0);
-auto one = builder.create<arith::ConstantIndexOp>(loc, 1);
-
-auto outerLoop = builder.create<scf::ForOp>(loc, zero, dims[0], one);
-builder.setInsertionPointToStart(outerLoop.getBody());
-Value i = outerLoop.getInductionVar();
-
-auto innerLoop = builder.create<scf::ForOp>(loc, zero, dims[1], one);
-builder.setInsertionPointToStart(innerLoop.getBody());
-Value j = innerLoop.getInductionVar();
-
-// Now build the element operation
-auto lhsVal = builder.create<memref::LoadOp>(loc, lhs, ValueRange{i, j});
-auto rhsVal = builder.create<memref::LoadOp>(loc, rhs, ValueRange{i, j});
-Value resultVal;
-if (opType == OpType::Add) {
-    resultVal = builder.create<arith::AddFOp>(loc, lhsVal, rhsVal);
-} else {  // Mul
-    resultVal = builder.create<arith::MulFOp>(loc, lhsVal, rhsVal);
-}
-builder.create<memref::StoreOp>(loc, resultVal, result, ValueRange{i, j});
-```
-
-The pattern is: create loop, set insertion point inside it, create inner loop (if needed), set insertion point inside that, then build the body operations. The induction variables (`i` and `j`) serve as our array indices for loads and stores.
-
-**Restoration and Return**
-
-After building the nested loops, the insertion point is inside the innermost loop body. We need to return it to the proper level—after the outermost loop—so subsequent operations in the same function are generated in the right place:
-
-```cpp
-builder.setInsertionPointAfter(outerLoop);
-return result;
-```
-
-Now the insertion point is after the complete nested loop structure, and we return the result memref for use by downstream operations.
-
-This pattern—allocate buffer, query dimensions, build nested loops, set insertion points carefully, create body operations, restore insertion point, return result—applies to many operation types. Matrix operations, reductions, scans, and other array operations all follow variations of this template. Master this pattern and you can implement most array operations you'll encounter.
+Compared to manual SCF loops, `linalg.generic`:
+- Expresses intent directly (element-wise operation with this scalar function)
+- Enables high-level optimization (fusion, tiling, distribution)
+- Handles arbitrary ranks automatically (same code for 1D, 2D, 3D, etc.)
+- Simplifies type inference (tensor types flow through naturally)
+- Separates iteration structure from computation (easier to understand and modify)
 
 ## 7.10 Matrix Multiplication with C++ APIs
 
-Matrix multiplication demonstrates using Linalg dialect operations from C++, showing how high-level structured operations simplify implementation compared to explicit loops. Let's walk through the complete implementation:
+Matrix multiplication demonstrates using Linalg dialect operations from C++, showing how high-level structured operations work with tensor types. Let's walk through the complete implementation using the tensor-based approach.
 
 **Function Signature**
 
 ```cpp
 Value buildMatMul(OpBuilder& builder, Location loc, Value lhs, Value rhs) {
-    auto lhsType = lhs.getType().cast<MemRefType>();
-    auto rhsType = rhs.getType().cast<MemRefType>();
+    auto lhsType = lhs.getType().cast<RankedTensorType>();
+    auto rhsType = rhs.getType().cast<RankedTensorType>();
     auto lhsShape = lhsType.getShape();
     auto rhsShape = rhsType.getShape();
 ```
 
-We extract shapes from both operands to determine the result shape. For matrix multiply, if left is M×K and right is K×N, result is M×N. We validate that the inner dimensions match (K equals K) in production code, though our example omits validation for brevity.
+We work with `RankedTensorType` instead of memrefs—tensors represent immutable values, perfect for high-level IR before bufferization converts them to mutable memory.
 
-**Allocate Result with Initialization**
+**Determine Result Shape**
 
-Unlike element-wise operations where we immediately write all elements, matrix multiply accumulates sums, so we must initialize the result to zero:
-
-```cpp
-SmallVector<int64_t> resultShape = {lhsShape[0], rhsShape[1]};
-auto resultType = MemRefType::get(resultShape, builder.getF32Type());
-Value result = builder.create<memref::AllocOp>(loc, resultType);
-
-// Initialize result to zero
-auto zero = builder.create<arith::ConstantFloatOp>(
-    loc, APFloat(0.0f), builder.getF32Type());
-auto zeroIdx = builder.create<arith::ConstantIndexOp>(loc, 0);
-auto oneIdx = builder.create<arith::ConstantIndexOp>(loc, 1);
-auto rows = builder.create<arith::ConstantIndexOp>(loc, lhsShape[0]);
-auto cols = builder.create<arith::ConstantIndexOp>(loc, rhsShape[1]);
-```
-
-The initialization requires nested loops filling every element with 0.0. This is similar to the copy loops we saw earlier—we omit the full code for brevity, but the pattern is identical to element-wise operations.
-
-**Create Linalg MatMul Operation**
-
-With the zero-initialized result buffer, we create the matrix multiply:
+For matrix multiply, if left is M×K and right is K×N, result is M×N:
 
 ```cpp
-builder.create<linalg::MatmulOp>(
-    loc,
-    ValueRange{lhs, rhs},  // Inputs
-    ValueRange{result}      // Output (accumulator)
-);
-
-return result;
+    SmallVector<int64_t> resultShape = {lhsShape[0], rhsShape[1]};
+    auto resultType = RankedTensorType::get(resultShape, builder.getF32Type());
 ```
 
-That's it! The `linalg::MatmulOp` encapsulates the entire computation: three nested loops (over output rows, output columns, and the reduction dimension), loads from input matrices, multiply-add operations, and stores to the output. The operation semantics are: for each (i,j) in the output, compute sum_k(A[i,k] * B[k,j]) and add it to result[i,j]. Since we initialized result to zero, we get the standard matrix product.
+**Initialize Output Tensor**
 
-The brevity here compared to element-wise operations (which required explicit loops) highlights the value of structured operations. Linalg provides a vocabulary for common linear algebra patterns, letting us express intent without manual loop construction. The lowering passes later expand this to explicit loops, but at the graph construction level, we work with semantic operations.
+Matrix multiply accumulates, so we need zero initialization. We use `tensor.empty` and `linalg.fill`:
 
-**Lowering Implications**
+```cpp
+    // Create empty tensor
+    Value emptyTensor = builder.create<tensor::EmptyOp>(loc, resultShape, 
+                                                        builder.getF32Type());
+    
+    // Fill with zeros
+    Value zero = builder.create<arith::ConstantOp>(loc, builder.getF32FloatAttr(0.0f));
+    Value zeroTensor = builder.create<linalg::FillOp>(loc, zero, emptyTensor).result();
+```
 
-When `linalg::MatmulOp` lowers to loops, the generated code looks something like:
+`linalg.fill` takes a scalar value and a destination tensor, returning a new tensor with all elements set to that scalar. This is pure (functional) style—no mutation, just value transformations.
 
-```mlir
-scf.for %i = %c0 to %M step %c1 {
-  scf.for %j = %c0 to %N step %c1 {
-    %sum_init = memref.load %result[%i, %j]
-    %sum_final = scf.for %k = %c0 to %K step %c1 
-                 iter_args(%sum = %sum_init) -> (f32) {
-      %a = memref.load %lhs[%i, %k]
-      %b = memref.load %rhs[%k, %j]
-      %prod = arith.mulf %a, %b
-      %new_sum = arith.addf %sum, %prod
-      scf.yield %new_sum
-    }
-    memref.store %sum_final, %result[%i, %j]
-  }
+**Create linalg.matmul Operation**
+
+With inputs and zero-initialized output ready:
+
+```cpp
+    Value result = builder.create<linalg::MatmulOp>(
+        loc, 
+        /*resultTypes=*/TypeRange{resultType},
+        /*inputs=*/ValueRange{lhs, rhs}, 
+        /*outputs=*/ValueRange{zeroTensor}
+    ).getResult(0);
+    
+    return result;
 }
 ```
 
-The innermost loop uses loop-carried variables (iter_args) for accumulation, exactly the pattern we learned in Chapter 6. The lowering pass generates this automatically from our high-level operation. This illustrates MLIR's layered approach: high-level operations for ease of use, lower-level representations for optimization, explicit loops for final code generation.
+The operation computes C = A × B as: for each output element C[i,j], sum over k of A[i,k] × B[k,j]. The `outputs` parameter is the accumulator—the operation conceptually does `output += lhs @ rhs`. Since we passed zeros, we get pure multiplication.
+
+**Type Inference and Static Shapes**
+
+A subtle but important detail: when creating the result shape, we use **static dimensions** when possible. If the input shapes are known at compile time (e.g., `tensor<2x3xf32>` and `tensor<3x4xf32>`), the result shape is `tensor<2x4xf32>` with static dimensions. This enables better optimization—the compiler can unroll loops, vectorize more aggressively, and eliminate dynamic size queries.
+
+If inputs have dynamic dimensions (e.g., `tensor<?x3xf32>`), we propagate that: the result is `tensor<?x4xf32>`. The lowering infrastructure handles both cases correctly, but static shapes enable more optimization. In our implementation, we preserve static dimensions from inputs whenever possible.
+
+**Lowering Path**
+
+After graph generation, the tensor-based IR goes through bufferization:
+
+1. **OneShotBufferize**: Converts tensors to memrefs, inserting allocations and copies as needed
+2. **BufferResultsToOutParams**: Transforms return values into output parameters
+3. **ConvertLinalgToLoops**: Expands linalg.matmul into three nested SCF loops
+4. Further lowering to LLVM
+
+At each level, the representation becomes more concrete: tensors → buffers → loops → machine code. But at the graph construction level, we think purely in terms of mathematical operations on immutable tensors, which is both simpler and more optimizable.
 
 ## 7.11 Composing Operations: Building a Neural Network
 
@@ -393,16 +448,15 @@ Each line returns an operation ID, which subsequent operations reference. The gr
 
 **Generated Function Signature**
 
-The generated MLIR function signature is:
+The generated MLIR function signature follows the functional style:
 
 ```mlir
-func.func @mlp(%arg0: memref<2x3xf32>, 
-               %arg1: memref<3x4xf32>, 
-               %arg2: memref<4x2xf32>,
-               %out: memref<2x2xf32>)
+func.func @mlp(%arg0: tensor<2x3xf32>, 
+               %arg1: tensor<3x4xf32>, 
+               %arg2: tensor<4x2xf32>) -> tensor<2x2xf32>
 ```
 
-Three input memrefs (x, W1, W2) and one output memref for the final result. The function body contains the complete computation: first matmul allocating a temporary for `h`, ReLU reading `h` and producing `h_relu`, second matmul producing `y`, and finally a copy loop transferring `y` to the output buffer.
+Three input tensors (x, W1, W2) and one tensor return value. The function body contains high-level linalg operations that express the computation at a semantic level. Bufferization later converts this to imperative code with explicit memory management.
 
 **Execution Flow**
 
@@ -671,31 +725,7 @@ def test_matmul():
 
 The test builds a graph, inspects IR (optional, useful for learning), compiles, executes with random data, and verifies against NumPy. This pattern—build graph, compile, execute, verify—applies to all operations. The compilation happens once; we can call `execute_generic(fn, ...)` repeatedly with different input data, amortizing compilation cost.
 
-## 7.15 Comparison with Chapter 6's Standalone Approach
-
-Chapter 6 implemented softmax as a standalone function: we wrote C++ code to generate a module containing one function, exported it to Python, and called it directly. Chapter 7 takes a compositional approach: softmax is one operation in a graph alongside other operations. Both approaches have merit, and understanding the tradeoffs informs architecture decisions for larger systems.
-
-**Standalone Functions (Chapter 6)**:
-- Each operation is a separate MLIR module with its own function
-- Python calls each operation independently
-- No opportunity for cross-operation optimization
-- Simple mental model: one operation = one function call
-- Works well for isolated operations or debugging individual operations
-- Execution overhead: function call per operation, memory allocation per output
-
-**Computation Graphs (Chapter 7)**:
-- All operations in one MLIR module, one function
-- Python builds a graph, then calls one compiled function
-- Cross-operation optimization opportunities (fusion, memory reduction, etc.)
-- More complex mental model: separate construction from execution
-- Necessary for models with many operations
-- Lower execution overhead: one function call for entire graph, potential for sharing intermediate buffers
-
-For production ML systems, the graph approach dominates because models have dozens to thousands of operations per forward pass. Calling each individually would be prohibitively expensive, and the lack of optimization opportunities would leave significant performance on the table. However, for prototyping new operations or debugging specific computations, standalone functions are easier to work with. Modern frameworks often support both: eager mode for development, graph mode for production.
-
-Our softmax implementation in Chapter 7 is nearly identical to Chapter 6's standalone version—the same three-pass algorithm, the same loop structures, the same numerical stability techniques. The difference is purely architectural: where Chapter 6 made it a module-level function, Chapter 7 makes it a helper method generating operations within a larger function. This demonstrates that operation implementations are largely independent of whether they're used standalone or in graphs. The graph is an organizational layer, not a fundamental change to how operations work.
-
-## 7.16 Looking Ahead
+## 7.15 Looking Ahead
 
 With computation graphs implemented, we can build complex models from simple operations, but we're still generating all operations explicitly into a single flat function. Chapter 8 will introduce **custom dialects**, allowing us to define high-level operations like `attention` or `feedforward` that encapsulate entire sub-networks. Instead of generating 50 operations for an attention mechanism, we'll generate one `transformer.attention` operation, then lower it to explicit operations later. This abstraction enables optimizations that reason about semantics (like "this attention operation can be fused with layer norm") rather than just syntax (like "these loops can be merged").
 

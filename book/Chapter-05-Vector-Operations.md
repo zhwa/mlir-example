@@ -1,153 +1,184 @@
-# Chapter 5: Structured Control Flow and Explicit Loops
+# Chapter 5: Tensor-First Architecture - Modern MLIR Patterns
 
-In the first four chapters, we relied on high-level operations from the Linalg dialect to express our computations. Operations like `linalg.matmul` and `linalg.fill` are declarative—they specify *what* to compute without detailing *how* the computation should proceed. In Chapter 3, we introduced progressive lowering and mentioned that Linalg operations eventually lower to explicit loops (the SCF dialect). This chapter reveals how that transformation works and when you might want to work with explicit loops directly.
+In the first four chapters, we built foundational knowledge of MLIR's compilation model. Chapter 1-3 used memrefs directly to understand execution mechanics, memory layout, and JIT compilation. Chapter 4 introduced bufferization—the transformation from functional tensor IR to imperative memref IR—and explained why modern MLIR compilers separate these concerns. That chapter was the pivot point. Now, starting from Chapter 5, we adopt **tensor-first architecture**: the industry-standard pattern used in production MLIR systems worldwide.
 
-The compiler decides how to implement these operations, choosing loop orders, vectorization strategies, and memory access patterns. This abstraction is powerful for optimization but sometimes limits control.
+This architectural shift reflects how real ML compilers work. Torch-MLIR (PyTorch's MLIR backend), IREE (Google's ML runtime), StableHLO (TensorFlow/JAX), and other production systems all follow the same pattern: high-level operations use immutable tensors, optimization happens at the tensor level, and bufferization converts to executable memref code late in the compilation pipeline. By adopting this pattern, we're not just learning MLIR—we're learning the patterns that power modern AI frameworks.
 
-This chapter introduces a different approach: **explicit control flow** using MLIR's SCF (Structured Control Flow) dialect. Instead of declaring "compute matrix multiplication," we'll write explicit loops that specify exactly how computation proceeds, element by element, iteration by iteration. This lower-level control becomes essential when implementing operations that don't fit neatly into high-level abstractions or when you need precise control over execution for performance tuning.
+Our vehicle for demonstrating tensor-first architecture is **SAXPY** (Single-Precision A·X Plus Y), a fundamental operation from linear algebra: `C[i] = α · A[i] + B[i]`. SAXPY is simpler than matrix multiplication but rich enough to demonstrate tensor operations, dynamic shapes, the Linalg dialect, and the complete bufferization pipeline. We'll implement SAXPY using `linalg.generic` with tensor types, then watch as bufferization automatically transforms our functional code into efficient imperative machine code.
 
-Our vehicle for learning is **SAXPY** (Single-Precision A·X Plus Y), a fundamental operation from linear algebra: `C[i] = α · A[i] + B[i]` for all elements i. SAXPY is simpler than matrix multiplication but rich enough to demonstrate explicit loop construction, element-wise operations, and the SCF dialect's capabilities. By the end of this chapter, you'll understand when to use high-level abstractions versus explicit control flow, and you'll be comfortable constructing loops directly in MLIR IR.
+By the end of this chapter, you'll understand:
+- Why tensors are the right abstraction for high-level ML operations
+- How `linalg.generic` expresses parallel computations on tensors
+- How the tensor dialect (`tensor.empty`, `tensor.dim`) handles dynamic shapes
+- How One-Shot Bufferize converts functional tensors to imperative memrefs
+- How the complete pipeline (canonicalization → bufferization → loop lowering → LLVM) produces executable code
+- When to use tensor-first patterns versus direct memref operations
 
-## 5.1 The SCF Dialect: Structured Control Flow in MLIR
+This knowledge forms the foundation for all subsequent chapters. From Chapter 5 onward, every operation we implement—softmax, ReLU, convolutions, attention, transformers—will use tensor-first architecture.
 
-Control flow is how programs make decisions and repeat operations. Every programming language has control flow constructs: C has `for` and `while` loops, Python has `for` and `while` loops with `if/else` statements, and assembly has conditional and unconditional branches. MLIR provides control flow at multiple abstraction levels, and the SCF (Structured Control Flow) dialect occupies the middle ground between high-level declarative operations and low-level branches.
+## 5.1 The Tensor-First Philosophy: Why Immutable Matters
 
-### What is Structured Control Flow?
+Modern ML frameworks think in terms of immutable data. When you write `result = alpha * A + B` in PyTorch, you're not mutating A or B—you're creating a new tensor that holds the result. This functional semantics isn't just convenient for users; it enables powerful compiler optimizations that would be impossible with mutable operations.
 
-Structured control flow refers to control constructs that have well-defined entry and exit points, following a hierarchical structure. A `for` loop in C is structured when there's no `goto` statement jumping arbitrarily to different parts of the program: execution enters at the loop header, iterates through the body, and exits when the condition fails. Structured control flow makes programs easier to reason about, optimize, and verify for correctness.
+### Functional vs Imperative: A Tale of Two Styles
 
-In contrast, unstructured control flow uses explicit branches and labels, as found in assembly language or MLIR's CF (Control Flow) dialect. With unstructured flow, you can jump to any label at any time, creating complex control graphs that are harder to analyze. Compilers prefer structured control flow during optimization phases because the structure provides guarantees that enable transformations like loop unrolling, fusion, and parallelization.
+Consider two ways to express the same SAXPY computation:
 
-MLIR's SCF dialect provides structured control operations that closely resemble high-level language constructs. The three primary operations are `scf.for` (counted loops), `scf.while` (condition-based loops), and `scf.if` (conditional branches). These operations maintain structured control flow properties while operating at a lower level than Linalg's declarative operations. When you write a `scf.for` loop, you're explicitly stating "iterate from this starting value to this ending value, executing this body on each iteration," which gives you fine-grained control over computation.
-
-### The scf.for Operation
-
-The `scf.for` operation implements a counted loop, similar to C's `for(int i = 0; i < n; i++)` or Python's `for i in range(n)`. The operation takes three operands: a lower bound, an upper bound, and a step size. The loop body executes repeatedly with an induction variable that starts at the lower bound and increments by the step size until reaching (but not including) the upper bound.
-
-Here's what a `scf.for` loop looks like in MLIR:
-
+**Imperative Style (Memref - Chapters 1-4):**
 ```mlir
-%c0 = arith.constant 0 : index
-%c10 = arith.constant 10 : index
-%c1 = arith.constant 1 : index
-
-scf.for %i = %c0 to %c10 step %c1 {
-  // Loop body executes with %i = 0, 1, 2, ..., 9
-  // ... operations using %i ...
+func.func @saxpy(%alpha: f32,
+                 %A: memref<?xf32>,
+                 %B: memref<?xf32>,
+                 %C: memref<?xf32>) {
+  // Mutate C in-place
+  %c0 = arith.constant 0 : index
+  %size = memref.dim %A, %c0 : memref<?xf32>
+  %c1 = arith.constant 1 : index
+  
+  scf.for %i = %c0 to %size step %c1 {
+    %a = memref.load %A[%i] : memref<?xf32>
+    %b = memref.load %B[%i] : memref<?xf32>
+    %scaled = arith.mulf %alpha, %a : f32
+    %sum = arith.addf %scaled, %b : f32
+    memref.store %sum, %C[%i] : memref<?xf32>
+  }
+  return
 }
 ```
 
-The loop executes ten times with the induction variable `%i` taking values from 0 through 9. The `index` type is MLIR's type for array indices and loop bounds—it's typically a machine word size (32-bit or 64-bit depending on the target platform). Notice that the upper bound is exclusive: the loop runs while `%i < %c10`, not `%i <= %c10`. This matches Python's `range()` semantics and C's typical `i < n` loop conditions.
+This imperative style explicitly:
+- Takes a pre-allocated output buffer C as a parameter
+- Loops over elements with explicit load/store operations
+- Mutates C in-place (side effects)
+- Requires understanding memory layout, iteration order, and aliasing
 
-The loop body is a region—a block of operations that can reference the induction variable. Everything inside the curly braces executes on each iteration. Importantly, `scf.for` maintains SSA (Static Single Assignment) form: the induction variable `%i` is defined once and has a different value on each iteration, but within a single iteration, it's immutable. This property is crucial for enabling optimizations like loop parallelization, where iterations can potentially execute in any order or concurrently.
-
-One powerful feature of `scf.for` is that it can carry values across iterations, implementing loop-carried dependencies. If a computation in iteration i needs a result from iteration i-1 (like accumulating a sum), `scf.for` supports this through iter_args:
-
+**Functional Style (Tensor - Chapter 5+):**
 ```mlir
-%sum = scf.for %i = %c0 to %c10 step %c1 
-    iter_args(%acc = %initial_value) -> (f32) {
-  // Use %acc (value from previous iteration)
-  %new_acc = arith.addf %acc, %some_value : f32
-  // Yield new value for next iteration
-  scf.yield %new_acc : f32
+#map = affine_map<(d0) -> (d0)>
+
+func.func @saxpy(%alpha: f32,
+                 %A: tensor<?xf32>,
+                 %B: tensor<?xf32>) -> tensor<?xf32> {
+  // Create and return new tensor
+  %c0 = arith.constant 0 : index
+  %dim = tensor.dim %A, %c0 : tensor<?xf32>
+  %empty = tensor.empty(%dim) : tensor<?xf32>
+  
+  %result = linalg.generic {
+    indexing_maps = [#map, #map, #map],
+    iterator_types = ["parallel"]
+  } ins(%A, %B : tensor<?xf32>, tensor<?xf32>)
+    outs(%empty : tensor<?xf32>) {
+  ^bb0(%a: f32, %b: f32, %out: f32):
+    %scaled = arith.mulf %alpha, %a : f32
+    %sum = arith.addf %scaled, %b : f32
+    linalg.yield %sum : f32
+  } -> tensor<?xf32>
+  
+  return %result : tensor<?xf32>
 }
-// After loop, %sum contains the final accumulated value
 ```
 
-This pattern implements a reduction: accumulating values across all iterations. The `iter_args` specify values that flow from one iteration to the next, and `scf.yield` produces the values for the next iteration (or returns them after the loop completes). This is more sophisticated than simple counted loops and enables expressing complex computations while maintaining structured control flow.
+This functional style:
+- Returns a new tensor (no mutation of inputs)
+- Uses declarative `linalg.generic` (compiler chooses iteration strategy)
+- No explicit load/store (abstracted away)
+- Immutable semantics enable optimization
 
-### Why SCF Instead of Linalg?
+### Why Immutability Wins
 
-You might wonder why we need explicit loops when Linalg already handles operations like element-wise addition and multiplication. The answer lies in the trade-off between abstraction and control. Linalg operations are opaque boxes: you specify *what* to compute, and the compiler decides *how*. This is excellent for operations with well-studied optimization strategies (matrix multiplication, convolutions) where decades of research have established best practices. The compiler can apply these optimizations automatically.
-
-However, not all operations fit neatly into Linalg's structured patterns. Custom operations, irregular computations, or operations where you need specific execution ordering may not map well to `linalg.generic`. Additionally, when learning or debugging, explicit control flow makes execution semantics crystal clear. There's no guessing about what the compiler might do—the IR directly expresses the computation sequence.
-
-Consider the SAXPY operation we'll implement: `C[i] = α · A[i] + B[i]`. We could express this with `linalg.generic`, specifying an iterator and a computation body. But writing it explicitly with `scf.for` teaches us how loops work in MLIR, how to load and store individual elements, and how arithmetic operations compose. Later, when we implement more complex operations like softmax (Chapter 6) or attention mechanisms (Chapter 11), this knowledge of explicit control flow becomes essential.
-
-In practice, production MLIR code uses both approaches. High-level framework code (PyTorch, TensorFlow frontends) generates Linalg operations. The compiler optimizes these, potentially lowering some to explicit loops during transformations. Eventually, all high-level operations lower to explicit loops (SCF), then to unstructured control flow (CF), and finally to machine instructions. By understanding both Linalg and SCF, you understand the full compilation pipeline.
-
-## 5.2 The Arith Dialect: Arithmetic and Comparison Operations
-
-Before we can implement SAXPY, we need operations for basic arithmetic: multiplication, addition, and constants. MLIR's Arith (Arithmetic) dialect provides these fundamental operations. While arithmetic might seem trivial—every language has `+` and `*`—MLIR's approach is more sophisticated, handling different numeric types, signedness, and overflow semantics explicitly.
-
-### Integer and Floating-Point Operations
-
-The Arith dialect separates integer and floating-point arithmetic because they have fundamentally different semantics. Floating-point operations follow IEEE 754 standards, handling infinities, NaNs (Not-a-Number), and approximate arithmetic. Integer operations are exact but must handle overflow and signedness. This separation makes numeric semantics explicit and enables target-specific optimizations.
-
-For floating-point operations, the dialect provides operations like:
-
-- `arith.addf`: Floating-point addition (`a + b`)
-- `arith.subf`: Floating-point subtraction (`a - b`)
-- `arith.mulf`: Floating-point multiplication (`a * b`)
-- `arith.divf`: Floating-point division (`a / b`)
-- `arith.negf`: Floating-point negation (`-a`)
-
-Each operation takes values of the same floating-point type (f16, f32, f64, etc.) and produces a result of that type. The operations follow IEEE 754 semantics: adding infinity to a finite number yields infinity, dividing by zero yields infinity, and operations on NaN propagate NaN. MLIR doesn't hide these details—they're part of the operation's specification.
-
-For integer operations, the dialect provides separate signed and unsigned variants where semantics differ:
-
-- `arith.addi`: Integer addition (works for both signed and unsigned)
-- `arith.muli`: Integer multiplication (works for both signed and unsigned)
-- `arith.divsi`: Signed integer division (rounds toward zero)
-- `arith.divui`: Unsigned integer division
-- `arith.remsi`: Signed remainder (modulo operation)
-- `arith.remui`: Unsigned remainder
-
-The separation between signed and unsigned division matters because they behave differently with negative numbers. Signed division of `-7 / 2` yields `-3` (rounding toward zero), while the bit pattern interpreted as unsigned would give a completely different result. By making this explicit, MLIR ensures that lowering to machine instructions chooses the correct assembly operation (`idiv` vs `div` on x86).
-
-### Constants and Index Operations
-
-Creating constant values requires the `arith.constant` operation, which takes a value and a type:
+The power of immutability becomes clear when you consider optimization. Suppose you have two operations:
 
 ```mlir
-%zero = arith.constant 0.0 : f32
-%alpha = arith.constant 2.5 : f32
-%one = arith.constant 1 : i32
+%tmp = some_op1 ins(%A : tensor<?xf32>) -> tensor<?xf32>
+%result = some_op2 ins(%tmp : tensor<?xf32>) -> tensor<?xf32>
 ```
 
-Constants are SSA values like any other, meaning they're defined once and immutable. The constant's value is embedded in the IR as an attribute (compile-time data), not computed at runtime. During optimization, the compiler can perform constant folding: if you multiply two constants, the compiler replaces them with the result constant, eliminating runtime computation.
+Because tensors are immutable, the compiler knows:
+1. **No aliasing**: %tmp cannot be an alias of %A (they're different tensor values)
+2. **No side effects**: some_op1 doesn't mutate any global state
+3. **Dead value elimination**: If %tmp is only used once, it might be eliminated
+4. **Fusion opportunity**: The compiler can fuse op1 and op2 into a single operation, eliminating the intermediate tensor allocation entirely
 
-For array indexing and loop bounds, MLIR uses the `index` type, which represents machine-word-sized integers (32-bit on 32-bit systems, 64-bit on 64-bit systems). Index operations ensure that array indices and sizes use the correct width for the target architecture. The operation `arith.constant` can create index constants:
+With memrefs, these optimizations require complex alias analysis:
 
 ```mlir
-%c0 = arith.constant 0 : index
-%c1 = arith.constant 1 : index
+some_op1 ins(%A : memref<?xf32>) outs(%tmp : memref<?xf32>)
+some_op2 ins(%tmp : memref<?xf32>) outs(%result : memref<?xf32>)
 ```
 
-MLIR also provides convenience operations for common index constants: `arith.ConstantIndexOp` is a builder-level operation that creates index constants directly, though in textual IR you'll see `arith.constant` with type `index`. The distinction between index and regular integers matters because some targets have specialized addressing modes or restrictions on index operations.
+The compiler must prove:
+- Does %tmp alias %A or %result? (Requires pointer analysis)
+- Could some_op1 modify %A through aliasing? (Side effect analysis)
+- Is it safe to eliminate %tmp? (Liveness analysis)
 
-### Comparison and Boolean Operations
+Alias analysis is notoriously difficult—it's why C/C++ compilers struggle to optimize code with pointers. By making immutability explicit at the type level (tensor vs memref), MLIR enables optimizations without complex analysis.
 
-The Arith dialect also provides comparison operations that produce boolean values (type `i1`, a 1-bit integer). These operations compare two values and yield true (1) or false (0):
+### The Industry Consensus
+
+Every major ML compiler uses tensor-first architecture:
+
+**Torch-MLIR** (PyTorch → MLIR):
+```mlir
+// PyTorch operations lower to Torch dialect with tensors
+%result = torch.aten.relu %input : !torch.tensor -> !torch.tensor
+// Then lower to Linalg (still tensors)
+%result = linalg.generic {...} ins(%input : tensor<?x?xf32>) -> tensor<?x?xf32>
+// Bufferize late
+// (automatic conversion to memref operations)
+```
+
+**IREE** (Google's ML runtime):
+- All frontends (TensorFlow, PyTorch, JAX) produce tensor IR
+- Optimization passes work on tensors
+- Bufferization happens per-function or per-dispatch-region
+- Low-level codegen uses memrefs
+
+**StableHLO** (TensorFlow/JAX intermediate representation):
+- Entirely tensor-based
+- No memref operations at the StableHLO level
+- Compilers consuming StableHLO (IREE, XLA) handle bufferization
+
+This universal adoption isn't coincidence—tensor-first architecture is simply the right abstraction level for ML compilation.
+
+## 5.2 The Linalg Dialect Revisited: Tensor Operations
+
+We've seen Linalg before (Chapter 1's `linalg.matmul`), but now we'll use it properly: with tensor types. The Linalg dialect is designed for expressing structured linear algebra operations, and its power comes from working on immutable tensors rather than mutable memrefs.
+
+### Understanding linalg.generic with Tensors
+
+The `linalg.generic` operation is Linalg's Swiss Army knife—a highly flexible operation that can express any structured computation on multi-dimensional arrays. When used with tensors, it becomes a pure function: given input tensors, it produces an output tensor without side effects.
+
+The anatomy of `linalg.generic`:
 
 ```mlir
-%cmp = arith.cmpf olt, %a, %b : f32
-// %cmp is true if %a < %b (ordered less-than)
+%result = linalg.generic {
+  indexing_maps = [...],      // How to map iteration space to array dimensions
+  iterator_types = [...]      // parallel, reduction, or window
+} ins(%input1, %input2, ... : tensor<...>, tensor<...>)
+  outs(%init : tensor<...>) {
+^bb0(%in1: element_type, %in2: element_type, %out_elem: element_type):
+  // Body: Compute output element from input elements
+  %computed = ... operations on %in1, %in2, ...
+  linalg.yield %computed : element_type
+} -> tensor<...>
 ```
 
-The `arith.cmpf` operation compares floating-point values with a predicate (olt = ordered less-than, oge = ordered greater-or-equal, etc.). The "ordered" terminology comes from IEEE 754: ordered comparisons return false if either operand is NaN, while unordered comparisons return true if either operand is NaN. This distinction matters for robust numerical code.
+**Key components:**
 
-Integer comparisons use `arith.cmpi` with predicates like `slt` (signed less-than), `ult` (unsigned less-than), `eq` (equal), and `ne` (not equal). Again, the separation between signed and unsigned comparisons ensures correct semantics. Comparing `-1` as a signed integer is less than `1`, but the same bit pattern interpreted as unsigned is a very large positive number, greater than `1`.
+1. **indexing_maps**: Affine maps defining how the iteration space maps to each tensor's dimensions. For SAXPY (element-wise operation), all three tensors use identity mapping: iteration index i maps directly to element i.
 
-Boolean operations like `arith.andi` (logical AND), `arith.ori` (logical OR), and `arith.xori` (logical XOR) combine boolean values, enabling complex conditional logic. These operations work on any integer type but are most commonly used with `i1` for boolean logic.
+2. **iterator_types**: Classification of each dimension as `parallel` (iterations are independent, can run concurrently), `reduction` (accumulate across this dimension), or `window` (sliding window, like convolution). SAXPY uses `["parallel"]` because each output element is computed independently.
 
-### Why Explicit Arithmetic Matters
+3. **ins/outs**: Input tensors (read-only) and output tensor (destination). The output is called `outs` even though conceptually it's being computed, not mutated. This is for uniformity with the memref version.
 
-You might think arithmetic operations are too low-level to worry about—just let the compiler handle them. But explicit arithmetic operations in MLIR serve several purposes. First, they make numeric semantics precise and auditable. When you see `arith.mulf`, you know it's IEEE 754 floating-point multiplication with all the associated semantics. Second, they enable target-specific optimizations. A compiler can recognize sequences of arithmetic operations and replace them with specialized instructions (fused multiply-add, SIMD operations, etc.). Third, they maintain the progressive lowering philosophy: high-level operations lower to arithmetic operations, which eventually lower to machine instructions.
+4. **Body block**: A region that computes one output element. The block arguments correspond to elements from each input tensor at the current iteration point, plus the current output element. The body performs element-wise computation and yields the result.
 
-## 5.3 The MemRef Dialect: Dynamic Dimensions and Runtime Queries
+5. **Result type**: The operation returns the computed tensor. This is crucial—with tensor semantics, `linalg.generic` is a pure function that returns a new tensor.
 
-We've worked with memrefs extensively in previous chapters, but always with the assumption that we knew dimensions at IR construction time (even if they were dynamic `?` placeholders). Now we need to query memref dimensions at runtime because our SAXPY implementation must work with vectors of any length. The MemRef dialect provides operations for querying shape information at runtime, which is essential for shape-agnostic code.
+### SAXPY with linalg.generic
 
-### The memref.dim Operation
-
-The `memref.dim` operation extracts the size of a specific dimension from a memref at runtime. Its signature is:
-
-```mlir
-%size = memref.dim %memref, %dimension : memref<?x?xf32>
-```
-
-The operation takes two operands: the memref to query and the dimension index (0 for first dimension, 1 for second, etc.). It returns an `index` value representing the size of that dimension. For a memref of type `memref<?x?xf32>` (dynamic 2D matrix), you'd query both dimensions:
+Let's break down SAXPY's tensor implementation step by step:
 
 ```mlir
 %rows = memref.dim %matrix, %c0 : memref<?x?xf32>  // Get row count
@@ -631,20 +662,114 @@ The relationship between Linalg and SCF exemplifies MLIR's progressive lowering 
 
 This philosophy maintains optimization opportunities at every level. Lowering too early closes off high-level optimizations. Staying too high-level prevents low-level tuning. Progressive lowering navigates this trade-off by lowering gradually, applying appropriate optimizations at each level. Understanding both Linalg and SCF prepares you to work at multiple abstraction levels as needed.
 
-## 5.9 Summary
+## 5.9 Summary: The Tensor-First Transformation
 
-This chapter introduced explicit control flow in MLIR through the SCF (Structured Control Flow) dialect. We moved from declarative high-level operations to imperative explicit loops, gaining fine-grained control over computation. The key insights:
+This chapter marks a pivotal shift in how we approach MLIR compilation. While the chapter content above discusses SCF and memref-based explicit control (valuable for understanding low-level mechanics), our actual implementation adopts **tensor-first architecture**—the industry-standard pattern used in all modern ML compilers.
 
-First, structured control flow provides an intermediate abstraction between declarative operations (Linalg) and unstructured branches (CF). The `scf.for` operation makes loop structure explicit while maintaining properties that enable optimization. We can see exactly how computation proceeds, iteration by iteration, without dropping all the way to assembly-level branches.
+### What We Actually Implemented
 
-Second, explicit control flow requires explicit arithmetic. The Arith dialect provides operations for addition, multiplication, constants, and comparisons. These operations make numeric semantics precise, specifying floating-point versus integer arithmetic, signed versus unsigned operations, and overflow behavior. This precision is necessary when lowering to machine instructions, where every detail matters.
+Our SAXPY implementation uses tensors and automatic bufferization:
 
-Third, working with dynamic shapes requires runtime queries. The `memref.dim` operation extracts dimension sizes at runtime, enabling dimension-agnostic code. We write functions that work with vectors of any length, querying sizes when needed rather than hardcoding dimensions. This flexibility is essential for production systems where input sizes vary.
+```mlir
+#map = affine_map<(d0) -> (d0)>
 
-Fourth, implementing operations explicitly teaches us how they work. SAXPY is conceptually simple—scale and add vectors—but implementing it with explicit loops reveals the mechanics: querying sizes, iterating indices, loading elements, performing arithmetic, storing results. This understanding becomes crucial when debugging or optimizing more complex operations.
+func.func @saxpy(%alpha: f32,
+                 %A: tensor<?xf32>,
+                 %B: tensor<?xf32>) -> tensor<?xf32> {
+  %c0 = arith.constant 0 : index
+  %dim = tensor.dim %A, %c0 : tensor<?xf32>
+  %empty = tensor.empty(%dim) : tensor<?xf32>
+  
+  %result = linalg.generic {
+    indexing_maps = [#map, #map, #map],
+    iterator_types = ["parallel"]
+  } ins(%A, %B : tensor<?xf32>, tensor<?xf32>)
+    outs(%empty : tensor<?xf32>) {
+  ^bb0(%a: f32, %b: f32, %out: f32):
+    %scaled = arith.mulf %alpha, %a : f32
+    %sum = arith.addf %scaled, %b : f32
+    linalg.yield %sum : f32
+  } -> tensor<?xf32>
+  
+  return %result : tensor<?xf32>
+}
+```
 
-Fifth, progressive lowering connects abstraction levels. We saw how SCF operations lower to CF branches, which lower to LLVM IR, which compiles to machine code. Each lowering step makes execution semantics more explicit while enabling level-appropriate optimizations. Understanding this pipeline helps you write code that optimizes well and debug issues when optimization falls short.
+**Key Differences from Old Approach:**
+1. **Function returns tensor** (functional) instead of void with out-parameter (imperative)
+2. **All operations on tensors** (immutable) instead of memrefs (mutable)
+3. **linalg.generic with tensors** instead of scf.for with memref.load/store
+4. **Bufferization happens automatically** in the compilation pipeline
 
-Finally, choosing the right abstraction level matters. Linalg for well-known operations that benefit from high-level optimization. SCF for custom operations that need explicit control or when learning how operations work. The two approaches aren't mutually exclusive—production systems use both, operating at the highest level appropriate for each operation. As MLIR developers, we should be comfortable moving between abstraction levels as needed.
+### The Modern Pipeline
 
-With control flow mastered, we're ready to tackle more complex operations. The next chapter introduces the Math dialect and implements softmax, a fundamental operation in neural networks that requires multiple passes, careful numerics, and reduction patterns—building on everything we've learned about explicit loops and arithmetic operations.
+Our actual lowering pipeline follows the pattern from Chapter 4:
+
+```
+Tensor IR (High-Level)
+    ↓ Canonicalize
+Tensor IR (Optimized)
+    ↓ One-Shot Bufferize
+MemRef IR (Out-Parameters)
+    ↓ Linalg-to-Loops
+SCF Loops (memref.load/store)
+    ↓ SCF-to-CF
+Control Flow (cf.br)
+    ↓ Convert-to-LLVM
+LLVM Dialect
+    ↓ JIT Compile
+Native Code
+```
+
+**Bufferization automatically transforms:**
+- `func @saxpy(...) -> tensor<?xf32>` → `func @saxpy(..., %out: memref<?xf32>)`
+- `linalg.generic` with tensors → `linalg.generic` with memrefs
+- Then Linalg-to-Loops produces the `scf.for` loops you learned about earlier
+
+### Why This Matters
+
+The tensor-first approach provides:
+
+1. **Better Optimization**: Functional semantics enable fusion, algebraic simplification, and dead code elimination without complex alias analysis.
+
+2. **Industry Alignment**: Every production ML compiler (Torch-MLIR, IREE, StableHLO) uses this pattern. You're learning real-world practices.
+
+3. **Cleaner Code**: Writing `%result = operation(%input)` is clearer than pre-allocating buffers and mutating them.
+
+4. **Framework Compatibility**: PyTorch, TensorFlow, and JAX all think in tensors. Tensor-first MLIR matches their semantics naturally.
+
+5. **Automatic Memory Management**: The compiler (via bufferization) decides when to allocate, when to reuse buffers, when to copy. You focus on correctness; the compiler handles efficiency.
+
+### Understanding Both Levels
+
+While we implement with tensors, understanding the lower levels (SCF, memref, explicit loops) remains valuable:
+
+- **Debugging**: When something goes wrong, you need to understand what the compiler generated
+- **Performance Tuning**: Sometimes you inspect the lowered SCF to understand why performance isn't optimal
+- **Custom Lowering**: Advanced users may write custom lowering patterns that produce specific SCF structures
+- **Educational Value**: Understanding explicit loops helps you reason about what high-level operations actually do
+
+The chapter content above explains these lower levels because they're foundational knowledge. But in practice, starting from Chapter 5, we work at the tensor level and let bufferization handle the details.
+
+### The Path Forward
+
+From this chapter onward, every operation follows the tensor-first pattern:
+
+- **Chapter 6 (Softmax)**: Tensor operations with reductions
+- **Chapter 7 (Neural Ops)**: ReLU, Conv2D with tensors
+- **Chapter 8 (Custom Dialect)**: Define tensor-based operations in C++
+- **Chapter 9 (TableGen)**: Generate tensor operations from specs
+- **Chapter 10 (Optimizations)**: Optimize at tensor level, then at memref level
+- **Chapters 11-14 (Transformers/GPT)**: Complete tensor pipelines
+
+This is the modern way to build ML compilers with MLIR. Chapter 4 taught you bufferization theory. Chapter 5 puts it into practice. Now every subsequent chapter builds on this foundation.
+
+### Key Takeaways
+
+1. **Write tensor operations** at high level (functional, clean, optimizable)
+2. **Bufferization transforms automatically** to efficient memref code
+3. **Understand both levels**: tensors for development, memrefs/SCF for understanding execution
+4. **Industry standard**: This pattern powers PyTorch, TensorFlow/JAX, and other frameworks
+5. **Progressive lowering**: Each stage (tensor → memref → loops → branches → LLVM) enables appropriate optimizations
+
+With tensor-first architecture mastered, we're ready to tackle more complex operations. The next chapter introduces softmax—a fundamental neural network operation requiring reductions, exponentials, and careful numerics—all implemented using tensor operations and automatic bufferization.

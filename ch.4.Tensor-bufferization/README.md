@@ -14,6 +14,8 @@ This chapter shows the MLIR compilation stack with **tensor-based IR and bufferi
 
 **Key Learning:** Tensor-based approach with bufferization enables better optimization opportunities compared to direct memref-based IR (Chapter 1-3).
 
+**Looking Ahead:** Starting from Chapter 5, this book adopts a **tensor-first architecture**—the industry-standard pattern where operations use tensor types and bufferization happens as part of the lowering pipeline. Chapters 1-4 established foundations; Chapters 5+ teach production patterns used in modern MLIR compilers.
+
 ## Key Differences from Previous Chapters
 
 | Aspect | Chapters 1-3 | Chapter 4 |
