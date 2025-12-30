@@ -8,6 +8,7 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
@@ -32,7 +33,7 @@ static Value createConstantIndex(OpBuilder &builder, Location loc,
   return builder.create<arith::ConstantIndexOp>(loc, value);
 }
 
-// Lower transformer.matmul to linalg.matmul
+// Lower transformer.matmul to linalg.matmul (tensor-based)
 struct MatmulOpLowering : public OpRewritePattern<MatmulOp> {
   using OpRewritePattern<MatmulOp>::OpRewritePattern;
 
@@ -41,29 +42,30 @@ struct MatmulOpLowering : public OpRewritePattern<MatmulOp> {
     Location loc = op.getLoc();
     Value lhs = op.getLhs();
     Value rhs = op.getRhs();
-    Value output = op.getOutput();
 
-    auto outputType = cast<MemRefType>(output.getType());
+    auto resultType = cast<RankedTensorType>(op.getResult().getType());
 
-    // Step 1: Initialize output to zero using linalg.fill
-    // linalg.matmul uses accumulation semantics (C += A @ B), so we need C = 0 first
+    // Step 1: Create empty output tensor
+    Value empty = rewriter.create<tensor::EmptyOp>(
+        loc, resultType.getShape(), resultType.getElementType());
+
+    // Step 2: Initialize output to zero using linalg.fill
     Value zero = createConstantFloat(rewriter, loc, 0.0f);
-    rewriter.create<linalg::FillOp>(loc, zero, output);
+    Value filled = rewriter.create<linalg::FillOp>(loc, zero, empty).getResult(0);
 
-    // Step 2: Perform matrix multiplication using linalg.matmul
-    // For both 2D and 3D (batched), linalg.matmul handles it automatically
-    rewriter.create<linalg::MatmulOp>(
+    // Step 3: Perform matrix multiplication using linalg.matmul
+    Value result = rewriter.create<linalg::MatmulOp>(
         loc,
         ValueRange{lhs, rhs},  // inputs
-        ValueRange{output}     // output (accumulates into initialized buffer)
-    );
+        ValueRange{filled}     // output (accumulates into initialized tensor)
+    ).getResult(0);
 
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
 
-// Lower transformer.add to linalg.generic for element-wise addition
+// Lower transformer.add to linalg.generic for element-wise addition (tensor-based)
 struct AddOpLowering : public OpRewritePattern<AddOp> {
   using OpRewritePattern<AddOp>::OpRewritePattern;
 
@@ -72,10 +74,13 @@ struct AddOpLowering : public OpRewritePattern<AddOp> {
     Location loc = op.getLoc();
     Value lhs = op.getLhs();
     Value rhs = op.getRhs();
-    Value output = op.getOutput();
 
-    auto outputType = cast<MemRefType>(output.getType());
-    int rank = outputType.getRank();
+    auto resultType = cast<RankedTensorType>(op.getResult().getType());
+    int rank = resultType.getRank();
+
+    // Create empty output tensor
+    Value empty = rewriter.create<tensor::EmptyOp>(
+        loc, resultType.getShape(), resultType.getElementType());
 
     // Create indexing maps: all identity (parallel element-wise operation)
     SmallVector<AffineMap> indexingMaps;
@@ -88,10 +93,11 @@ struct AddOpLowering : public OpRewritePattern<AddOp> {
     SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
 
     // Create linalg.generic operation
-    rewriter.create<linalg::GenericOp>(
+    Value result = rewriter.create<linalg::GenericOp>(
         loc,
+        resultType,
         /*inputs=*/ValueRange{lhs, rhs},
-        /*outputs=*/ValueRange{output},
+        /*outputs=*/ValueRange{empty},
         /*indexingMaps=*/indexingMaps,
         /*iteratorTypes=*/iteratorTypes,
         /*bodyBuilder=*/[](OpBuilder &b, Location loc, ValueRange args) {
@@ -99,14 +105,14 @@ struct AddOpLowering : public OpRewritePattern<AddOp> {
           Value sum = b.create<arith::AddFOp>(loc, args[0], args[1]);
           b.create<linalg::YieldOp>(loc, sum);
         }
-    );
+    ).getResult(0);
 
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
 
-// Lower transformer.mul to linalg.generic for element-wise multiplication
+// Lower transformer.mul to linalg.generic for element-wise multiplication (tensor-based)
 struct MulOpLowering : public OpRewritePattern<MulOp> {
   using OpRewritePattern<MulOp>::OpRewritePattern;
 
@@ -115,10 +121,13 @@ struct MulOpLowering : public OpRewritePattern<MulOp> {
     Location loc = op.getLoc();
     Value lhs = op.getLhs();
     Value rhs = op.getRhs();
-    Value output = op.getOutput();
 
-    auto outputType = cast<MemRefType>(output.getType());
-    int rank = outputType.getRank();
+    auto resultType = cast<RankedTensorType>(op.getResult().getType());
+    int rank = resultType.getRank();
+
+    // Create empty output tensor
+    Value empty = rewriter.create<tensor::EmptyOp>(
+        loc, resultType.getShape(), resultType.getElementType());
 
     // Create indexing maps: all identity (parallel element-wise operation)
     SmallVector<AffineMap> indexingMaps;
@@ -131,10 +140,11 @@ struct MulOpLowering : public OpRewritePattern<MulOp> {
     SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
 
     // Create linalg.generic operation
-    rewriter.create<linalg::GenericOp>(
+    Value result = rewriter.create<linalg::GenericOp>(
         loc,
+        resultType,
         /*inputs=*/ValueRange{lhs, rhs},
-        /*outputs=*/ValueRange{output},
+        /*outputs=*/ValueRange{empty},
         /*indexingMaps=*/indexingMaps,
         /*iteratorTypes=*/iteratorTypes,
         /*bodyBuilder=*/[](OpBuilder &b, Location loc, ValueRange args) {
@@ -142,14 +152,14 @@ struct MulOpLowering : public OpRewritePattern<MulOp> {
           Value prod = b.create<arith::MulFOp>(loc, args[0], args[1]);
           b.create<linalg::YieldOp>(loc, prod);
         }
-    );
+    ).getResult(0);
 
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
 
-// Lower transformer.softmax using linalg operations for numerically stable softmax
+// Lower transformer.softmax using linalg operations for numerically stable softmax (tensor-based)
 struct SoftmaxOpLowering : public OpRewritePattern<SoftmaxOp> {
   using OpRewritePattern<SoftmaxOp>::OpRewritePattern;
 
@@ -157,36 +167,32 @@ struct SoftmaxOpLowering : public OpRewritePattern<SoftmaxOp> {
                                 PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     Value input = op.getInput();
-    Value output = op.getOutput();
 
-    auto inputType = cast<MemRefType>(input.getType());
+    auto inputType = cast<RankedTensorType>(input.getType());
     ArrayRef<int64_t> shape = inputType.getShape();
     int rank = shape.size();
 
-    // Create temporary buffers for intermediate results
-    SmallVector<int64_t> reducedShape(shape.begin(), shape.end() - 1);
-    auto reducedType = MemRefType::get(reducedShape, rewriter.getF32Type());
-    Value maxBuffer = rewriter.create<memref::AllocOp>(loc, reducedType);
-    Value sumBuffer = rewriter.create<memref::AllocOp>(loc, reducedType);
-
     // Step 1: Find max along last dimension using linalg.reduce
+    SmallVector<int64_t> reducedShape(shape.begin(), shape.end() - 1);
+    auto reducedType = RankedTensorType::get(reducedShape, rewriter.getF32Type());
+    
     Value negInf = createConstantFloat(rewriter, loc, -1e9f);
-    rewriter.create<linalg::FillOp>(loc, negInf, maxBuffer);
+    Value initMax = rewriter.create<tensor::EmptyOp>(loc, reducedShape, rewriter.getF32Type());
+    Value filledMax = rewriter.create<linalg::FillOp>(loc, negInf, initMax).getResult(0);
 
-    rewriter.create<linalg::ReduceOp>(
+    Value maxVals = rewriter.create<linalg::ReduceOp>(
         loc,
         ValueRange{input},
-        ValueRange{maxBuffer},
+        ValueRange{filledMax},
         SmallVector<int64_t>{rank - 1},  // reduce along last dimension
         [](OpBuilder &b, Location loc, ValueRange args) {
           // args[0] = input element, args[1] = current max
           Value newMax = b.create<arith::MaximumFOp>(loc, args[0], args[1]);
           b.create<linalg::YieldOp>(loc, newMax);
         }
-    );
+    ).getResult(0);
 
     // Step 2: Compute exp(input - max) using linalg.generic
-    // This broadcasts max across the last dimension and computes exp
     SmallVector<AffineMap> indexingMaps;
     auto identityMap = AffineMap::getMultiDimIdentityMap(rank, rewriter.getContext());
     SmallVector<AffineExpr> reducedExprs;
@@ -196,65 +202,63 @@ struct SoftmaxOpLowering : public OpRewritePattern<SoftmaxOp> {
     auto broadcastMap = AffineMap::get(rank, 0, reducedExprs, rewriter.getContext());
 
     indexingMaps.push_back(identityMap);     // input
-    indexingMaps.push_back(broadcastMap);    // maxBuffer (broadcasted)
+    indexingMaps.push_back(broadcastMap);    // maxVals (broadcasted)
     indexingMaps.push_back(identityMap);     // output
 
     SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
-
-    rewriter.create<linalg::GenericOp>(
+    
+    Value emptyExp = rewriter.create<tensor::EmptyOp>(loc, shape, rewriter.getF32Type());
+    Value expVals = rewriter.create<linalg::GenericOp>(
         loc,
-        ValueRange{input, maxBuffer},
-        ValueRange{output},
+        inputType,
+        ValueRange{input, maxVals},
+        ValueRange{emptyExp},
         indexingMaps,
         iteratorTypes,
         [](OpBuilder &b, Location loc, ValueRange args) {
-          // args[0] = input element, args[1] = max value (broadcasted)
           Value shifted = b.create<arith::SubFOp>(loc, args[0], args[1]);
           Value expVal = b.create<math::ExpOp>(loc, shifted);
           b.create<linalg::YieldOp>(loc, expVal);
         }
-    );
+    ).getResult(0);
 
     // Step 3: Sum exp values along last dimension using linalg.reduce
     Value zero = createConstantFloat(rewriter, loc, 0.0f);
-    rewriter.create<linalg::FillOp>(loc, zero, sumBuffer);
+    Value initSum = rewriter.create<tensor::EmptyOp>(loc, reducedShape, rewriter.getF32Type());
+    Value filledSum = rewriter.create<linalg::FillOp>(loc, zero, initSum).getResult(0);
 
-    rewriter.create<linalg::ReduceOp>(
+    Value sumVals = rewriter.create<linalg::ReduceOp>(
         loc,
-        ValueRange{output},  // input is now the exp values
-        ValueRange{sumBuffer},
+        ValueRange{expVals},
+        ValueRange{filledSum},
         SmallVector<int64_t>{rank - 1},  // reduce along last dimension
         [](OpBuilder &b, Location loc, ValueRange args) {
-          // args[0] = exp element, args[1] = current sum
           Value newSum = b.create<arith::AddFOp>(loc, args[0], args[1]);
           b.create<linalg::YieldOp>(loc, newSum);
         }
-    );
+    ).getResult(0);
 
     // Step 4: Normalize by dividing exp values by sum using linalg.generic
-    rewriter.create<linalg::GenericOp>(
+    Value emptyResult = rewriter.create<tensor::EmptyOp>(loc, shape, rewriter.getF32Type());
+    Value result = rewriter.create<linalg::GenericOp>(
         loc,
-        ValueRange{output, sumBuffer},  // exp values and sum
-        ValueRange{output},              // in-place normalization
+        inputType,
+        ValueRange{expVals, sumVals},
+        ValueRange{emptyResult},
         SmallVector<AffineMap>{identityMap, broadcastMap, identityMap},
         iteratorTypes,
         [](OpBuilder &b, Location loc, ValueRange args) {
-          // args[0] = exp element, args[1] = sum (broadcasted)
           Value normalized = b.create<arith::DivFOp>(loc, args[0], args[1]);
           b.create<linalg::YieldOp>(loc, normalized);
         }
-    );
+    ).getResult(0);
 
-    // Clean up temporary buffers
-    rewriter.create<memref::DeallocOp>(loc, maxBuffer);
-    rewriter.create<memref::DeallocOp>(loc, sumBuffer);
-
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
 
-// Lower transformer.transpose to linalg.transpose (swaps last two dimensions)
+// Lower transformer.transpose to linalg.transpose (swaps last two dimensions, tensor-based)
 struct TransposeOpLowering : public OpRewritePattern<TransposeOp> {
   using OpRewritePattern<TransposeOp>::OpRewritePattern;
 
@@ -262,10 +266,14 @@ struct TransposeOpLowering : public OpRewritePattern<TransposeOp> {
                                 PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     Value input = op.getInput();
-    Value output = op.getOutput();
 
-    auto inputType = cast<MemRefType>(input.getType());
+    auto inputType = cast<RankedTensorType>(input.getType());
+    auto resultType = cast<RankedTensorType>(op.getResult().getType());
     int rank = inputType.getRank();
+
+    // Create empty output tensor
+    Value empty = rewriter.create<tensor::EmptyOp>(
+        loc, resultType.getShape(), resultType.getElementType());
 
     // Create permutation: swap last two dimensions
     // For rank=2: [0,1] -> [1,0]
@@ -278,14 +286,14 @@ struct TransposeOpLowering : public OpRewritePattern<TransposeOp> {
     permutation.push_back(rank - 2);  // Swap: second-to-last dimension second
 
     // Use linalg.transpose with the permutation
-    rewriter.create<linalg::TransposeOp>(
+    Value result = rewriter.create<linalg::TransposeOp>(
         loc,
         input,
-        output,
+        empty,
         permutation
-    );
+    ).getResult()[0];
 
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
@@ -302,7 +310,8 @@ struct LowerTransformerToStandardPass
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<arith::ArithDialect, func::FuncDialect,
                     linalg::LinalgDialect, math::MathDialect,
-                    memref::MemRefDialect, scf::SCFDialect>();
+                    memref::MemRefDialect, scf::SCFDialect,
+                    tensor::TensorDialect>();
   }
 
   void runOnOperation() override {

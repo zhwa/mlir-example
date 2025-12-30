@@ -27,25 +27,29 @@ output = attn_weights @ V
 
 ## Architecture
 
-**Pure MLIR JIT Compilation** using the Tensor API:
+**Tensor-First MLIR Compilation** using the Tensor API with Bufferization:
 
 1. **Tensor API** - Build computation graphs with Python-like operations
 2. **GraphNode** - Internal representation of operations and their dependencies
-3. **IRBuilder** - Converts computation graph to MLIR operations
-4. **JIT Compilation** - MLIR → LLVM IR → native code
-5. **libffi Execution** - Proper calling convention for variable memref descriptors
+3. **IRBuilder** - Converts computation graph to MLIR tensor operations
+4. **Bufferization Pipeline** - Three-pass transformation (tensor → memref)
+   - `OneShotBufferize` - Converts tensor operations to memref operations
+   - `BufferResultsToOutParams` - Transforms results to output parameters
+   - `ConvertBufferizationToMemRef` - Removes remaining tensor artifacts
+5. **JIT Compilation** - MLIR → LLVM IR → native code
+6. **libffi Execution** - Proper calling convention for memref descriptors
 
-**Custom Transformer Dialect** operations:
-- `transformer.matmul` - 2D matrix multiplication
-- `transformer.add` - Element-wise addition  
-- `transformer.mul` - Element-wise multiplication (for scaling)
-- `transformer.softmax` - Numerically stable softmax
-- `transformer.transpose` - 2D transpose
+**Custom Transformer Dialect** operations (all tensor-based):
+- `transformer.matmul` - 2D matrix multiplication (tensor inputs/result)
+- `transformer.add` - Element-wise addition (tensor inputs/result)
+- `transformer.mul` - Element-wise multiplication (tensor inputs/result)
+- `transformer.softmax` - Numerically stable softmax (tensor input/result)
+- `transformer.transpose` - 2D transpose (tensor input/result)
 - Higher-level: `attention(Q, K, V)` composed from primitives
 
 ## Key Concepts
 
-### Pure MLIR JIT Pipeline
+### Pure MLIR JIT Pipeline (Tensor-First)
 
 1. **Python API** → **Computation Graph**
    ```python
@@ -53,33 +57,65 @@ output = attn_weights @ V
    result = ch11.attention(Q, K, V)  # Builds GraphNode tree
    ```
 
-2. **Computation Graph** → **MLIR IR**
+2. **Computation Graph** → **MLIR IR (Tensor-Based)**
    ```
-   IRBuilder traverses graph, generates MLIR operations:
-   - Input nodes → func arguments
-   - Operation nodes → transformer.* operations
+   IRBuilder traverses graph, generates tensor-based MLIR operations:
+   - Input nodes → func arguments (tensor<?x?xf32>)
+   - Operation nodes → transformer.* operations (return tensors)
+   Example: %result = transformer.matmul %lhs, %rhs : (tensor<?x?xf32>, tensor<?x?xf32>) -> tensor<?x?xf32>
    ```
 
-3. **MLIR IR** → **Native Code**
+3. **Bufferization Pipeline** → **Memref-Based IR**
+   ```
+   Three-pass bufferization (func_ext registration required):
+   - OneShotBufferize: tensor ops → memref ops (with function boundaries)
+   - BufferResultsToOutParams: results → output parameters
+   - ConvertBufferizationToMemRef: cleanup remaining tensor artifacts
+   Result: %result = memref.alloc() + transformer ops update memrefs in-place
+   ```
+
+4. **MLIR IR** → **Native Code**
    ```
    PassManager pipeline:
-   - Transformer dialect → Standard/Arith/MemRef/SCF
+   - Transformer dialect → Linalg (tensor-based)
+   - Bufferization passes (tensor → memref)
+   - Linalg (memref) → SCF loops
    - Standard dialects → LLVM IR
    - LLVM IR → native machine code
    ```
 
-4. **Native Code** → **Execution**
+5. **Native Code** → **Execution**
    ```
    libffi calls JIT-compiled function with memref descriptors
    ```
 
-### Lowering Strategy
-Operations lower to standard MLIR dialects:
-- `MatmulOp` → nested `scf.for` loops with `arith.mulf` and `arith.addf`
-- `AddOp`, `MulOp` → rank-generic loops, `arith.addf`/`arith.mulf`
-- `SoftmaxOp` → three-pass algorithm (find max → exp → normalize)
-- `TransposeOp` → dimension permutation via `memref.load`/`store`
-- `attention()` → composition of primitives (matmul, transpose, scale, softmax)
+### Lowering Strategy (Tensor-First → Linalg → Bufferization → Loops)
+
+Operations lower through multiple stages:
+
+**Stage 1: Transformer Dialect (Tensor) → Linalg (Tensor)**
+- `MatmulOp` → `tensor::EmptyOp` + `linalg::FillOp` + `linalg::MatmulOp` (all tensors)
+- `AddOp` → `tensor::EmptyOp` + `linalg::AddOp` (tensors)
+- `MulOp` → `tensor::EmptyOp` + `linalg::MulOp` (tensors)
+- `SoftmaxOp` → `tensor::EmptyOp` + `linalg::Reduce` + `linalg::Generic` (4-pass tensor algorithm)
+- `TransposeOp` → `tensor::EmptyOp` + `linalg::TransposeOp` (tensors)
+
+**Stage 2: Bufferization (Tensor → Memref)**
+- `OneShotBufferize`: Converts all tensor operations to memref operations
+- `BufferResultsToOutParams`: Adds output parameters to function signatures
+- `ConvertBufferizationToMemRef`: Removes tensor.empty → memref.alloc
+
+**Stage 3: Linalg (Memref) → SCF Loops**
+- `linalg.matmul` → nested `scf.for` loops with `arith.mulf` and `arith.addf`
+- `linalg.add`, `linalg.mul` → rank-generic loops with arithmetic ops
+- `linalg.reduce` + `linalg.generic` → multi-pass loops (max → exp → normalize)
+- `linalg.transpose` → dimension permutation via `memref.load`/`store`
+
+This multi-stage approach:
+- **Cleaner semantics** at high level (pure functions with tensor results)
+- **Optimization opportunities** before bufferization (tensor-level passes)
+- **Explicit memory management** after bufferization (memref allocations)
+- **Consistency** with Chapters 5-10 architecture
 
 ### Debugging NaN Issues
 

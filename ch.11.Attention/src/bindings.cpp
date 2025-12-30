@@ -10,6 +10,16 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/Bufferization/Transforms/Bufferize.h"
+#include "mlir/Dialect/Bufferization/Transforms/OneShotAnalysis.h"
+#include "mlir/Dialect/Bufferization/Transforms/OneShotModuleBufferize.h"
+#include "mlir/Dialect/Bufferization/Transforms/Passes.h"
+#include "mlir/Dialect/Linalg/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Bufferization/Transforms/FuncBufferizableOpInterfaceImpl.h"
 #include "mlir/ExecutionEngine/ExecutionEngine.h"
 #include "mlir/ExecutionEngine/OptUtils.h"
 #include "mlir/IR/Builders.h"
@@ -21,6 +31,7 @@
 #include "mlir/Transforms/Passes.h"
 
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
+#include "mlir/Conversion/BufferizationToMemRef/BufferizationToMemRef.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h"
 #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
@@ -28,6 +39,7 @@
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
+#include "mlir/Conversion/TensorToLinalg/TensorToLinalgPass.h"
 #include "mlir/Dialect/Linalg/Passes.h"
 
 #include <llvm/Support/TargetSelect.h>
@@ -72,6 +84,8 @@ public:
     context_.getOrLoadDialect<memref::MemRefDialect>();
     context_.getOrLoadDialect<scf::SCFDialect>();
     context_.getOrLoadDialect<math::MathDialect>();
+    context_.getOrLoadDialect<tensor::TensorDialect>();
+    context_.getOrLoadDialect<bufferization::BufferizationDialect>();
     context_.getOrLoadDialect<LLVM::LLVMDialect>();
   }
 
@@ -80,12 +94,27 @@ public:
   bool lowerToLLVM(ModuleOp module) {
     PassManager pm(&context_);
 
-    // Lower transformer dialect to linalg and standard dialects
+    // Lower transformer dialect to linalg and standard dialects (tensor-based)
     pm.addNestedPass<func::FuncOp>(createLowerTransformerToStandardPass());
     pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
     pm.addNestedPass<func::FuncOp>(createCSEPass());
 
-    // Lower linalg: convert named ops to loops
+    // Bufferization: tensor → memref
+    DialectRegistry registry;
+    arith::registerBufferizableOpInterfaceExternalModels(registry);
+    linalg::registerBufferizableOpInterfaceExternalModels(registry);
+    tensor::registerBufferizableOpInterfaceExternalModels(registry);
+    bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(registry);
+    context_.appendDialectRegistry(registry);
+
+    bufferization::OneShotBufferizePassOptions bufferizeOptions;
+    bufferizeOptions.bufferizeFunctionBoundaries = true;
+    pm.addPass(bufferization::createOneShotBufferizePass(bufferizeOptions));
+    pm.addPass(bufferization::createBufferResultsToOutParamsPass());
+    pm.addPass(createConvertBufferizationToMemRefPass());
+    pm.addPass(createCanonicalizerPass());
+
+    // Lower linalg: convert named ops to loops (on memrefs now)
     pm.addPass(createConvertLinalgToLoopsPass());
     pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
 
@@ -99,7 +128,17 @@ public:
     pm.addPass(createConvertFuncToLLVMPass());
     pm.addPass(createReconcileUnrealizedCastsPass());
 
-    return succeeded(pm.run(module));
+    if (failed(pm.run(module))) {
+      llvm::errs() << "Pass manager failed\n";
+      return false;
+    }
+    
+    // Debug: print module after lowering
+    llvm::errs() << "=== Module after lowering ===\n";
+    module.print(llvm::errs());
+    llvm::errs() << "\n=== End module ===\n";
+    
+    return true;
   }
 
   void* compileAndGetFunctionPtr(ModuleOp module, const std::string& funcName) {
@@ -283,9 +322,9 @@ public:
 public:
   IRBuilder(OpBuilder& b) : builder(b) {}
 
-  Value createAlloc(const std::vector<int64_t>& shape) {
-    auto memrefType = MemRefType::get(shape, builder.getF32Type());
-    return builder.create<memref::AllocOp>(builder.getUnknownLoc(), memrefType);
+  Value createEmptyTensor(const std::vector<int64_t>& shape) {
+    auto tensorType = RankedTensorType::get(shape, builder.getF32Type());
+    return builder.create<tensor::EmptyOp>(builder.getUnknownLoc(), shape, builder.getF32Type());
   }
 
   Value compileNode(std::shared_ptr<GraphNode> node) {
@@ -303,73 +342,49 @@ public:
       case OpType::Matmul: {
         Value lhs = compileNode(node->inputs[0]);
         Value rhs = compileNode(node->inputs[1]);
-        Value output = createAlloc(node->shape);
-        builder.create<MatmulOp>(loc, lhs, rhs, output);
-        result = output;
+        auto resultType = RankedTensorType::get(node->shape, builder.getF32Type());
+        result = builder.create<MatmulOp>(loc, resultType, lhs, rhs).getResult();
         break;
       }
 
       case OpType::Add: {
         Value lhs = compileNode(node->inputs[0]);
         Value rhs = compileNode(node->inputs[1]);
-        Value output = createAlloc(node->shape);
-        builder.create<AddOp>(loc, lhs, rhs, output);
-        result = output;
+        auto resultType = RankedTensorType::get(node->shape, builder.getF32Type());
+        result = builder.create<AddOp>(loc, resultType, lhs, rhs).getResult();
         break;
       }
 
       case OpType::Transpose: {
         Value input = compileNode(node->inputs[0]);
-        Value output = createAlloc(node->shape);
-        builder.create<TransposeOp>(loc, input, output);
-        result = output;
+        auto resultType = RankedTensorType::get(node->shape, builder.getF32Type());
+        result = builder.create<TransposeOp>(loc, resultType, input).getResult();
         break;
       }
 
       case OpType::Softmax: {
         Value input = compileNode(node->inputs[0]);
-        Value output = createAlloc(node->shape);
-        builder.create<SoftmaxOp>(loc, input, output);
-        result = output;
+        auto resultType = RankedTensorType::get(node->shape, builder.getF32Type());
+        result = builder.create<SoftmaxOp>(loc, resultType, input).getResult();
         break;
       }
 
       case OpType::Scale: {
         Value input = compileNode(node->inputs[0]);
-        Value output = createAlloc(node->shape);
-
-        // Create constant scale factor memref (same shape as input)
-        Value scale = createAlloc(node->shape);
-        Value scaleConst = builder.create<arith::ConstantOp>(
+        
+        // Create constant scale tensor (broadcast scalar to shape)
+        Value scaleScalar = builder.create<arith::ConstantOp>(
             loc, builder.getFloatAttr(builder.getF32Type(), llvm::APFloat(node->scale_factor)));
-
-        // Fill scale memref with constant
-        SmallVector<Value> bounds;
-        Value zero = builder.create<arith::ConstantIndexOp>(loc, 0);
-        Value one = builder.create<arith::ConstantIndexOp>(loc, 1);
-        for (int64_t dim : node->shape) {
-          bounds.emplace_back(builder.create<arith::ConstantIndexOp>(loc, dim));
-        }
-
-        std::function<void(OpBuilder&, Location, SmallVector<Value>&, size_t)> fillScale;
-        fillScale = [&](OpBuilder& b, Location l, SmallVector<Value>& indices, size_t depth) {
-          if (depth == node->shape.size()) {
-            b.create<memref::StoreOp>(l, scaleConst, scale, indices);
-          } else {
-            b.create<scf::ForOp>(l, zero, bounds[depth], one, std::nullopt,
-              [&](OpBuilder& b2, Location l2, Value iv, ValueRange) {
-                indices.emplace_back(iv);
-                fillScale(b2, l2, indices, depth + 1);
-                indices.pop_back();
-                b2.create<scf::YieldOp>(l2);
-              });
-          }
-        };
-        SmallVector<Value> indices;
-        fillScale(builder, loc, indices, 0);
-
-        builder.create<MulOp>(loc, input, scale, output);
-        result = output;
+        
+        // Create empty tensor for scale
+        Value emptyScale = createEmptyTensor(node->shape);
+        
+        // Fill scale tensor with constant using linalg.fill
+        Value scaleTensor = builder.create<linalg::FillOp>(loc, scaleScalar, emptyScale).getResult(0);
+        
+        // Perform element-wise multiplication
+        auto resultType = RankedTensorType::get(node->shape, builder.getF32Type());
+        result = builder.create<MulOp>(loc, resultType, input, scaleTensor).getResult();
         break;
       }
     }
@@ -410,16 +425,15 @@ py::array_t<float> forward(const Tensor& output) {
   auto module = ModuleOp::create(builder.getUnknownLoc());
   builder.setInsertionPointToEnd(module.getBody());
 
-  // Create function signature: (inputs..., output) -> ()
+  // Create function signature: (inputs...) -> tensor<...>
   std::vector<Type> funcInputTypes;
   for (auto& inp : inputs) {
-    auto memrefType = MemRefType::get(inp->shape, builder.getF32Type());
-    funcInputTypes.emplace_back(memrefType);
+    auto tensorType = RankedTensorType::get(inp->shape, builder.getF32Type());
+    funcInputTypes.emplace_back(tensorType);
   }
-  auto outputType = MemRefType::get(output.node->shape, builder.getF32Type());
-  funcInputTypes.emplace_back(outputType);
+  auto outputTensorType = RankedTensorType::get(output.node->shape, builder.getF32Type());
 
-  auto funcType = builder.getFunctionType(funcInputTypes, {});
+  auto funcType = builder.getFunctionType(funcInputTypes, {outputTensorType});
   auto func = func::FuncOp::create(builder.getUnknownLoc(), "compute", funcType);
   auto& entryBlock = *func.addEntryBlock();
   builder.setInsertionPointToStart(&entryBlock);
@@ -432,11 +446,9 @@ py::array_t<float> forward(const Tensor& output) {
 
   // Compile computation graph
   Value resultValue = irBuilder.compileNode(output.node);
-  Value outputArg = entryBlock.getArgument(inputs.size());
 
-  // Copy result to output
-  builder.create<memref::CopyOp>(builder.getUnknownLoc(), resultValue, outputArg);
-  builder.create<func::ReturnOp>(builder.getUnknownLoc());
+  // Return result tensor
+  builder.create<func::ReturnOp>(builder.getUnknownLoc(), resultValue);
 
   module.push_back(func);
 
@@ -446,13 +458,19 @@ py::array_t<float> forward(const Tensor& output) {
     throw std::runtime_error("Failed to compile function");
   }
 
-  // Prepare arguments: inputs, output
+  // After bufferization, function signature changes from:
+  //   (tensor, ...) -> tensor
+  // to:
+  //   (memref*, ..., memref*) -> ()
+  // The last argument is the output memref (result of BufferResultsToOutParams pass)
+
+  // Prepare arguments: input memrefs + output memref
   std::vector<void*> args;
   for (auto& inp : inputs) {
     marshal_memref_2d(args, inp->data);
   }
 
-  // Allocate output
+  // Allocate output memref
   py::array_t<float> result(output.node->shape);
   marshal_memref_2d(args, result);
 

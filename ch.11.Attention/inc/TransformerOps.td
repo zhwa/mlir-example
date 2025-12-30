@@ -23,8 +23,9 @@ def Transformer_MatmulOp : Transformer_Op<"matmul"> {
     For 3D: (B, M, K) @ (B, K, N) -> (B, M, N)
   }];
 
-  let arguments = (ins AnyMemRef:$lhs, AnyMemRef:$rhs, AnyMemRef:$output);
-  let assemblyFormat = "$lhs `,` $rhs `,` $output attr-dict `:` type($lhs) `,` type($rhs) `,` type($output)";
+  let arguments = (ins AnyTensor:$lhs, AnyTensor:$rhs);
+  let results = (outs AnyTensor:$result);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` `(` type($lhs) `,` type($rhs) `)` `->` type($result)";
 }
 
 //===----------------------------------------------------------------------===//
@@ -33,18 +34,20 @@ def Transformer_MatmulOp : Transformer_Op<"matmul"> {
 
 def Transformer_AddOp : Transformer_Op<"add"> {
   let summary = "Element-wise addition";
-  let description = [{ output = lhs + rhs }];
+  let description = [{ result = lhs + rhs }];
 
-  let arguments = (ins AnyMemRef:$lhs, AnyMemRef:$rhs, AnyMemRef:$output);
-  let assemblyFormat = "$lhs `,` $rhs `,` $output attr-dict `:` type($lhs) `,` type($rhs) `,` type($output)";
+  let arguments = (ins AnyTensor:$lhs, AnyTensor:$rhs);
+  let results = (outs AnyTensor:$result);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` `(` type($lhs) `,` type($rhs) `)` `->` type($result)";
 }
 
 def Transformer_MulOp : Transformer_Op<"mul"> {
   let summary = "Element-wise multiplication";
-  let description = [{ output = lhs * rhs }];
+  let description = [{ result = lhs * rhs }];
 
-  let arguments = (ins AnyMemRef:$lhs, AnyMemRef:$rhs, AnyMemRef:$output);
-  let assemblyFormat = "$lhs `,` $rhs `,` $output attr-dict `:` type($lhs) `,` type($rhs) `,` type($output)";
+  let arguments = (ins AnyTensor:$lhs, AnyTensor:$rhs);
+  let results = (outs AnyTensor:$result);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` `(` type($lhs) `,` type($rhs) `)` `->` type($result)";
 }
 
 //===----------------------------------------------------------------------===//
@@ -59,8 +62,9 @@ def Transformer_SoftmaxOp : Transformer_Op<"softmax"> {
     softmax(x) = exp(x - max(x)) / sum(exp(x - max(x)))
   }];
 
-  let arguments = (ins AnyMemRef:$input, AnyMemRef:$output);
-  let assemblyFormat = "$input `,` $output attr-dict `:` type($input) `,` type($output)";
+  let arguments = (ins AnyTensor:$input);
+  let results = (outs AnyTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
 }
 
 //===----------------------------------------------------------------------===//
@@ -76,8 +80,9 @@ def Transformer_TransposeOp : Transformer_Op<"transpose"> {
     For 3D: (B, M, N) -> (B, N, M)
   }];
 
-  let arguments = (ins AnyMemRef:$input, AnyMemRef:$output);
-  let assemblyFormat = "$input `,` $output attr-dict `:` type($input) `,` type($output)";
+  let arguments = (ins AnyTensor:$input);
+  let results = (outs AnyTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
 }
 
 #endif // TRANSFORMER_OPS

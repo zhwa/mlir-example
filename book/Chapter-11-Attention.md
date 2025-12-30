@@ -163,17 +163,22 @@ def Transformer_MatmulOp : Transformer_Op<"matmul"> {
     Supports 2D and 3D tensors (batched matmul).
     For 2D: (M, K) @ (K, N) -> (M, N)
     For 3D: (B, M, K) @ (B, K, N) -> (B, M, N)
+    
+    Returns a new tensor with the result.
   }];
 
-  let arguments = (ins AnyMemRef:$lhs, AnyMemRef:$rhs, AnyMemRef:$output);
-  let assemblyFormat = "$lhs `,` $rhs `,` $output attr-dict `:` type($lhs) `,` type($rhs) `,` type($output)";
+  let arguments = (ins AnyTensor:$lhs, AnyTensor:$rhs);
+  let results = (outs AnyTensor:$result);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` `(` type($lhs) `,` type($rhs) `)` `->` type($result)";
 }
 ```
 
-**Design Choices**:
-- **Three operands**: Two inputs, one output (out-parameter pattern from Chapter 7). Avoids allocation inside the operation.
-- **AnyMemRef**: Accepts memrefs of any rank/type. Verification (if needed) happens at lowering time.
-- **Assembly format**: Custom syntax `transformer.matmul %A, %B, %C : memref<...>, memref<...>, memref<...>`. Mirrors operation semantics directly.
+**Design Choices** (Tensor-First Architecture):
+- **Tensor operations**: Operations consume tensor arguments and return tensor results, following pure functional semantics (consistent with Chapters 5-10).
+- **AnyTensor**: Accepts tensors of any rank/type (typically `tensor<?x?xf32>` for dynamic 2D matrices).
+- **Results instead of output parameters**: Modern MLIR uses result values rather than output parameters.
+- **Bufferization handles memory**: Tensor operations remain pure; the bufferization pipeline converts to memref-based execution later.
+- **Assembly format**: Custom syntax `%result = transformer.matmul %A, %B : (tensor<?x?xf32>, tensor<?x?xf32>) -> tensor<?x?xf32>` mirrors pure functional semantics.
 
 
 ### 11.2.2 Transpose
@@ -186,14 +191,18 @@ def Transformer_TransposeOp : Transformer_Op<"transpose"> {
 
     For 2D: (M, N) -> (N, M)
     For 3D: (B, M, N) -> (B, N, M)
+    
+    Example:
+      %transposed = transformer.transpose %input : tensor<?x?xf32> -> tensor<?x?xf32>
   }];
 
-  let arguments = (ins AnyMemRef:$input, AnyMemRef:$output);
-  let assemblyFormat = "$input `,` $output attr-dict `:` type($input) `,` type($output)";
+  let arguments = (ins AnyTensor:$input);
+  let results = (outs AnyTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
 }
 ```
 
-Attention requires transposing K to compute Q @ K^T. Note the specification: "last two dimensions." This handles batched attention (3D tensors) automatically—batch dimension remains unchanged, inner matrix transposes.
+Attention requires transposing K to compute Q @ K^T. Note the specification: "last two dimensions." This handles batched attention (3D tensors) automatically—batch dimension remains unchanged, inner matrix transposes. The operation returns a tensor result rather than mutating an output parameter.
 
 ### 11.2.3 Softmax
 
@@ -204,55 +213,75 @@ def Transformer_SoftmaxOp : Transformer_Op<"softmax"> {
     Applies numerically stable softmax along the last dimension:
     
     softmax(x)[i] = exp(x[i] - max(x)) / sum_j(exp(x[j] - max(x)))
+    
+    Example:
+      %weights = transformer.softmax %scaled_scores : tensor<?x?xf32> -> tensor<?x?xf32>
   }];
 
-  let arguments = (ins AnyMemRef:$input, AnyMemRef:$output);
-  let assemblyFormat = "$input `,` $output attr-dict `:` type($input) `,` type($output)";
+  let arguments = (ins AnyTensor:$input);
+  let results = (outs AnyTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
 }
 ```
 
-The description specifies **numerically stable** softmax—max subtraction prevents overflow. This is crucial: without it, exp(large_number) produces infinity, breaking attention. The implementation (Section 11.3) shows the three-pass algorithm from Chapter 6.
+The description specifies **numerically stable** softmax—max subtraction prevents overflow. This is crucial: without it, exp(large_number) produces infinity, breaking attention. The implementation (Section 11.3) shows the four-pass tensor-based algorithm.
 
 ### 11.2.4 Element-Wise Operations
 
 ```tablegen
 def Transformer_AddOp : Transformer_Op<"add"> {
   let summary = "Element-wise addition";
-  let description = [{ output = lhs + rhs }];
-  let arguments = (ins AnyMemRef:$lhs, AnyMemRef:$rhs, AnyMemRef:$output);
-  let assemblyFormat = "$lhs `,` $rhs `,` $output attr-dict `:` type($lhs) `,` type($rhs) `,` type($output)";
+  let description = [{
+    result = lhs + rhs
+    
+    Example:
+      %sum = transformer.add %lhs, %rhs : (tensor<?x?xf32>, tensor<?x?xf32>) -> tensor<?x?xf32>
+  }];
+  let arguments = (ins AnyTensor:$lhs, AnyTensor:$rhs);
+  let results = (outs AnyTensor:$result);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` `(` type($lhs) `,` type($rhs) `)` `->` type($result)";
 }
 
 def Transformer_MulOp : Transformer_Op<"mul"> {
   let summary = "Element-wise multiplication";
-  let description = [{ output = lhs * rhs }];
-  let arguments = (ins AnyMemRef:$lhs, AnyMemRef:$rhs, AnyMemRef:$output);
-  let assemblyFormat = "$lhs `,` $rhs `,` $output attr-dict `:` type($lhs) `,` type($rhs) `,` type($output)";
+  let description = [{
+    result = lhs * rhs
+    
+    Example:
+      %scaled = transformer.mul %scores, %scale_factor : (tensor<?x?xf32>, tensor<?x?xf32>) -> tensor<?x?xf32>
+  }];
+  let arguments = (ins AnyTensor:$lhs, AnyTensor:$rhs);
+  let results = (outs AnyTensor:$result);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` `(` type($lhs) `,` type($rhs) `)` `->` type($result)";
 }
 ```
 
-Addition handles residual connections (Chapter 12). Multiplication enables element-wise operations, including scaling. The Python API's `scale()` function uses `mul` to implement scaling by √d_k: it creates a memref filled with the scale constant, then performs element-wise multiplication. Both operations are rank-generic: work on any-shaped memrefs with compatible shapes.
+Addition handles residual connections (Chapter 12). Multiplication enables element-wise operations, including scaling. The Python API's `scale()` function uses `mul` to implement scaling by √d_k. Both operations are rank-generic: work on any-shaped tensors with compatible shapes. Like all transformer operations, they return tensor results that later bufferize to memrefs.
 
 
-## 11.3 Lowering Patterns: Leveraging the Linalg Dialect
+## 11.3 Lowering Patterns: Tensor-First Linalg Lowering
 
-Operations defined, we now implement lowering—converting high-level `transformer.*` operations to MLIR's **Linalg dialect**. Linalg provides structured operations for linear algebra that MLIR's optimization passes understand deeply. By lowering to linalg instead of raw loops, we get free optimizations: tiling, fusion, vectorization, parallelization.
+Operations defined, we now implement lowering—converting high-level `transformer.*` operations to MLIR's **Linalg dialect** using **tensor-based** operations. This tensor-first approach (consistent with Chapters 5-10) provides cleaner semantics: operations are pure functions returning new tensors rather than mutating output parameters. The bufferization pipeline (Section 11.5) later converts these tensor operations to efficient memref-based code.
 
-**Design Philosophy**: The transformer dialect is a **thin wrapper** around linalg. Operations provide domain-specific names (`transformer.matmul` is clearer than `linalg.matmul` in attention code), but immediately lower to linalg for optimization. This combines usability with performance.
+**Design Philosophy**: The transformer dialect is a **thin wrapper** around linalg's tensor operations. Operations provide domain-specific names (`transformer.matmul` is clearer than `linalg.matmul` in attention code), but immediately lower to tensor-based linalg for optimization. This combines usability with performance while maintaining consistency with the architecture established in Chapters 5-10.
 
-### 11.3.1 Matrix Multiplication Lowering
+### 11.3.1 Matrix Multiplication Lowering (Tensor-Based)
 
-Matrix multiplication C = A @ B lowers to two linalg operations:
+Matrix multiplication C = A @ B lowers to tensor-based linalg operations:
 
 ```mlir
-linalg.fill ins(%zero : f32) outs(%C : memref<?x?xf32>)
-linalg.matmul ins(%A, %B : memref<?x?xf32>, memref<?x?xf32>)
-              outs(%C : memref<?x?xf32>)
+%empty = tensor.empty(%M, %N) : tensor<?x?xf32>
+%zero = arith.constant 0.0 : f32
+%filled = linalg.fill ins(%zero : f32) outs(%empty : tensor<?x?xf32>) -> tensor<?x?xf32>
+%result = linalg.matmul ins(%A, %B : tensor<?x?xf32>, tensor<?x?xf32>)
+                        outs(%filled : tensor<?x?xf32>) -> tensor<?x?xf32>
 ```
 
-**Zero Initialization**: `linalg.fill` sets all elements of C to zero before accumulation. Skipping this produces undefined behavior.
+**Tensor Creation**: `tensor.empty` creates an uninitialized tensor (bufferization allocates memory later).
 
-**Structured Operation**: `linalg.matmul` is a **named operation**—MLIR knows its semantics (`C[i,j] += A[i,k] * B[k,j]`). Optimization passes can tile it, fuse it with consumers, vectorize it, or parallelize it automatically.
+**Zero Initialization**: `linalg.fill` returns a new zero-filled tensor. This is a pure operation—no mutation.
+
+**Structured Operation**: `linalg.matmul` computes matrix multiplication on tensors, returning the result tensor. MLIR knows its semantics and can optimize (tile, fuse, vectorize) before bufferization.
 
 **The Lowering Pattern**. From [src/TransformerToStandard.cpp](ch.11.Attention/src/TransformerToStandard.cpp):
 
@@ -265,26 +294,46 @@ struct MatmulOpLowering : public OpRewritePattern<MatmulOp> {
     auto loc = op.getLoc();
     Value lhs = op.getLhs();
     Value rhs = op.getRhs();
-    Value output = op.getOutput();
 
-    // Zero-initialize output
+    // Get result type from the operation
+    auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
+
+    // Create empty tensor for output
+    SmallVector<Value> dynamicDims;
+    for (auto dim : resultType.getShape()) {
+      if (ShapedType::isDynamic(dim)) {
+        auto dimSize = rewriter.create<tensor::DimOp>(loc, lhs, 0);
+        dynamicDims.push_back(dimSize);
+      }
+    }
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(
+        loc, resultType, dynamicDims);
+
+    // Zero-initialize with linalg.fill (returns new tensor)
     Value zero = rewriter.create<arith::ConstantOp>(
         loc, rewriter.getF32FloatAttr(0.0));
-    rewriter.create<linalg::FillOp>(loc, zero, output);
+    Value filledTensor = rewriter.create<linalg::FillOp>(
+        loc, zero, emptyTensor).getResult(0);
 
-    // Matrix multiplication
-    rewriter.create<linalg::MatmulOp>(
-        loc, ValueRange{lhs, rhs}, ValueRange{output});
+    // Matrix multiplication (tensor → tensor)
+    Value result = rewriter.create<linalg::MatmulOp>(
+        loc, ValueRange{lhs, rhs}, ValueRange{filledTensor}).getResult(0);
 
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
 ```
 
-Compare to manual loop lowering: ~115 lines of nested `scf.for` loops with index management, load/store operations, and accumulation logic—now 11 lines. The linalg operation encapsulates all that complexity.
+Key differences from memref-based lowering:
+- No `memref.alloc`—uses `tensor.empty` instead
+- Operations return results instead of mutating outputs
+- `replaceOp` replaces the original operation with the result value
+- Bufferization pipeline converts this to memref operations later
 
-**Execution**: Later passes convert `linalg.matmul` to loops (via `createConvertLinalgToLoopsPass()`), generating the same nested structure—but optimization passes run **before** that conversion, applying transformations impossible with raw loops.
+Compare to manual loop lowering: ~115 lines of nested `scf.for` loops with index management—now ~25 lines of tensor operations that later optimize and bufferize automatically.
+
+**Execution**: The bufferization pipeline (Section 11.5) converts these tensor operations to memref-based code, then `createConvertLinalgToLoopsPass()` generates loops—but optimization passes run **before** loop generation, enabling transformations impossible with raw loops.
 
 ### 11.3.2 Transpose Lowering
 
@@ -763,7 +812,7 @@ py::array_t<float> forward(const Tensor& input) {
 
 Four stages: graph → MLIR, MLIR → LLVM, LLVM → native, native → execution. Let's examine each.
 
-**Stage 1: Graph to MLIR**. The `buildGraphFunction()` traverses the graph, emitting MLIR operations:
+**Stage 1: Graph to MLIR (Tensor-Based)**. The `buildGraphFunction()` traverses the graph, emitting tensor-based MLIR operations:
 
 ```cpp
 void buildGraphFunction(OpBuilder& builder, ModuleOp module,
@@ -775,53 +824,51 @@ void buildGraphFunction(OpBuilder& builder, ModuleOp module,
   std::unordered_map<GraphNode*, Value> nodeToValue;
   collectInputs(outputNode, inputs);
   
-  // Build function signature
+  // Build function signature with TENSOR types
   SmallVector<Type> argTypes;
   for (auto& input : inputs) {
-    auto memrefType = MemRefType::get(input->shape, builder.getF32Type());
-    argTypes.push_back(memrefType);
+    // Dynamic tensor types (compatible with NumPy arrays)
+    SmallVector<int64_t> dynamicShape(input->shape.size(), ShapedType::kDynamic);
+    auto tensorType = RankedTensorType::get(dynamicShape, builder.getF32Type());
+    argTypes.push_back(tensorType);
   }
   
-  // Output type
-  auto outputType = MemRefType::get(outputNode->shape, builder.getF32Type());
-  argTypes.push_back(outputType);
+  // Function returns a tensor (not mutating an output parameter)
+  SmallVector<int64_t> outputShape(outputNode->shape.size(), ShapedType::kDynamic);
+  auto outputType = RankedTensorType::get(outputShape, builder.getF32Type());
   
-  // Create function
-  auto funcType = builder.getFunctionType(argTypes, {});
+  // Create function with tensor signature
+  auto funcType = builder.getFunctionType(argTypes, {outputType});
   auto func = builder.create<func::FuncOp>(loc, "graph_func", funcType);
   auto* entryBlock = func.addEntryBlock();
   builder.setInsertionPointToStart(entryBlock);
   
-  // Map input nodes to function arguments
+  // Map input nodes to function arguments (tensors)
   for (size_t i = 0; i < inputs.size(); ++i) {
     nodeToValue[inputs[i].get()] = entryBlock->getArgument(i);
   }
-  Value outputBuffer = entryBlock->getArgument(inputs.size());
   
-  // Emit operations for each node
-  emitNode(builder, outputNode, nodeToValue, outputBuffer);
+  // Emit operations for each node (returning tensors)
+  Value finalResult = emitNode(builder, outputNode, nodeToValue);
   
-  builder.create<func::ReturnOp>(loc);
+  builder.create<func::ReturnOp>(loc, finalResult);
   module.push_back(func);
 }
 ```
 
-**Key Steps**:
+**Key Changes from Memref-Based Approach**:
 
-1. **Collect Inputs**: Traverse graph depth-first, identifying all `Input` nodes. These become function arguments.
+1. **Tensor Types**: Function arguments are `tensor<?x?xf32>` (dynamic tensors), not `memref<?x?xf32>`.
 
-2. **Build Signature**: Each input becomes a memref argument. The output (where results are written) is the last argument.
+2. **Function Returns**: Functions return tensor values rather than writing to an output parameter.
 
-3. **Create Function**: Build `func.func @graph_func(...)` with the computed signature.
+3. **Pure Functions**: All operations are pure—they compute and return results without mutation.
 
-4. **Emit Operations**: Walk the graph, emitting transformer operations in topological order (dependencies before dependents).
-
-**Emitting Operations**. The `emitNode()` function is recursive:
+**Emitting Operations (Tensor-Based)**. The `emitNode()` function returns tensor values:
 
 ```cpp
 Value emitNode(OpBuilder& builder, std::shared_ptr<GraphNode> node,
-               std::unordered_map<GraphNode*, Value>& nodeToValue,
-               Value outputBuffer) {
+               std::unordered_map<GraphNode*, Value>& nodeToValue) {
   // Check if already emitted
   if (nodeToValue.count(node.get())) {
     return nodeToValue[node.get()];
@@ -836,34 +883,39 @@ Value emitNode(OpBuilder& builder, std::shared_ptr<GraphNode> node,
       
     case OpType::Matmul: {
       // Emit input nodes first (recursion)
-      Value lhs = emitNode(builder, node->inputs[0], nodeToValue, outputBuffer);
-      Value rhs = emitNode(builder, node->inputs[1], nodeToValue, outputBuffer);
+      Value lhs = emitNode(builder, node->inputs[0], nodeToValue);
+      Value rhs = emitNode(builder, node->inputs[1], nodeToValue);
       
-      // Allocate buffer for result
-      auto resultType = MemRefType::get(node->shape, builder.getF32Type());
-      Value result = builder.create<memref::AllocOp>(loc, resultType);
+      // Compute result type
+      auto lhsType = mlir::cast<RankedTensorType>(lhs.getType());
+      auto rhsType = mlir::cast<RankedTensorType>(rhs.getType());
+      SmallVector<int64_t> resultShape = {lhsType.getShape()[0], rhsType.getShape()[1]};
+      auto resultType = RankedTensorType::get(resultShape, builder.getF32Type());
       
-      // Emit matmul operation
-      builder.create<MatmulOp>(loc, lhs, rhs, result);
+      // Emit matmul operation (returns tensor result)
+      Value result = builder.create<MatmulOp>(loc, resultType, lhs, rhs).getResult();
       
       nodeToValue[node.get()] = result;
       return result;
     }
     
     case OpType::Transpose: {
-      Value input = emitNode(builder, node->inputs[0], nodeToValue, outputBuffer);
-      auto resultType = MemRefType::get(node->shape, builder.getF32Type());
-      Value result = builder.create<memref::AllocOp>(loc, resultType);
-      builder.create<TransposeOp>(loc, input, result);
+      Value input = emitNode(builder, node->inputs[0], nodeToValue);
+      auto inputType = mlir::cast<RankedTensorType>(input.getType());
+      // Swap last two dimensions for result type
+      SmallVector<int64_t> resultShape(inputType.getShape().begin(), inputType.getShape().end());
+      std::swap(resultShape[resultShape.size()-2], resultShape[resultShape.size()-1]);
+      auto resultType = RankedTensorType::get(resultShape, builder.getF32Type());
+      
+      Value result = builder.create<TransposeOp>(loc, resultType, input).getResult();
       nodeToValue[node.get()] = result;
       return result;
     }
     
     case OpType::Softmax: {
-      Value input = emitNode(builder, node->inputs[0], nodeToValue, outputBuffer);
-      auto resultType = MemRefType::get(node->shape, builder.getF32Type());
-      Value result = builder.create<memref::AllocOp>(loc, resultType);
-      builder.create<SoftmaxOp>(loc, input, result);
+      Value input = emitNode(builder, node->inputs[0], nodeToValue);
+      auto resultType = input.getType();  // Softmax preserves shape
+      Value result = builder.create<SoftmaxOp>(loc, resultType, input).getResult();
       nodeToValue[node.get()] = result;
       return result;
     }
@@ -873,50 +925,58 @@ Value emitNode(OpBuilder& builder, std::shared_ptr<GraphNode> node,
 }
 ```
 
-The pattern: emit dependencies recursively, allocate buffer for this operation's result, emit the transformer operation, cache the result value. This ensures topological ordering—operations emit only after their inputs are available.
+The pattern: emit dependencies recursively, compute result type, emit operation returning tensor result, cache result. No allocations—tensor operations are pure functions. The lowering patterns (Section 11.3) create `tensor.empty` operations, and bufferization (next) converts those to allocations.
 
-**Generated MLIR**. For the attention graph, the emitted IR looks like:
+**Generated MLIR (Tensor-Based)**. For the attention graph, the emitted IR looks like:
 
 ```mlir
-func.func @graph_func(%Q: memref<4x8xf32>, %K: memref<4x8xf32>,
-                       %V: memref<4x8xf32>, %output: memref<4x8xf32>) {
-  %K_T = memref.alloc() : memref<8x4xf32>
-  transformer.transpose %K, %K_T : memref<4x8xf32>, memref<8x4xf32>
+func.func @graph_func(%Q: tensor<?x?xf32>, %K: tensor<?x?xf32>,
+                       %V: tensor<?x?xf32>) -> tensor<?x?xf32> {
+  // Transpose K
+  %K_T = transformer.transpose %K : tensor<?x?xf32> -> tensor<?x?xf32>
   
-  %scores = memref.alloc() : memref<4x4xf32>
-  transformer.matmul %Q, %K_T, %scores : memref<4x8xf32>, memref<8x4xf32>, memref<4x4xf32>
+  // Compute scores = Q @ K^T
+  %scores = transformer.matmul %Q, %K_T : (tensor<?x?xf32>, tensor<?x?xf32>) -> tensor<?x?xf32>
   
-  %scale_buf = memref.alloc() : memref<4x4xf32>
-  %scale = arith.constant 0.353553 : f32  // 1/sqrt(8)
-  // ... scale operation ...
+  // Scale (implemented as mul with constant tensor)
+  %scale_factor = <constant tensor creation>
+  %scaled = transformer.mul %scores, %scale_factor : (tensor<?x?xf32>, tensor<?x?xf32>) -> tensor<?x?xf32>
   
-  %attn = memref.alloc() : memref<4x4xf32>
-  transformer.softmax %scale_buf, %attn : memref<4x4xf32>, memref<4x4xf32>
+  // Apply softmax
+  %attn_weights = transformer.softmax %scaled : tensor<?x?xf32> -> tensor<?x?xf32>
   
-  transformer.matmul %attn, %V, %output : memref<4x4xf32>, memref<4x8xf32>, memref<4x8xf32>
+  // Compute output = weights @ V
+  %output = transformer.matmul %attn_weights, %V : (tensor<?x?xf32>, tensor<?x?xf32>) -> tensor<?x?xf32>
   
-  func.return
+  return %output : tensor<?x?xf32>
 }
 ```
 
-High-level transformer operations, explicit buffer allocations, correct dependency ordering. This IR is ready for lowering.
+Pure functional operations, tensor types throughout, no explicit allocations. This high-level tensor-based IR is ready for lowering and bufferization.
 
-**Stage 2: Lowering to LLVM**. The compiler applies passes from Section 11.3:
+**Stage 2: Lowering to Linalg and Bufferization**. The compiler applies passes from Section 11.3, followed by a critical three-pass bufferization pipeline:
 
 ```cpp
 bool TransformerCompiler::lowerToLLVM(ModuleOp module) {
   PassManager pm(&context_);
 
-  // Lower transformer dialect to linalg
+  // Step 1: Lower transformer dialect to tensor-based linalg
   pm.addNestedPass<func::FuncOp>(createLowerTransformerToStandardPass());
   
-  // Lower linalg to loops
+  // Step 2: Three-pass bufferization (tensor → memref)
+  bufferization::OneShotBufferizePassOptions bufferizationOptions;
+  bufferizationOptions.bufferizeFunctionBoundaries = true;
+  pm.addPass(bufferization::createOneShotBufferizePass(bufferizationOptions));
+  pm.addPass(bufferization::createBufferResultsToOutParamsPass());
+  pm.addPass(createConvertBufferizationToMemRefPass());
+  
+  // Step 3: Lower linalg to loops (now operating on memrefs)
   pm.addPass(createConvertLinalgToLoopsPass());
   
   pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
   pm.addNestedPass<func::FuncOp>(createCSEPass());
 
-  // Lower standard dialects to LLVM
+  // Step 4: Lower standard dialects to LLVM
   pm.addPass(createConvertMathToLLVMPass());
   pm.addPass(createConvertMathToLibmPass());
   pm.addPass(createSCFToControlFlowPass());
@@ -930,7 +990,38 @@ bool TransformerCompiler::lowerToLLVM(ModuleOp module) {
 }
 ```
 
-First, transformer ops → linalg (Section 11.3's patterns). Then, linalg → scf.for loops (via `createConvertLinalgToLoopsPass()`). Finally, loops → LLVM IR (standard MLIR passes). Canonicalization and CSE (common subexpression elimination) clean up between major transformations. After this pipeline, the module contains only LLVM dialect operations—pointers, branches, arithmetic instructions.
+**The Bufferization Pipeline** (Critical for Tensor-First Architecture):
+
+1. **OneShotBufferize**: Converts tensor operations to memref operations. With `bufferizeFunctionBoundaries = true`, it handles function boundaries correctly—tensors in function signatures also convert to memrefs. This pass requires `func_ext` registration:
+
+```cpp
+// In compiler initialization
+bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(registry_);
+```
+
+After this pass:
+- `%result = linalg.matmul ins(%a, %b : tensor<?x?xf32>, tensor<?x?xf32>) -> tensor<?x?xf32>` becomes
+- `%alloc = memref.alloc() : memref<?x?xf32>` + `linalg.matmul ins(%a, %b) outs(%alloc)`
+
+2. **BufferResultsToOutParams**: Transforms function results into output parameters, matching the calling convention needed for libffi execution:
+
+- `func.func @graph_func(%Q: memref<?x?xf32>, %K: memref<?x?xf32>) -> memref<?x?xf32>` becomes
+- `func.func @graph_func(%Q: memref<?x?xf32>, %K: memref<?x?xf32>, %arg2: memref<?x?xf32>)`
+
+The final argument receives the output, enabling efficient in-place computation.
+
+3. **ConvertBufferizationToMemRef**: Removes remaining tensor artifacts. Converts `tensor.empty` → `memref.alloc`, cleans up any bufferization-specific operations.
+
+After these three passes, all tensor operations are gone—the IR is fully memref-based, ready for loop lowering.
+
+**Why Three Passes?** Each handles a distinct aspect:
+- **OneShotBufferize**: Core tensor → memref conversion
+- **BufferResultsToOutParams**: ABI transformation (results → output parameters)
+- **ConvertBufferizationToMemRef**: Cleanup (remove tensor remnants)
+
+Trying to do all three in one pass would be extremely complex. The modular approach keeps each pass focused and maintainable.
+
+First, transformer ops → tensor-based linalg (Section 11.3's patterns). Then, bufferization converts tensors → memrefs. Then, linalg → scf.for loops (via `createConvertLinalgToLoopsPass()`). Finally, loops → LLVM IR (standard MLIR passes). Canonicalization and CSE (common subexpression elimination) clean up between major transformations. After this pipeline, the module contains only LLVM dialect operations—pointers, branches, arithmetic instructions.
 
 **Stage 3: LLVM IR to Native Code**. MLIR's ExecutionEngine compiles LLVM dialect to machine code:
 
