@@ -101,7 +101,18 @@ This roughly matches GPT-2 small's actual parameter count (~117M, which includes
 
 Part 2 will cover Rotary Position Embeddings (RoPE), autoregressive generation, sampling strategies, and text generation pipelines.
 
-**Implementation Architecture**. Chapter 13 inherits Chapter 12's linalg-based lowering patterns for the 8 common transformer operations (LayerNorm, Linear, GELU, Add, Matmul, Transpose, Softmax, Scale). These operations lower to structured `linalg` dialect operations, enabling optimization passes and portable compilation. Chapter 13 adds 4 GPT-specific operations (Embedding, CreateCausalMask, MaskedSoftmax, RoPE) that use manual loop lowering for domain-specific logic not expressible in linalg's structured iteration model. This hybrid approach—linalg for regular computations, manual loops for specialized operations—balances optimization opportunities with implementation flexibility.
+**Implementation Architecture**. Chapter 13 inherits Chapter 12's linalg-based lowering patterns for the 8 common transformer operations (LayerNorm, Linear, GELU, Add, Matmul, Transpose, Softmax, Scale). However, Chapter 13 adopts a **tensor-first architecture** where operations take tensor inputs and return tensor results (functional style), rather than using memref out-parameters. This modern MLIR best practice enables automatic bufferization while maintaining clean, composable IR.
+
+These operations lower to structured `linalg` dialect operations, enabling optimization passes and portable compilation. Chapter 13 adds 4 GPT-specific operations (Embedding, CreateCausalMask, MaskedSoftmax, RoPE) that also use tensor-first style but lower directly to SCF loops for domain-specific logic not expressible in linalg's structured iteration model. This hybrid approach—linalg for regular computations, manual loops for specialized operations—balances optimization opportunities with implementation flexibility.
+
+**Bufferization Pipeline**. After tensor-based IR is generated, the bufferization pipeline automatically converts functional tensor operations to efficient memref code:
+
+1. **OneShotBufferize**: Converts tensor operations to bufferization dialect
+2. **BufferResultsToOutParams**: Transforms function signatures from `(tensor) -> tensor` to `(memref, memref) -> ()`
+3. **ConvertBufferizationToMemRef**: Finalizes conversion to memref dialect
+4. **Lower to LLVM**: Standard memref/scf/arith to LLVM conversion
+
+This approach provides the best of both worlds: clean tensor IR for operations and composition, efficient memref code for execution.
 
 The common operations work identically in Chapters 11, 12, 13, and 14, providing architectural consistency. Changes to these operations (e.g., adding tiling optimizations or vectorization) propagate automatically across all chapters. The GPT-specific operations remain independent, allowing Chapters 13-14 to implement unique functionality (integer token indexing, conditional masking, pairwise dimension rotation) without constraining Chapter 12's design. This design ensures that LayerNorm and Linear use linalg.ReduceOp, linalg.GenericOp, linalg.MatmulOp, and linalg.FillOp rather than manual SCF loops—providing Transform dialect hooks for advanced optimizations in Chapter 14.
 
@@ -131,8 +142,8 @@ def Transformer_EmbeddingOp : Transformer_Op<"embedding"> {
     
     Example:
     ```mlir
-    transformer.embedding %indices, %table, %output
-      : memref<?xi32>, memref<?x?xf32>, memref<?x?xf32>
+    %result = transformer.embedding %indices, %table
+      : tensor<?xi32>, tensor<?x?xf32> -> tensor<?x?xf32>
     ```
     
     Indices shape: [seq_len] (int32)
@@ -147,21 +158,22 @@ def Transformer_EmbeddingOp : Transformer_Op<"embedding"> {
   }];
   
   let arguments = (ins 
-    AnyMemRef:$indices,  // Token IDs [seq_len]
-    AnyMemRef:$table,    // Embedding table [vocab_size, d_model]
-    AnyMemRef:$output    // Output embeddings [seq_len, d_model]
+    AnyTensor:$indices,  // Token IDs [seq_len]
+    AnyTensor:$table     // Embedding table [vocab_size, d_model]
   );
   
+  let results = (outs AnyTensor:$result);  // Output embeddings [seq_len, d_model]
+  
   let assemblyFormat = [{
-    $indices `,` $table `,` $output
-    attr-dict `:` type($indices) `,` type($table) `,` type($output)
+    $indices `,` $table
+    attr-dict `:` type($indices) `,` type($table) `->` type($result)
   }];
 }
 ```
 
-Consistent with Chapter 12's memref-based design, the embedding operation uses out-parameter pattern: the output memref is passed as an argument rather than returned as a result. Input indices are `int32`, table and output are `float32`.
+**Tensor-First Architecture**. Chapter 13 adopts a tensor-first design with functional-style operations: operations take tensor inputs and return tensor results, rather than using out-parameter memrefs. This matches modern MLIR best practices and enables automatic bufferization. Input indices are `int32`, table and output are `float32`.
 
-**Lowering to Standard Dialects**. Embedding lookup lowers to nested SCF loops with memref loads/stores:
+**Lowering to Standard Dialects**. Embedding lookup first lowers to tensor operations, then bufferization converts to memrefs with nested SCF loops:
 
 ```cpp
 // src/TransformerPasses.cpp
@@ -172,54 +184,82 @@ struct EmbeddingOpLowering : public OpRewritePattern<EmbeddingOp> {
     Location loc = op.getLoc();
     Value indices = op.getIndices();
     Value table = op.getTable();
-    Value output = op.getOutput();
     
-    auto indicesType = cast<MemRefType>(indices.getType());
-    auto tableType = cast<MemRefType>(table.getType());
+    auto indicesType = cast<RankedTensorType>(indices.getType());
+    auto tableType = cast<RankedTensorType>(table.getType());
     
     int64_t seqLen = indicesType.getShape()[0];
     int64_t dModel = tableType.getShape()[1];
     
-    Value seqLenVal = createConstantIndex(rewriter, loc, seqLen);
-    Value dModelVal = createConstantIndex(rewriter, loc, dModel);
+    // Create output tensor type
+    auto resultType = RankedTensorType::get(
+      {seqLen, dModel}, tableType.getElementType()
+    );
+    
+    // Allocate output tensor (will be bufferized to memref.alloc later)
+    Value empty = rewriter.create<tensor::EmptyOp>(
+      loc, resultType.getShape(), resultType.getElementType()
+    );
+    
     Value zeroIdx = createConstantIndex(rewriter, loc, 0);
     Value oneIdx = createConstantIndex(rewriter, loc, 1);
+    Value seqLenVal = createConstantIndex(rewriter, loc, seqLen);
+    Value dModelVal = createConstantIndex(rewriter, loc, dModel);
     
-    // For each position in sequence
-    rewriter.create<scf::ForOp>(
-      loc, zeroIdx, seqLenVal, oneIdx, ValueRange{},
-      [&](OpBuilder &builder, Location loc, Value i, ValueRange iterArgs) {
-        // Load token ID (int32)
-        Value tokenId32 = builder.create<memref::LoadOp>(loc, indices, ValueRange{i});
+    // For each position in sequence (generates SCF loop with tensor updates)
+    Value result = rewriter.create<scf::ForOp>(
+      loc, zeroIdx, seqLenVal, oneIdx, ValueRange{empty},
+      [&](OpBuilder &b, Location loc, Value i, ValueRange iterArgs) {
+        Value currentTensor = iterArgs[0];
         
-        // Convert int32 token ID to index type
-        Value tokenIdx = builder.create<arith::IndexCastOp>(
-          loc, builder.getIndexType(), tokenId32
-        );
+        // Extract token ID (int32) and convert to index
+        Value tokenId32 = b.create<tensor::ExtractOp>(loc, indices, ValueRange{i});
+        Value tokenIdx = b.create<arith::IndexCastOp>(loc, b.getIndexType(), tokenId32);
         
-        // Copy embedding vector from table to output
-        builder.create<scf::ForOp>(
-          loc, zeroIdx, dModelVal, oneIdx, ValueRange{},
-          [&](OpBuilder &builder, Location loc, Value j, ValueRange iterArgs) {
-            Value embVal = builder.create<memref::LoadOp>(loc, table, ValueRange{tokenIdx, j});
-            builder.create<memref::StoreOp>(loc, embVal, output, ValueRange{i, j});
-            builder.create<scf::YieldOp>(loc);
-          });
+        // Copy embedding vector: extract slice from table, insert into output
+        Value updatedTensor = b.create<scf::ForOp>(
+          loc, zeroIdx, dModelVal, oneIdx, ValueRange{currentTensor},
+          [&](OpBuilder &b2, Location loc, Value j, ValueRange args2) {
+            Value tensor = args2[0];
+            Value embVal = b2.create<tensor::ExtractOp>(loc, table, ValueRange{tokenIdx, j});
+            Value updated = b2.create<tensor::InsertOp>(loc, embVal, tensor, ValueRange{i, j});
+            b2.create<scf::YieldOp>(loc, updated);
+          }).getResult(0);
         
-        builder.create<scf::YieldOp>(loc);
-      });
+        b.create<scf::YieldOp>(loc, updatedTensor);
+      }).getResult(0);
     
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
 ```
 
-This lowering generates nested SCF loops: the outer loop iterates over sequence positions, the inner loop copies each embedding dimension from the table to output. The implementation uses explicit memref operations (load/store) rather than structured linalg operations, since embedding lookup is random-access (indexed by token ID) rather than strided iteration.
+This lowering generates nested SCF loops operating on tensors: the outer loop iterates over sequence positions, the inner loop copies each embedding dimension using `tensor.extract` and `tensor.insert`. The implementation uses tensor operations rather than structured linalg operations, since embedding lookup is random-access (indexed by token ID) rather than strided iteration.
+
+**Bufferization Pipeline**. After tensor-based lowering, the bufferization pipeline automatically converts tensor operations to efficient memref code:
+
+```cpp
+// bindings.cpp - Bufferization pipeline
+bufferization::OneShotBufferizePassOptions bufferizeOptions;
+bufferizeOptions.bufferizeFunctionBoundaries = true;
+pm.addPass(bufferization::createOneShotBufferizePass(bufferizeOptions));
+pm.addPass(createConvertTensorToLinalgPass());
+pm.addPass(bufferization::createBufferResultsToOutParamsPass());
+pm.addPass(createConvertBufferizationToMemRefPass());
+```
+
+This transforms:
+1. `tensor.empty` → `memref.alloc`
+2. `tensor.extract/insert` → `memref.load/store`
+3. Function signatures: `(tensor params) -> tensor` becomes `(memref params, memref out) -> ()`
+4. Scf.for tensor loop-carried values → memref in-place updates
+
+The result is efficient memref code with nested loops and direct memory access, identical to hand-written memref lowering but with cleaner tensor-level IR.
 
 **Implementation Challenges**. Several subtleties arise:
 
-1. **Integer Indexing**: Token IDs are integers, but MLIR's indexing operations (`tensor.extract`, `memref.load`) require `index` type. The lowering must insert `arith.index_cast` operations to convert `int32 → index`.
+1. **Integer Indexing**: Token IDs are integers, but MLIR's indexing operations (`tensor.extract`) require `index` type. The lowering must insert `arith.index_cast` operations to convert `int32 → index`.
 
 2. **Bounds Checking**: What if `token_ids[i] >= vocab_size`? Invalid indices cause undefined behavior (reading beyond array bounds). Production implementations either:
    - Assert valid indices (panic on violation)
@@ -375,23 +415,24 @@ def Transformer_MaskedSoftmaxOp : Transformer_Op<"masked_softmax"> {
     
     Example:
     ```mlir
-    transformer.masked_softmax %logits, %mask, %output 
-      : memref<2x4x4xf32>, memref<4x4xf32>, memref<2x4x4xf32>
+    %result = transformer.masked_softmax %logits, %mask
+      : tensor<2x4x4xf32>, tensor<4x4xf32> -> tensor<2x4x4xf32>
     ```
   }];
   
-  let arguments = (ins AnyMemRef:$input, AnyMemRef:$mask, AnyMemRef:$output);
+  let arguments = (ins AnyTensor:$input, AnyTensor:$mask);
+  let results = (outs AnyTensor:$result);
   
   let assemblyFormat = [{
-    $input `,` $mask `,` $output
-    attr-dict `:` type($input) `,` type($mask) `,` type($output)
+    $input `,` $mask
+    attr-dict `:` type($input) `,` type($mask) `->` type($result)
   }];
 }
 ```
 
 Unlike the conceptual description earlier, the actual operation takes the mask as an explicit parameter. This design separates mask creation (via `create_causal_mask`) from application, allowing flexibility: the same mask can be reused across multiple attention heads or layers.
 
-**Lowering Masked Softmax**. The lowering generates mask on-the-fly rather than storing it:
+**Lowering Masked Softmax**. The lowering uses nested SCF loops to apply mask and compute softmax (similar to embedding lookup, the mask is generated on-the-fly):
 
 ```cpp
 struct MaskedSoftmaxOpLowering : public OpRewritePattern<MaskedSoftmaxOp> {
@@ -400,41 +441,43 @@ struct MaskedSoftmaxOpLowering : public OpRewritePattern<MaskedSoftmaxOp> {
   LogicalResult matchAndRewrite(MaskedSoftmaxOp op, PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     Value input = op.getInput();
-    auto inputType = input.getType().cast<RankedTensorType>();
-    int64_t seqLen = inputType.getShape()[0];
+    Value mask = op.getMask();
     
-    // Step 1: Apply mask (set upper triangle to -inf)
-    Value negInf = rewriter.create<arith::ConstantOp>(
-      loc, rewriter.getF32FloatAttr(-std::numeric_limits<float>::infinity())
+    auto inputType = cast<RankedTensorType>(input.getType());
+    auto shape = inputType.getShape();
+    size_t ndim = shape.size();
+    bool is2D = (ndim == 2);
+    
+    // Step 1: Add mask to logits (masked_logits = logits + mask)
+    // Step 2: Compute max for numerical stability
+    // Step 3: Compute exp(masked_logits - max) and sum
+    // Step 4: Normalize by sum
+    
+    // Implementation uses nested scf.for loops with tensor updates,
+    // supporting both 2D [seq_len, seq_len] and 3D [batch, seq_len, seq_len]
+    
+    // Create empty output tensor
+    Value empty = rewriter.create<tensor::EmptyOp>(
+      loc, inputType.getShape(), inputType.getElementType()
     );
     
-    Value masked = rewriter.create<linalg::GenericOp>(
-      loc, inputType, input,
-      [&](OpBuilder &b, Location loc, ValueRange args) {
-        // Get loop indices (i, j)
-        Value i = b.create<linalg::IndexOp>(loc, 0);
-        Value j = b.create<linalg::IndexOp>(loc, 1);
-        
-        // Compare: j > i?
-        Value jGtI = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ugt, j, i);
-        
-        // Select: j > i ? -inf : input[i, j]
-        Value result = b.create<arith::SelectOp>(loc, jGtI, negInf, args[0]);
-        b.create<linalg::YieldOp>(loc, result);
-      }
-    );
+    // Generate loops for max computation, exp sum, and normalization
+    // (Full implementation in TransformerPasses.cpp, lines ~640-760)
+    Value result = lowerMaskedSoftmaxTensorOps(rewriter, loc, input, mask, empty, is2D);
     
-    // Step 2: Compute softmax on masked input
-    // (Same as Chapter 6's softmax: max, subtract, exp, sum, divide)
-    Value softmaxResult = lowerSoftmax(rewriter, loc, masked);
-    
-    rewriter.replaceOp(op, softmaxResult);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
 ```
 
-This generates efficient code: the mask comparison (`j > i`) compiles to a simple integer comparison, and the `select` operation compiles to a conditional move instruction on most architectures. The mask doesn't require separate memory allocation—it's computed on-the-fly during attention.
+The implementation generates nested SCF loops that:
+1. Add mask to input logits (element-wise)
+2. Find max value for numerical stability
+3. Compute exp(logit + mask - max) and sum
+4. Normalize: softmax[i] = exp(logit[i] + mask[i] - max) / sum
+
+After bufferization, these tensor operations become efficient memref loads/stores with in-place updates. The mask doesn't require separate memory allocation—it's applied during the element-wise addition.
 
 **Memory and Computation Trade-offs**. Generating the mask on-the-fly saves memory (no need to store `seq_len × seq_len` mask) but adds computation (comparison per element). For typical sequence lengths (512-2048 tokens), the memory savings dominate: a 2048×2048 mask requires 16MB (float32), while the comparison adds negligible overhead.
 
@@ -532,9 +575,9 @@ block_params = {
     'attn_wo': np.random.randn(d_model, d_model) * 0.02,  # [d_model, d_model]
     'ln2_gamma': np.ones(d_model),           # [d_model]
     'ln2_beta': np.zeros(d_model),           # [d_model]
-    'ffn_w1': np.random.randn(d_model, d_ff) * 0.02,      # [d_model, d_ff]
+    'ffn_w1': np.random.randn(d_ff, d_model) * 0.02,      # [d_ff, d_model] (PyTorch format)
     'ffn_b1': np.zeros(d_ff),                # [d_ff]
-    'ffn_w2': np.random.randn(d_ff, d_model) * 0.02,      # [d_ff, d_model]
+    'ffn_w2': np.random.randn(d_model, d_ff) * 0.02,      # [d_model, d_ff] (PyTorch format)
     'ffn_b2': np.zeros(d_model),             # [d_model]
 }
 

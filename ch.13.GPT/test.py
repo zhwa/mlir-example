@@ -408,10 +408,10 @@ def create_gpt_weights(d_model, d_ff, num_layers):
         weights.append(np.random.randn(d_model, d_model).astype(np.float32) * 0.02)  # W_O
         weights.append(np.zeros(d_model, dtype=np.float32))  # b_O
 
-        # FFN (d_model x d_ff and d_ff x d_model)
-        weights.append(np.random.randn(d_model, d_ff).astype(np.float32) * 0.02)  # W1
+        # FFN (PyTorch format: out_features x in_features)
+        weights.append(np.random.randn(d_ff, d_model).astype(np.float32) * 0.02)  # W1 (64x16)
         weights.append(np.zeros(d_ff, dtype=np.float32))  # b1
-        weights.append(np.random.randn(d_ff, d_model).astype(np.float32) * 0.02)  # W2
+        weights.append(np.random.randn(d_model, d_ff).astype(np.float32) * 0.02)  # W2 (16x64)
         weights.append(np.zeros(d_model, dtype=np.float32))  # b2
 
         # Layer norms (d_model each)

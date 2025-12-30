@@ -10,7 +10,16 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/Bufferization/Transforms/Bufferize.h"
+#include "mlir/Dialect/Bufferization/Transforms/OneShotAnalysis.h"
+#include "mlir/Dialect/Bufferization/Transforms/OneShotModuleBufferize.h"
+#include "mlir/Dialect/Bufferization/Transforms/Passes.h"
+#include "mlir/Dialect/Linalg/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Bufferization/Transforms/FuncBufferizableOpInterfaceImpl.h"
 #include "mlir/ExecutionEngine/ExecutionEngine.h"
 #include "mlir/ExecutionEngine/OptUtils.h"
 #include "mlir/IR/Builders.h"
@@ -22,26 +31,16 @@
 #include "mlir/Transforms/Passes.h"
 
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
+#include "mlir/Conversion/BufferizationToMemRef/BufferizationToMemRef.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h"
-#include "mlir/Conversion/LinalgToStandard/LinalgToStandard.h"
 #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
 #include "mlir/Conversion/MathToLibm/MathToLibm.h"
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
-#include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVMPass.h"
-#include "mlir/Conversion/VectorToSCF/VectorToSCF.h"
+#include "mlir/Conversion/TensorToLinalg/TensorToLinalgPass.h"
 #include "mlir/Dialect/Linalg/Passes.h"
-#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
-#include "mlir/Dialect/Vector/Transforms/Passes.h"
-#include "mlir/Dialect/Transform/IR/TransformDialect.h"
-#include "mlir/Dialect/Transform/IR/TransformOps.h"
-#include "mlir/Dialect/Transform/IR/TransformTypes.h"
-#include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
-#include "mlir/Dialect/Linalg/TransformOps/LinalgTransformOps.h"
-#include "mlir/Dialect/Linalg/TransformOps/DialectExtension.h"
-#include "mlir/Dialect/Vector/TransformOps/VectorTransformOps.h"
 
 #include <llvm/Support/TargetSelect.h>
 
@@ -77,231 +76,48 @@ static struct LLVMInit {
 class TransformerCompiler {
 public:
   TransformerCompiler() {
-    // Register Transform dialect extensions for Linalg and Vector
-    DialectRegistry registry;
-    mlir::linalg::registerTransformDialectExtension(registry);
-    mlir::vector::registerTransformDialectExtension(registry);
-    context_.appendDialectRegistry(registry);
-    
     context_.loadDialect<transformer::TransformerDialect,
                          func::FuncDialect, arith::ArithDialect,
-                         linalg::LinalgDialect,  // Phase 1: Add Linalg for optimizations
-                         vector::VectorDialect,  // Phase 4: Add Vector for SIMD
                          memref::MemRefDialect, scf::SCFDialect, math::MathDialect,
-                         LLVM::LLVMDialect,
-                         transform::TransformDialect>();  // Phase 6: Transform for vectorization
-  }
-  
-  // Build comprehensive Transform dialect IR for modern optimization
-  // This demonstrates production-grade Transform dialect usage
-  ModuleOp buildOptimizationTransform(OpBuilder &builder, Location loc) {
-    auto transformModule = builder.create<ModuleOp>(loc);
-    OpBuilder::InsertionGuard guard(builder);
-    builder.setInsertionPointToEnd(transformModule.getBody());
-    
-    // Create transform.sequence as top-level operation
-    auto anyOpType = transform::OperationType::get(
-        builder.getContext(), builder.getStringAttr("builtin.module"));
-    
-    auto sequence = builder.create<transform::SequenceOp>(
-        loc,
-        /*resultTypes=*/TypeRange{},
-        /*failure_propagation_mode=*/transform::FailurePropagationMode::Suppress,  // Suppress to continue on failure
-        /*root=*/Value(),  // Null value means use top-level
-        /*extra_bindings=*/ValueRange{});
-    
-    Region &region = sequence.getBodyRegion();
-    Block *block = builder.createBlock(&region);
-    block->addArgument(anyOpType, loc);
-    builder.setInsertionPointToStart(block);
-    
-    Value target = block->getArgument(0);
-    
-    // Phase 1: Match and tile matmul operations
-    // Tiling is essential for:
-    // 1. Cache locality (32x32x32 fits in L1 cache)
-    // 2. Vectorization enablement (tiled loops are vectorizable)
-    // 3. Parallelization opportunities
-    
-    // Build array of operation names to match
-    SmallVector<StringRef> matmulOps = {"linalg.matmul"};
-    auto matchMatmul = builder.create<transform::MatchOp>(
-        loc,
-        /*results=*/transform::AnyOpType::get(builder.getContext()),
-        target,
-        /*opNames=*/matmulOps);
-    
-    // Tile matmul: [32, 32, 32] for good cache locality and vectorization
-    // These sizes work well for AVX2 (8-wide float SIMD)
-    SmallVector<int64_t> tileSizes = {32, 32, 32};
-    auto tileMatmul = builder.create<transform::TileUsingForOp>(
-        loc,
-        /*resultTypes=*/TypeRange{transform::AnyOpType::get(builder.getContext()),
-                                   transform::AnyOpType::get(builder.getContext()),
-                                   transform::AnyOpType::get(builder.getContext()),
-                                   transform::AnyOpType::get(builder.getContext())},
-        /*target=*/matchMatmul.getResult(),
-        /*dynamic_sizes=*/ValueRange{},
-        /*static_sizes=*/builder.getDenseI64ArrayAttr(tileSizes),
-        /*interchange=*/DenseI64ArrayAttr(),
-        /*scalable_sizes=*/DenseBoolArrayAttr());
-    
-    Value tiledMatmul = tileMatmul.getResult(0);
-    
-    // Phase 2: Match and tile generic ops (GELU, Add, etc.)
-    // Element-wise ops benefit from tiling for cache and vectorization
-    SmallVector<StringRef> genericOps = {"linalg.generic"};
-    auto matchGeneric = builder.create<transform::MatchOp>(
-        loc,
-        /*results=*/transform::AnyOpType::get(builder.getContext()),
-        target,
-        /*opNames=*/genericOps);
-    
-    // Tile generic ops: [128] - larger tiles for element-wise (less reuse)
-    SmallVector<int64_t> genericTileSizes = {128};
-    auto tileGeneric = builder.create<transform::TileUsingForOp>(
-        loc,
-        /*resultTypes=*/TypeRange{transform::AnyOpType::get(builder.getContext()),
-                                   transform::AnyOpType::get(builder.getContext())},
-        /*target=*/matchGeneric.getResult(),
-        /*dynamic_sizes=*/ValueRange{},
-        /*static_sizes=*/builder.getDenseI64ArrayAttr(genericTileSizes),
-        /*interchange=*/DenseI64ArrayAttr(),
-        /*scalable_sizes=*/DenseBoolArrayAttr());
-    
-    Value tiledGeneric = tileGeneric.getResult(0);
-    
-    // Phase 3: Tile-and-fuse producers into consumers
-    // This is the MODERN way: tile ops and fuse producers greedily
-    // Replaces old createLinalgElementwiseOpFusionPass()
-    // Benefits:
-    // 1. Reduces memory traffic (fused ops share cache)
-    // 2. Enables better vectorization (larger computation kernels)
-    // 3. Declarative and composable with other transforms
-    
-    // Fuse into matmul tiles (32x32x32 tiles with fused producers)
-    // Note: FuseOp expects ArrayAttr for tile sizes
-    SmallVector<Attribute> matmulTileAttrs;
-    for (auto size : tileSizes) {
-      matmulTileAttrs.push_back(builder.getI64IntegerAttr(size));
-    }
-    auto fuseMatmul = builder.create<transform::FuseOp>(
-        loc,
-        /*resultTypes=*/TypeRange{transform::AnyOpType::get(builder.getContext()),
-                                   transform::AnyOpType::get(builder.getContext()),
-                                   transform::AnyOpType::get(builder.getContext()),
-                                   transform::AnyOpType::get(builder.getContext())},
-        /*target=*/tiledMatmul,
-        /*tile_sizes=*/builder.getArrayAttr(matmulTileAttrs),
-        /*tile_interchange=*/ArrayAttr(),
-        /*apply_cleanup=*/false);
-    
-    Value fusedMatmul = fuseMatmul.getResult(0);
-    
-    // Fuse into generic op tiles (128 tiles with fused producers)
-    SmallVector<Attribute> genericTileAttrs;
-    for (auto size : genericTileSizes) {
-      genericTileAttrs.push_back(builder.getI64IntegerAttr(size));
-    }
-    auto fuseGeneric = builder.create<transform::FuseOp>(
-        loc,
-        /*resultTypes=*/TypeRange{transform::AnyOpType::get(builder.getContext()),
-                                   transform::AnyOpType::get(builder.getContext())},
-        /*target=*/tiledGeneric,
-        /*tile_sizes=*/builder.getArrayAttr(genericTileAttrs),
-        /*tile_interchange=*/ArrayAttr(),
-        /*apply_cleanup=*/false);
-    
-    Value fusedGeneric = fuseGeneric.getResult(0);
-    
-    // Phase 4: Vectorize fused operations
-    // Now that ops are tiled AND fused, vectorization creates efficient SIMD kernels
-    // The fused ops will be vectorized as single units
-    builder.create<transform::VectorizeOp>(
-        loc,
-        /*resultTypes=*/TypeRange{},
-        fusedMatmul,
-        /*vector_sizes=*/ValueRange{},
-        /*static_vector_sizes=*/DenseI64ArrayAttr(),
-        /*vectorize_nd_extract=*/UnitAttr(),
-        /*scalable_sizes=*/DenseBoolArrayAttr());
-    
-    builder.create<transform::VectorizeOp>(
-        loc,
-        /*resultTypes=*/TypeRange{},
-        fusedGeneric,
-        /*vector_sizes=*/ValueRange{},
-        /*static_vector_sizes=*/DenseI64ArrayAttr(),
-        /*vectorize_nd_extract=*/UnitAttr(),
-        /*scalable_sizes=*/DenseBoolArrayAttr());
-    
-    // Phase 5: Apply patterns for cleanup and optimization
-    // Use transform.apply_patterns with pattern descriptors
-    auto applyPatterns = builder.create<transform::ApplyPatternsOp>(loc, target);
-    {
-      OpBuilder::InsertionGuard guard(builder);
-      Region &patternsRegion = applyPatterns.getRegion();
-      Block *patternsBlock = builder.createBlock(&patternsRegion);
-      builder.setInsertionPointToStart(patternsBlock);
-      
-      // Canonicalization patterns to clean up after transformations
-      builder.create<transform::ApplyCanonicalizationPatternsOp>(loc);
-      
-      // Tiling-specific canonicalization for linalg
-      builder.create<transform::ApplyTilingCanonicalizationPatternsOp>(loc);
-    }
-    
-    builder.create<transform::YieldOp>(loc);
-    
-    return transformModule;
+                         linalg::LinalgDialect, tensor::TensorDialect,
+                         bufferization::BufferizationDialect,
+                         LLVM::LLVMDialect>();
   }
 
   MLIRContext& getContext() { return context_; }
 
   bool lowerToLLVM(ModuleOp module) {
     PassManager pm(&context_);
+    
+    // Enable error reporting
+    pm.enableVerifier(true);
 
-    // Lower transformer dialect to standard dialects (now includes linalg ops)
+    // Lower transformer dialect to linalg (tensor-based)
     pm.addNestedPass<func::FuncOp>(createLowerTransformerToStandardPass());
+    
     pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
     pm.addNestedPass<func::FuncOp>(createCSEPass());
 
-    // Phase 3-6: Apply comprehensive Transform dialect optimizations
-    // Modern approach: tile → fuse → vectorize → cleanup (all declarative!)
-    // All done declaratively via Transform dialect (not old-style passes)
-    OpBuilder builder(&context_);
-    auto transformModule = buildOptimizationTransform(builder, module.getLoc());
-    
-    // Apply the transform sequence to the payload module
-    auto sequenceOp = *transformModule.getBody()->getOps<transform::SequenceOp>().begin();
-    RaggedArray<transform::MappedValue> emptyMapping;
-    
-    // Note: Using Suppress mode so we continue even if some ops can't be optimized
-    if (failed(transform::applyTransforms(
-            module, cast<transform::TransformOpInterface>(sequenceOp.getOperation()),
-            emptyMapping,
-            transform::TransformOptions()))) {
-      // This is informational - not a hard error with Suppress mode
-      llvm::errs() << "Note: Some Transform dialect optimizations were not applicable\n";
-    }
-    
-    // Clean up any leftover linalg ops by lowering to loops
-    pm.addPass(mlir::createConvertLinalgToLoopsPass());
-    pm.addPass(createCanonicalizerPass());
+    // Bufferization: tensor → memref
+    DialectRegistry registry;
+    arith::registerBufferizableOpInterfaceExternalModels(registry);
+    linalg::registerBufferizableOpInterfaceExternalModels(registry);
+    tensor::registerBufferizableOpInterfaceExternalModels(registry);
+    bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(registry);
+    context_.appendDialectRegistry(registry);
 
-    // Loop optimizations that help enable vectorization
-    pm.addNestedPass<func::FuncOp>(createLoopInvariantCodeMotionPass());
+    bufferization::OneShotBufferizePassOptions bufferizeOptions;
+    bufferizeOptions.bufferizeFunctionBoundaries = true;
+    pm.addPass(bufferization::createOneShotBufferizePass(bufferizeOptions));
+    pm.addPass(createConvertTensorToLinalgPass());
+    pm.addPass(bufferization::createBufferResultsToOutParamsPass());
+    pm.addPass(createConvertBufferizationToMemRefPass());
+
+    // Lower linalg operations to loops
+    pm.addNestedPass<func::FuncOp>(createConvertLinalgToLoopsPass());
     pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
-    
-    // Prepare loops for vectorization
-    pm.addPass(createCanonicalizerPass());
-    pm.addPass(createCSEPass());
 
-    // Phase 6: Lower vector operations to LLVM SIMD
-    // Handle vector operations that couldn't be fully lowered
-    pm.addPass(createConvertVectorToSCFPass());  // Vector masking and unrolling
-    pm.addPass(createCanonicalizerPass());
-    pm.addPass(createConvertVectorToLLVMPass());  // Vector → LLVM SIMD intrinsics
+    // Lower to LLVM
     pm.addPass(createConvertMathToLLVMPass());
     pm.addPass(createConvertMathToLibmPass());
     pm.addPass(createSCFToControlFlowPass());
@@ -498,9 +314,9 @@ Tensor linear(const Tensor& input, py::array_t<float> weight, py::array_t<float>
   node->weight = weight;
   node->bias = bias;
   auto weight_info = weight.request();
-  // Weight is stored as (in_features, out_features) in numpy
-  // Output shape is (batch_size, out_features)
-  node->shape = {input.node->shape[0], weight_info.shape[1]};
+  // PyTorch format: weight is (out_features, in_features)
+  // Output shape: (seq_len, out_features) = (input.shape[0], weight.shape[0])
+  node->shape = {input.node->shape[0], weight_info.shape[0]};
   return Tensor(node);
 }
 
@@ -713,117 +529,6 @@ Tensor gpt_attention(const Tensor& input,
   return linear(attn_output, w_o, b_o);
 }
 
-// KV-cached attention for incremental generation
-// Only computes attention for new token, using cached K/V from previous tokens
-// Pure CPU implementation without MLIR compilation
-py::array_t<float> gpt_attention_cached(
-    py::array_t<float> new_token_hidden,  // [1, d_model] - single new token
-    py::array_t<float> k_cache,           // [max_seq, d_model] - cached keys
-    py::array_t<float> v_cache,           // [max_seq, d_model] - cached values
-    int cache_pos,                        // Position to write new K/V
-    py::array_t<float> w_q, py::array_t<float> b_q,
-    py::array_t<float> w_k, py::array_t<float> b_k,
-    py::array_t<float> w_v, py::array_t<float> b_v,
-    py::array_t<float> w_o, py::array_t<float> b_o) {
-
-  // Get shapes
-  int64_t d_model = new_token_hidden.shape(1);
-  auto h_ptr = new_token_hidden.data();
-  auto wq_ptr = w_q.data();
-  auto bq_ptr = b_q.data();
-  auto wk_ptr = w_k.data();
-  auto bk_ptr = b_k.data();
-  auto wv_ptr = w_v.data();
-  auto bv_ptr = b_v.data();
-  auto wo_ptr = w_o.data();
-  auto bo_ptr = b_o.data();
-
-  auto k_cache_ptr = k_cache.mutable_data();
-  auto v_cache_ptr = v_cache.mutable_data();
-
-  // Compute Q = h @ Wq.T + bq  [1, d_model]
-  py::array_t<float> q(std::vector<ssize_t>{1, d_model});
-  auto q_ptr = q.mutable_data();
-  for (int64_t j = 0; j < d_model; j++) {
-    float sum = bq_ptr[j];
-    for (int64_t k = 0; k < d_model; k++) {
-      sum += h_ptr[k] * wq_ptr[j * d_model + k];
-    }
-    q_ptr[j] = sum;
-  }
-
-  // Compute K_new = h @ Wk.T + bk and store in cache
-  for (int64_t j = 0; j < d_model; j++) {
-    float sum = bk_ptr[j];
-    for (int64_t k = 0; k < d_model; k++) {
-      sum += h_ptr[k] * wk_ptr[j * d_model + k];
-    }
-    k_cache_ptr[cache_pos * d_model + j] = sum;
-  }
-
-  // Compute V_new = h @ Wv.T + bv and store in cache
-  for (int64_t j = 0; j < d_model; j++) {
-    float sum = bv_ptr[j];
-    for (int64_t k = 0; k < d_model; k++) {
-      sum += h_ptr[k] * wv_ptr[j * d_model + k];
-    }
-    v_cache_ptr[cache_pos * d_model + j] = sum;
-  }
-
-  // Compute attention scores: Q @ K_cache[:cache_pos+1].T  [1, cache_pos+1]
-  int64_t valid_len = cache_pos + 1;
-  py::array_t<float> scores(std::vector<ssize_t>{1, valid_len});
-  auto scores_ptr = scores.mutable_data();
-  float scale_factor = 1.0f / std::sqrt(static_cast<float>(d_model));
-
-  for (int64_t j = 0; j < valid_len; j++) {
-    float score = 0.0f;
-    for (int64_t k = 0; k < d_model; k++) {
-      score += q_ptr[k] * k_cache_ptr[j * d_model + k];
-    }
-    scores_ptr[j] = score * scale_factor;
-  }
-
-  // Softmax
-  float max_score = scores_ptr[0];
-  for (int64_t j = 1; j < valid_len; j++) {
-    max_score = std::max(max_score, scores_ptr[j]);
-  }
-  float sum_exp = 0.0f;
-  for (int64_t j = 0; j < valid_len; j++) {
-    scores_ptr[j] = std::exp(scores_ptr[j] - max_score);
-    sum_exp += scores_ptr[j];
-  }
-  for (int64_t j = 0; j < valid_len; j++) {
-    scores_ptr[j] /= sum_exp;
-  }
-
-  // Attention output: scores @ V_cache[:valid_len]  [1, d_model]
-  py::array_t<float> attn(std::vector<ssize_t>{1, d_model});
-  auto attn_ptr = attn.mutable_data();
-  std::fill(attn_ptr, attn_ptr + d_model, 0.0f);
-
-  for (int64_t j = 0; j < valid_len; j++) {
-    float weight = scores_ptr[j];
-    for (int64_t k = 0; k < d_model; k++) {
-      attn_ptr[k] += weight * v_cache_ptr[j * d_model + k];
-    }
-  }
-
-  // Output projection: attn @ Wo.T + bo  [1, d_model]
-  py::array_t<float> output(std::vector<ssize_t>{1, d_model});
-  auto out_ptr = output.mutable_data();
-  for (int64_t j = 0; j < d_model; j++) {
-    float sum = bo_ptr[j];
-    for (int64_t k = 0; k < d_model; k++) {
-      sum += attn_ptr[k] * wo_ptr[j * d_model + k];
-    }
-    out_ptr[j] = sum;
-  }
-
-  return output;
-}
-
 // GPT Block: LayerNorm → Attention → Residual → LayerNorm → FFN → Residual
 Tensor gpt_block(const Tensor& input,
                  py::array_t<float> w_q, py::array_t<float> b_q,
@@ -923,85 +628,79 @@ public:
 
     switch (node->type) {
       case OpType::Input: {
-        result = createAlloc(node->shape);
+        auto resultType = RankedTensorType::get(node->shape, builder.getF32Type());
+        result = builder.create<tensor::EmptyOp>(loc, resultType.getShape(), builder.getF32Type()).getResult();
         break;
       }
 
       case OpType::Add: {
         Value lhs = compileNode(node->inputs[0]);
         Value rhs = compileNode(node->inputs[1]);
-        Value output = createAlloc(node->shape);
-        builder.create<transformer::AddOp>(loc, lhs, rhs, output);
-        result = output;
+        auto resultType = RankedTensorType::get(node->shape, builder.getF32Type());
+        result = builder.create<transformer::AddOp>(loc, resultType, lhs, rhs).getResult();
         break;
       }
 
       case OpType::LayerNorm: {
         Value input = compileNode(node->inputs[0]);
-        Value output = createAlloc(node->shape);
         Value gamma = getParameter(node->gamma.request().ptr);
         Value beta = getParameter(node->beta.request().ptr);
-        builder.create<transformer::LayerNormOp>(loc, input, gamma, beta, output);
-        result = output;
+        auto resultType = RankedTensorType::get(node->shape, builder.getF32Type());
+        result = builder.create<transformer::LayerNormOp>(loc, resultType, input, gamma, beta).getResult();
         break;
       }
 
       case OpType::Linear: {
         Value input = compileNode(node->inputs[0]);
-        Value output = createAlloc(node->shape);
         Value weight = getParameter(node->weight.request().ptr);
         Value bias = getParameter(node->bias.request().ptr);
-        builder.create<transformer::LinearOp>(loc, input, weight, bias, output);
-        result = output;
+        auto resultType = RankedTensorType::get(node->shape, builder.getF32Type());
+        result = builder.create<transformer::LinearOp>(loc, resultType, input, weight, bias).getResult();
         break;
       }
 
       case OpType::Gelu: {
         Value input = compileNode(node->inputs[0]);
-        Value output = createAlloc(node->shape);
-        builder.create<transformer::GeluOp>(loc, input, output);
-        result = output;
+        auto resultType = RankedTensorType::get(node->shape, builder.getF32Type());
+        result = builder.create<transformer::GeluOp>(loc, resultType, input).getResult();
         break;
       }
 
       case OpType::Matmul: {
         Value lhs = compileNode(node->inputs[0]);
         Value rhs = compileNode(node->inputs[1]);
-        Value output = createAlloc(node->shape);
-        builder.create<transformer::MatmulOp>(loc, lhs, rhs, output);
-        result = output;
+        auto resultType = RankedTensorType::get(node->shape, builder.getF32Type());
+        result = builder.create<transformer::MatmulOp>(loc, resultType, lhs, rhs).getResult();
         break;
       }
 
       case OpType::Transpose: {
         Value input = compileNode(node->inputs[0]);
-        Value output = createAlloc(node->shape);
-        builder.create<transformer::TransposeOp>(loc, input, output);
-        result = output;
+        auto resultType = RankedTensorType::get(node->shape, builder.getF32Type());
+        result = builder.create<transformer::TransposeOp>(loc, resultType, input).getResult();
         break;
       }
 
       case OpType::Softmax: {
         Value input = compileNode(node->inputs[0]);
-        Value output = createAlloc(node->shape);
-        builder.create<transformer::SoftmaxOp>(loc, input, output);
-        result = output;
+        auto resultType = RankedTensorType::get(node->shape, builder.getF32Type());
+        result = builder.create<transformer::SoftmaxOp>(loc, resultType, input).getResult();
         break;
       }
 
       case OpType::Scale: {
         Value input = compileNode(node->inputs[0]);
-        Value output = createAlloc(node->shape);
 
-        // Create constant scale factor
-        Value scale = createAlloc({1});
+        // Create constant scale factor as tensor
+        auto scalarType = RankedTensorType::get({1}, builder.getF32Type());
+        Value scalarTensor = builder.create<tensor::EmptyOp>(loc, ArrayRef<int64_t>{1}, builder.getF32Type()).getResult();
         Value zeroIdx = builder.create<arith::ConstantIndexOp>(loc, 0);
         Value scaleConst = builder.create<arith::ConstantOp>(
             loc, builder.getFloatAttr(builder.getF32Type(), llvm::APFloat(node->scale_factor)));
-        builder.create<memref::StoreOp>(loc, scaleConst, scale, ValueRange{zeroIdx});
+        Value scaleTensor = builder.create<tensor::InsertOp>(loc, scaleConst, scalarTensor, ValueRange{zeroIdx}).getResult();
 
-        builder.create<transformer::ScaleOp>(loc, input, scale, output);
-        result = output;
+        auto resultType = RankedTensorType::get(node->shape, builder.getF32Type());
+        result = builder.create<transformer::ScaleOp>(loc, resultType, input, scaleTensor).getResult();
         break;
       }
 
@@ -1010,17 +709,15 @@ public:
         // output: [seq_len, d_model] float
         Value indicesValue = getParameter(node->indices.request().ptr);
         Value tableValue = getParameter(node->table.request().ptr);
-        Value output = createAlloc(node->shape);
-        builder.create<transformer::EmbeddingOp>(loc, indicesValue, tableValue, output);
-        result = output;
+        auto resultType = RankedTensorType::get(node->shape, builder.getF32Type());
+        result = builder.create<transformer::EmbeddingOp>(loc, resultType, indicesValue, tableValue).getResult();
         break;
       }
 
       case OpType::CreateCausalMask: {
         // output: [seq_len, seq_len] causal mask
-        Value output = createAlloc(node->shape);
-        builder.create<transformer::CreateCausalMaskOp>(loc, output);
-        result = output;
+        auto resultType = RankedTensorType::get(node->shape, builder.getF32Type());
+        result = builder.create<transformer::CreateCausalMaskOp>(loc, resultType).getResult();
         break;
       }
 
@@ -1029,9 +726,8 @@ public:
         // output: [batch, seq_len, seq_len]
         Value input = compileNode(node->inputs[0]);
         Value mask = compileNode(node->inputs[1]);
-        Value output = createAlloc(node->shape);
-        builder.create<transformer::MaskedSoftmaxOp>(loc, input, mask, output);
-        result = output;
+        auto resultType = RankedTensorType::get(node->shape, builder.getF32Type());
+        result = builder.create<transformer::MaskedSoftmaxOp>(loc, resultType, input, mask).getResult();
         break;
       }
 
@@ -1039,9 +735,8 @@ public:
         // input: [seq_len, d_model]
         // output: [seq_len, d_model] with rotary position embeddings
         Value input = compileNode(node->inputs[0]);
-        Value output = createAlloc(node->shape);
-        builder.create<transformer::RoPEOp>(loc, input, output);
-        result = output;
+        auto resultType = RankedTensorType::get(node->shape, builder.getF32Type());
+        result = builder.create<transformer::RoPEOp>(loc, resultType, input).getResult();
         break;
       }
     }
@@ -1133,11 +828,11 @@ py::array_t<float> forward(const Tensor& output) {
   auto module = ModuleOp::create(builder.getUnknownLoc());
   builder.setInsertionPointToEnd(module.getBody());
 
-  // Create function signature: (inputs..., int32_params..., float_params..., output) -> ()
+  // Create function signature: (tensor inputs..., tensor int32_params..., tensor float_params...) -> tensor output
   std::vector<Type> funcInputTypes;
   for (auto& inp : inputs) {
-    auto memrefType = MemRefType::get(inp->shape, builder.getF32Type());
-    funcInputTypes.emplace_back(memrefType);
+    auto tensorType = RankedTensorType::get(inp->shape, builder.getF32Type());
+    funcInputTypes.emplace_back(tensorType);
   }
   // Add int32 parameters (e.g., embedding indices)
   for (auto& param : int32_parameters) {
@@ -1146,8 +841,8 @@ py::array_t<float> forward(const Tensor& output) {
     for (ssize_t i = 0; i < buf.ndim; i++) {
       shape.emplace_back(buf.shape[i]);
     }
-    auto memrefType = MemRefType::get(shape, builder.getI32Type());
-    funcInputTypes.emplace_back(memrefType);
+    auto tensorType = RankedTensorType::get(shape, builder.getI32Type());
+    funcInputTypes.emplace_back(tensorType);
   }
   // Add float parameters (gamma, beta, weight, bias, table)
   for (auto& param : parameters) {
@@ -1156,13 +851,12 @@ py::array_t<float> forward(const Tensor& output) {
     for (ssize_t i = 0; i < buf.ndim; i++) {
       shape.emplace_back(buf.shape[i]);
     }
-    auto memrefType = MemRefType::get(shape, builder.getF32Type());
-    funcInputTypes.emplace_back(memrefType);
+    auto tensorType = RankedTensorType::get(shape, builder.getF32Type());
+    funcInputTypes.emplace_back(tensorType);
   }
-  auto outputType = MemRefType::get(output.node->shape, builder.getF32Type());
-  funcInputTypes.emplace_back(outputType); // Output as last argument
+  auto outputTensorType = RankedTensorType::get(output.node->shape, builder.getF32Type());
 
-  auto funcType = builder.getFunctionType(funcInputTypes, {});
+  auto funcType = builder.getFunctionType(funcInputTypes, {outputTensorType});
   auto func = func::FuncOp::create(builder.getUnknownLoc(), "compute", funcType);
   auto& entryBlock = *func.addEntryBlock();
   builder.setInsertionPointToStart(&entryBlock);
@@ -1177,11 +871,9 @@ py::array_t<float> forward(const Tensor& output) {
 
   // Compile computation graph
   Value resultValue = irBuilder.compileNode(output.node);
-  Value outputArg = entryBlock.getArgument(inputs.size() + int32_parameters.size() + parameters.size());
 
-  // Copy result to output
-  builder.create<memref::CopyOp>(builder.getUnknownLoc(), resultValue, outputArg);
-  builder.create<func::ReturnOp>(builder.getUnknownLoc());
+  // Return the tensor result
+  builder.create<func::ReturnOp>(builder.getUnknownLoc(), resultValue);
 
   module.push_back(func);
 
@@ -1262,7 +954,7 @@ py::array_t<float> forward(const Tensor& output) {
 //===----------------------------------------------------------------------===//
 
 PYBIND11_MODULE(ch14, m) {
-  m.doc() = "Chapter 14: Optimized GPT (Linalg + Fusion + Vectorization)";
+  m.doc() = "Chapter 13: Minimal GPT with RoPE and Causal Attention";
 
   py::class_<Tensor, std::shared_ptr<Tensor>>(m, "Tensor")
       .def(py::init<py::array_t<float>>())
@@ -1293,8 +985,6 @@ PYBIND11_MODULE(ch14, m) {
 
   // Chapter 13: GPT compositions
   m.def("gpt_attention", &gpt_attention);
-  m.def("gpt_attention_cached", &gpt_attention_cached,
-        "Cached attention for incremental generation");
   m.def("gpt_block", &gpt_block);
   m.def("gpt_forward", &gpt_forward);
 

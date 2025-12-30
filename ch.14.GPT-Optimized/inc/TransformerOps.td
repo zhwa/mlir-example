@@ -38,16 +38,17 @@ def Transformer_LayerNormOp : Transformer_Op<"layer_norm"> {
   }];
   
   let arguments = (ins 
-    AnyMemRef:$input,
-    AnyMemRef:$gamma,    // Scale parameter
-    AnyMemRef:$beta,     // Shift parameter
-    AnyMemRef:$output
+    AnyTensor:$input,
+    AnyTensor:$gamma,    // Scale parameter
+    AnyTensor:$beta      // Shift parameter
     // NOTE: epsilon removed - pass as runtime value to avoid BytecodeOpInterface issues
   );
   
+  let results = (outs AnyTensor:$result);
+  
   let assemblyFormat = [{
-    $input `,` $gamma `,` $beta `,` $output
-    attr-dict `:` type($input) `,` type($gamma) `,` type($beta) `,` type($output)
+    $input `,` $gamma `,` $beta
+    attr-dict `:` type($input) `,` type($gamma) `,` type($beta) `->` type($result)
   }];
 }
 
@@ -73,15 +74,16 @@ def Transformer_LinearOp : Transformer_Op<"linear"> {
   }];
   
   let arguments = (ins 
-    AnyMemRef:$input,
-    AnyMemRef:$weight,
-    AnyMemRef:$bias,
-    AnyMemRef:$output
+    AnyTensor:$input,
+    AnyTensor:$weight,
+    AnyTensor:$bias
   );
   
+  let results = (outs AnyTensor:$result);
+  
   let assemblyFormat = [{
-    $input `,` $weight `,` $bias `,` $output
-    attr-dict `:` type($input) `,` type($weight) `,` type($bias) `,` type($output)
+    $input `,` $weight `,` $bias
+    attr-dict `:` type($input) `,` type($weight) `,` type($bias) `->` type($result)
   }];
 }
 
@@ -95,17 +97,19 @@ def Transformer_GeluOp : Transformer_Op<"gelu"> {
     
     Example:
     ```mlir
-    transformer.gelu %input, %output : memref<?x?xf32>, memref<?x?xf32>
+    transformer.gelu %input : tensor<?x?xf32> -> tensor<?x?xf32>
     ```
   }];
   
-  let arguments = (ins AnyMemRef:$input, AnyMemRef:$output);
-  let assemblyFormat = "$input `,` $output attr-dict `:` type($input) `,` type($output)";
+  let arguments = (ins AnyTensor:$input);
+  let results = (outs AnyTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
 }
 
 //===----------------------------------------------------------------------===//
 // Phase 3: Attention Operations
 //===----------------------------------------------------------------------===//
+
 
 def Transformer_MatmulOp : Transformer_Op<"matmul"> {
   let summary = "Matrix multiplication";
@@ -117,8 +121,9 @@ def Transformer_MatmulOp : Transformer_Op<"matmul"> {
     For 3D: (B, M, K) @ (B, K, N) -> (B, M, N)
   }];
   
-  let arguments = (ins AnyMemRef:$lhs, AnyMemRef:$rhs, AnyMemRef:$output);
-  let assemblyFormat = "$lhs `,` $rhs `,` $output attr-dict `:` type($lhs) `,` type($rhs) `,` type($output)";
+  let arguments = (ins AnyTensor:$lhs, AnyTensor:$rhs);
+  let results = (outs AnyTensor:$result);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($lhs) `,` type($rhs) `->` type($result)";
 }
 
 def Transformer_TransposeOp : Transformer_Op<"transpose"> {
@@ -131,12 +136,13 @@ def Transformer_TransposeOp : Transformer_Op<"transpose"> {
     
     Example:
     ```mlir
-    transformer.transpose %input, %output : memref<?x?xf32>, memref<?x?xf32>
+    transformer.transpose %input : tensor<?x?xf32> -> tensor<?x?xf32>
     ```
   }];
   
-  let arguments = (ins AnyMemRef:$input, AnyMemRef:$output);
-  let assemblyFormat = "$input `,` $output attr-dict `:` type($input) `,` type($output)";
+  let arguments = (ins AnyTensor:$input);
+  let results = (outs AnyTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
 }
 
 def Transformer_SoftmaxOp : Transformer_Op<"softmax"> {
@@ -155,8 +161,9 @@ def Transformer_SoftmaxOp : Transformer_Op<"softmax"> {
     ```
   }];
   
-  let arguments = (ins AnyMemRef:$input, AnyMemRef:$output);
-  let assemblyFormat = "$input `,` $output attr-dict `:` type($input) `,` type($output)";
+  let arguments = (ins AnyTensor:$input);
+  let results = (outs AnyTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
 }
 
 def Transformer_ScaleOp : Transformer_Op<"scale"> {
@@ -169,8 +176,9 @@ def Transformer_ScaleOp : Transformer_Op<"scale"> {
     Note: scale passed as memref to avoid attribute/BytecodeOpInterface issues.
   }];
   
-  let arguments = (ins AnyMemRef:$input, AnyMemRef:$scale, AnyMemRef:$output);
-  let assemblyFormat = "$input `,` $scale `,` $output attr-dict `:` type($input) `,` type($scale) `,` type($output)";
+  let arguments = (ins AnyTensor:$input, AnyTensor:$scale);
+  let results = (outs AnyTensor:$result);
+  let assemblyFormat = "$input `,` $scale attr-dict `:` type($input) `,` type($scale) `->` type($result)";
 }
 
 //===----------------------------------------------------------------------===//
@@ -203,14 +211,15 @@ def Transformer_EmbeddingOp : Transformer_Op<"embedding"> {
   }];
   
   let arguments = (ins 
-    AnyMemRef:$indices,  // Token IDs [seq_len]
-    AnyMemRef:$table,    // Embedding table [vocab_size, d_model]
-    AnyMemRef:$output    // Output embeddings [seq_len, d_model]
+    AnyTensor:$indices,  // Token IDs [seq_len]
+    AnyTensor:$table     // Embedding table [vocab_size, d_model]
   );
   
+  let results = (outs AnyTensor:$result);  // Output embeddings [seq_len, d_model]
+  
   let assemblyFormat = [{
-    $indices `,` $table `,` $output
-    attr-dict `:` type($indices) `,` type($table) `,` type($output)
+    $indices `,` $table
+    attr-dict `:` type($indices) `,` type($table) `->` type($result)
   }];
 }
 
@@ -234,7 +243,7 @@ def Transformer_CreateCausalMaskOp : Transformer_Op<"create_causal_mask"> {
     
     Example:
     ```mlir
-    transformer.create_causal_mask %output : memref<4x4xf32>
+    transformer.create_causal_mask : tensor<4x4xf32>
     // Output:
     // [  0.0  -inf  -inf  -inf ]
     // [  0.0   0.0  -inf  -inf ]
@@ -243,8 +252,9 @@ def Transformer_CreateCausalMaskOp : Transformer_Op<"create_causal_mask"> {
     ```
   }];
   
-  let arguments = (ins AnyMemRef:$output);
-  let assemblyFormat = "$output attr-dict `:` type($output)";
+  let arguments = (ins);
+  let results = (outs AnyTensor:$result);
+  let assemblyFormat = "attr-dict `:` type($result)";
 }
 
 def Transformer_MaskedSoftmaxOp : Transformer_Op<"masked_softmax"> {
@@ -270,11 +280,13 @@ def Transformer_MaskedSoftmaxOp : Transformer_Op<"masked_softmax"> {
     ```
   }];
   
-  let arguments = (ins AnyMemRef:$input, AnyMemRef:$mask, AnyMemRef:$output);
+  let arguments = (ins AnyTensor:$input, AnyTensor:$mask);
+  
+  let results = (outs AnyTensor:$result);
   
   let assemblyFormat = [{
-    $input `,` $mask `,` $output
-    attr-dict `:` type($input) `,` type($mask) `,` type($output)
+    $input `,` $mask
+    attr-dict `:` type($input) `,` type($mask) `->` type($result)
   }];
 }
 
@@ -300,7 +312,7 @@ def Transformer_RoPEOp : Transformer_Op<"rope"> {
     
     Example:
     ```mlir
-    transformer.rope %input, %output : memref<32x64xf32>, memref<32x64xf32>
+    transformer.rope %input : tensor<32x64xf32> -> tensor<32x64xf32>
     ```
     
     References:
@@ -308,8 +320,9 @@ def Transformer_RoPEOp : Transformer_Op<"rope"> {
     - Used in LLaMA, GPT-NeoX, and other modern LLMs
   }];
   
-  let arguments = (ins AnyMemRef:$input, AnyMemRef:$output);
-  let assemblyFormat = "$input `,` $output attr-dict `:` type($input) `,` type($output)";
+  let arguments = (ins AnyTensor:$input);
+  let results = (outs AnyTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
 }
 
 //===----------------------------------------------------------------------===//
@@ -324,12 +337,14 @@ def Transformer_AddOp : Transformer_Op<"add"> {
     
     Example:
     ```mlir
-    transformer.add %lhs, %rhs, %output : memref<?x?xf32>, memref<?x?xf32>, memref<?x?xf32>
+    transformer.add %lhs, %rhs : tensor<?x?xf32>, tensor<?x?xf32> -> tensor<?x?xf32>
     ```
   }];
   
-  let arguments = (ins AnyMemRef:$lhs, AnyMemRef:$rhs, AnyMemRef:$output);
-  let assemblyFormat = "$lhs `,` $rhs `,` $output attr-dict `:` type($lhs) `,` type($rhs) `,` type($output)";
+  let arguments = (ins AnyTensor:$lhs, AnyTensor:$rhs);
+  let results = (outs AnyTensor:$result);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($lhs) `,` type($rhs) `->` type($result)";
+
 }
 
 #endif // TRANSFORMER_OPS

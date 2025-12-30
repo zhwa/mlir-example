@@ -1,14 +1,41 @@
 # Chapter 15: GPU Programming Concepts
 
-Chapters 1-14 built a complete GPT architecture on CPU using MLIR's standard dialects. The implementation is functionally correct but limited by CPU constraints: serial execution, scalar operations, limited parallelism. Modern LLM serving requires GPU acceleration—thousands of parallel threads, high memory bandwidth, specialized tensor cores. Chapter 15 introduces GPU programming fundamentals through MLIR, preparing for Chapter 16's production serving system.
+Chapters 1-14 built a complete GPT architecture using MLIR's high-level abstractions—Chapters 11-14 used the **Transformer dialect with tensor-first operations** that automatically bufferize to efficient code, while Chapter 14 added **Transform Dialect optimizations** (tiling, fusion, vectorization) for production-grade performance. The implementations are functionally correct and optimized for CPU, but modern LLM serving requires GPU acceleration—thousands of parallel threads, high memory bandwidth, specialized tensor cores. Chapter 15 introduces GPU programming fundamentals through MLIR, teaching the **low-level concepts** underlying production GPU code generation.
 
-This chapter takes a unique pedagogical approach: we implement GPU concepts on CPU through **thread emulation**. Using MLIR's SCF (Structured Control Flow) dialect, we emulate GPU thread hierarchies (grids, blocks, threads) as nested loops. This approach eliminates GPU hardware requirements while teaching genuine GPU programming patterns—the same concepts used in CUDA, ROCm, and Metal. When you understand thread indexing, memory coalescing, and reduction algorithms through CPU emulation, you understand them period. The transition to real GPU code is syntactic, not conceptual.
+**Two Levels of GPU Programming**. This chapter takes a unique pedagogical approach distinct from Chapters 11-14:
+
+**Chapters 11-14 (High-level)**: Tensor operations → Linalg → Transform Dialect → (would target GPU dialect) → GPU code. This is how production ML compilers (IREE, Torch-MLIR, XLA) work—you write high-level tensor operations, the compiler automatically generates optimized GPU kernels.
+
+**Chapter 15 (Low-level)**: Direct memref manipulation with explicit thread indexing. We implement GPU concepts on CPU through **thread emulation** using MLIR's SCF (Structured Control Flow) dialect to emulate GPU thread hierarchies (grids, blocks, threads) as nested loops. This approach teaches the **hardware concepts and patterns** that automated compilers generate behind the scenes.
+
+This chapter eliminates GPU hardware requirements while teaching genuine GPU programming patterns—the same concepts used in CUDA, ROCm, and Metal. When you understand thread indexing, memory coalescing, and reduction algorithms through CPU emulation, you understand them period. The transition to real GPU code is syntactic, not conceptual. **Educational value**: See what Transform Dialect and production compilers do automatically when targeting GPUs.
+
+**Connection to Previous Chapters**. Chapters 11-14 used high-level abstractions (Transformer dialect with tensor operations) that would **automatically target GPUs** in production compilers:
+
+```
+Chapter 14 tensor operations (linalg.matmul, linalg.generic)
+  ↓ Transform Dialect (tile, fuse, vectorize)
+  ↓ GPU Dialect (gpu.launch, gpu.thread_id) ← automatic code generation
+  ↓ NVVM/ROCDL (GPU-specific LLVM)
+  ↓ PTX/AMDGPU Assembly
+```
+
+Chapter 15 teaches what happens **inside** that GPU code generation—the thread patterns, memory access patterns, and reduction algorithms that automated compilers generate. You write high-level tensor code (Chapter 14), the compiler generates low-level GPU kernels (Chapter 15 patterns). Understanding both levels makes you effective at optimizing production ML systems.
+
+**Why Memref Instead of Tensors?** This chapter uses **memref directly** (raw memory with explicit indexing) rather than tensor operations because:
+1. **Teaching GPU concepts**: Thread indexing, bounds checking, memory coalescing are explicit and visible
+2. **CPU emulation**: Nested loops directly map to GPU thread hierarchies
+3. **Hardware focus**: See the patterns that Transform Dialect and GPU dialect generate automatically
+
+Production ML compilers use the Chapter 14 approach (high-level tensors) for portability and optimization. Chapter 15 teaches the low-level patterns they generate.
 
 **Why GPU Programming Matters for LLMs**. GPT-3 has 175 billion parameters (700 GB at float32). A single forward pass touches every parameter—reading 700 GB of data. CPU memory bandwidth: 50-100 GB/s (7-14 seconds per forward pass). GPU memory bandwidth: 1-2 TB/s (0.35-0.7 seconds per forward pass). This 10-20× bandwidth advantage makes GPUs essential for LLM inference. Understanding GPU architecture—memory hierarchies, thread organization, access patterns—is prerequisite for building production serving systems.
 
 Chapter 15 is structured as seven progressive phases: vector operations (1D parallelism), matrix multiplication (2D parallelism), element-wise operations (GELU, bias), softmax (reductions), layer normalization (multi-stage reductions), transpose (memory patterns), attention mechanism (combining primitives), and complete transformer (nano GPT with KV cache). Each phase introduces new GPU concepts while building toward a working transformer. By chapter's end, you'll have a complete nano GPT implementation that demonstrates production GPU patterns—all running on CPU for universal accessibility.
 
-**A Note on AOT vs JIT Compilation**. Chapters 1-14 used JIT (Just-In-Time) compilation for immediate feedback during development. Chapter 15 switches to AOT (Ahead-Of-Time) compilation—generating native code at build time, not runtime. This change reflects production reality: serving systems compile models once, execute many times. AOT compilation eliminates runtime overhead, improves debugging (inspect assembly, use gdb), and matches production compilers (IREE, XLA, TVM). The trade-off is losing Python integration, but gaining reliability and speed. This architectural decision prepares you for real-world ML compilation.
+**A Note on AOT vs JIT Compilation**. Chapters 1-14 used **JIT-style workflow** with Python bindings—build IR at runtime, compile to LLVM, execute via ExecutionEngine, return results to Python. This enables rapid prototyping and testing. Chapter 15 switches to **AOT (Ahead-Of-Time) workflow**—generate MLIR at build time, compile to object files, link into standalone C++ test binary. This change reflects production reality: serving systems compile models once, execute many times. AOT workflow matches production compilers (IREE, XLA, TVM) and enables better debugging (inspect assembly, use gdb, profile with perf). The trade-off is losing Python integration, but gaining reliability and matching production deployment patterns. Both approaches use MLIR compilation; the difference is **when** and **how** code generation happens.
+
+**Note**: The original development used JIT but encountered LLVM 21 ORC JIT bugs with LayerNorm operations. Switching to AOT resolved these issues—demonstrating why production systems prefer AOT compilation for reliability.
 
 ## 15.1 GPU Architecture Fundamentals
 
@@ -1060,8 +1087,34 @@ Chapter 15 introduced GPU programming fundamentals through CPU emulation using M
 
 The only difference is execution model: CPU runs loops serially, GPU runs them in parallel. The code structure is identical. When you transition to real GPU code (CUDA, ROCm, Metal), you're writing the same kernels with different syntax.
 
-Chapter 15 switched from JIT to AOT compilation. Production ML systems compile models once, serve many times. AOT compilation reflects this reality.
+**Connecting the Dots: Two Paths to GPU Execution**
 
-**Looking Ahead**. Chapter 16 builds a production LLM serving engine using GPU concepts from this chapter. We implement modern serving techniques: continuous batching (process multiple requests concurrently), paged attention (efficient KV cache memory management), chunked prefill (split prompt processing across iterations), and request scheduling. These techniques transform nano GPT from an educational example into a production-capable serving system—the capstone project synthesizing all 16 chapters.
+**Path 1 (Chapters 11-14 extended to GPU)**:
+```
+Write: tensor operations (Chapter 13/14 style)
+  ↓
+Optimize: Transform Dialect (Chapter 14)
+  ↓
+Generate: GPU dialect (automatic)
+  ↓
+Execute: GPU hardware
+```
+This is the production ML compiler approach (IREE, Torch-MLIR, XLA).
+
+**Path 2 (Chapter 15 direct GPU programming)**:
+```
+Write: memref + explicit thread indexing (Chapter 15 style)
+  ↓
+Lower: GPU dialect (manual control)
+  ↓
+Execute: GPU hardware (or CPU emulation)
+```
+This is the manual GPU programming approach (CUDA/HIP kernels).
+
+Production systems use **Path 1** (automatic generation from high-level ops). Chapter 15 teaches **Path 2** patterns so you understand what Path 1 generates.
+
+Chapter 15 switched from JIT to AOT compilation workflow. Production ML systems compile models once, serve many times. AOT workflow reflects this reality and matches production compiler architecture.
+
+**Looking Ahead to Production Deployment**. Real production LLM serving combines concepts from Chapters 14 and 15: high-level tensor operations (Chapter 14) compiled to efficient GPU kernels (Chapter 15 patterns) with advanced serving techniques like continuous batching and paged attention. The next step would integrate these foundations with production serving frameworks (vLLM, TensorRT-LLM, SGLang) that automate the high-level → GPU code generation while providing batching, scheduling, and memory management.
 
 Chapter 15 completed the GPU programming foundation. You understand thread hierarchies, memory hierarchies, and parallel algorithms. Chapter 16 applies these concepts to build a complete serving engine—the final step from theory to production system.

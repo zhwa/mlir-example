@@ -65,12 +65,10 @@ class Request:
 
     # State tracking
     cached_len: int            # Tokens with computed KV cache
-    device_len: int            # Tokens in GPU memory
-    max_device_len: int        # Maximum capacity (prompt_len + max_tokens)
+    device_len: int            # Tokens in GPU memory (computed property)
 
     # Memory management
-    table_idx: int             # Row in page table
-    page_ids: List[int]        # Allocated physical pages
+    kv_pages: List[int]        # Allocated physical pages
 
     # Lifecycle
     status: str                # "waiting" → "running" → "finished"
@@ -78,7 +76,7 @@ class Request:
 ```
 
 **Key Invariants**:
-- `0 ≤ cached_len < device_len ≤ max_device_len`
+- `0 ≤ cached_len ≤ device_len`
 - `cached_len`: tokens with KV cache computed and stored
 - `device_len`: tokens loaded in GPU memory (prompt + generated)
 - `extend_len = device_len - cached_len`: tokens needing forward pass
@@ -91,8 +89,7 @@ req = Request(
     prompt=[1, 2, 3, 4, 5],
     max_tokens=10,
     cached_len=0,     # No KV cache yet
-    device_len=5,     # 5 prompt tokens
-    max_device_len=15 # 5 prompt + 10 generation
+    device_len=5      # 5 prompt tokens (computed property)
 )
 
 # After prefill (first forward pass)
@@ -622,7 +619,7 @@ class RadixNode:
     
     def __init__(self):
         self.tokens: List[int] = []       # Token sequence this node represents
-        self.page_ids: List[int] = []     # Physical pages storing KV cache
+        self.kv_pages: List[int] = []     # Physical pages storing KV cache
         self.children: Dict[int, RadixNode] = {}  # token → child node
         
         self.last_access_time: float = 0  # For LRU eviction

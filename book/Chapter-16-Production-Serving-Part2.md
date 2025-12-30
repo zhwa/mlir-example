@@ -121,7 +121,7 @@ class Batch:
     def from_decode(requests: List[Request]) -> 'Batch':
         """Decode: one token per request"""
         tokens = [req.output_tokens[-1] for req in requests]
-        positions = [req.device_len - 1 for req in requests]
+        positions = [req.total_len for req in requests]
         
         return Batch(requests, np.array(tokens), np.array(positions))
 ```

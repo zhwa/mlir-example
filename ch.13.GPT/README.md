@@ -169,8 +169,8 @@ linalg::ReduceOp meanReduce = rewriter.create<linalg::ReduceOp>(
 
 #### 2. Linear → linalg.matmul + linalg.generic
 ```cpp
-// Ch13 convention: weight is already (in_features, out_features), no transpose needed
-// Step 1: Initialize output and perform matmul
+// Ch13 uses PyTorch format: weight is (out_features, in_features)
+// Step 1: Transpose weight to (in_features, out_features), then initialize output and perform matmul
 rewriter.create<linalg::FillOp>(loc, zero, output);
 rewriter.create<linalg::MatmulOp>(loc, ValueRange{input, weight}, ValueRange{output});
 
@@ -191,8 +191,8 @@ rewriter.create<linalg::GenericOp>(
 
 **Note**: Chapter 13's `LinearOp` differs from Chapter 12's implementation:
 - **Ch12**: Weights are `(out_features, in_features)`, requires `linalg.transpose` before matmul
-- **Ch13**: Weights are `(in_features, out_features)`, used directly in matmul
-- This reflects different weight storage conventions in the test data
+- **Ch13**: Weights are `(out_features, in_features)` (PyTorch format), requires `linalg.transpose` before matmul
+- Both chapters use the same PyTorch weight convention; Ch13 also transposes weights during lowering
 
 #### 3. GELU → linalg.generic (element-wise)
 ```cpp

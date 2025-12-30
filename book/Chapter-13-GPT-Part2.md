@@ -130,7 +130,7 @@ def Transformer_RoPEOp : Transformer_Op<"rope"> {
     
     Example:
     ```mlir
-    transformer.rope %input, %output : memref<32x64xf32>, memref<32x64xf32>
+    %result = transformer.rope %input : tensor<32x64xf32> -> tensor<32x64xf32>
     ```
     
     References:
@@ -138,14 +138,15 @@ def Transformer_RoPEOp : Transformer_Op<"rope"> {
     - Used in LLaMA, GPT-NeoX, and other modern LLMs
   }];
   
-  let arguments = (ins AnyMemRef:$input, AnyMemRef:$output);
-  let assemblyFormat = "$input `,` $output attr-dict `:` type($input) `,` type($output)";
+  let arguments = (ins AnyTensor:$input);
+  let results = (outs AnyTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
 }
 ```
 
-Consistent with Chapter 12's design, RoPE uses memref with out-parameter. Positions are implicit (0..seq_len-1) rather than explicit—simpler for the common case of sequential positions.
+**Tensor-First Design**. Like other Chapter 13 operations, RoPE uses functional tensor style: takes a tensor input and returns a tensor result. Positions are implicit (0..seq_len-1) rather than explicit—simpler for the common case of sequential positions. After lowering to tensor operations (using `tensor::EmptyOp`, `tensor::ExtractOp`, `tensor::InsertOp`), the bufferization pipeline automatically converts to efficient memref code.
 
-**Lowering RoPE to Standard Dialects**. The lowering generates nested SCF loops computing rotations:
+**Lowering RoPE to Standard Dialects**. The lowering generates tensor operations with nested SCF loops computing rotations:
 
 ```cpp
 // src/TransformerPasses.cpp
@@ -155,10 +156,14 @@ struct RoPEOpLowering : public OpRewritePattern<RoPEOp> {
   LogicalResult matchAndRewrite(RoPEOp op, PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     Value input = op.getInput();
-    Value output = op.getOutput();
     
-    auto inputType = cast<MemRefType>(input.getType());
+    auto inputType = cast<RankedTensorType>(input.getType());
     auto shape = inputType.getShape();
+    
+    // Create empty output tensor
+    Value empty = rewriter.create<tensor::EmptyOp>(
+      loc, shape, inputType.getElementType()
+    );
     
     Value zeroIdx = rewriter.create<arith::ConstantIndexOp>(loc, 0);
     Value oneIdx = rewriter.create<arith::ConstantIndexOp>(loc, 1);
@@ -167,72 +172,87 @@ struct RoPEOpLowering : public OpRewritePattern<RoPEOp> {
     Value dModelVal = rewriter.create<arith::ConstantIndexOp>(loc, shape[1]);
     
     // Constants
-    Value base = rewriter.create<arith::ConstantFloatOp>(
-      loc, llvm::APFloat(10000.0f), rewriter.getF32Type()
+    Value base = rewriter.create<arith::ConstantOp>(
+      loc, rewriter.getF32FloatAttr(10000.0f)
+    );
+    Value two_i64 = rewriter.create<arith::ConstantOp>(
+      loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(2)
     );
     
     // For each position (pos is loop index, serving as implicit position)
-    rewriter.create<scf::ForOp>(
-      loc, zeroIdx, seqLenVal, oneIdx, ValueRange{},
-      [&](OpBuilder &builder, Location loc, Value pos, ValueRange iterArgs) {
+    Value result = rewriter.create<scf::ForOp>(
+      loc, zeroIdx, seqLenVal, oneIdx, ValueRange{empty},
+      [&](OpBuilder &b, Location loc, Value pos, ValueRange iterArgs) {
+        Value currentTensor = iterArgs[0];
+        
         // Convert position index to float
-        Value posI64 = builder.create<arith::IndexCastOp>(loc, builder.getI64Type(), pos);
-        Value posFloat = builder.create<arith::SIToFPOp>(loc, builder.getF32Type(), posI64);
+        Value posI64 = b.create<arith::IndexCastOp>(loc, b.getI64Type(), pos);
+        Value posFloat = b.create<arith::SIToFPOp>(loc, b.getF32Type(), posI64);
         
         // Process dimension pairs: (0,1), (2,3), (4,5), ...
-        builder.create<scf::ForOp>(
-          loc, zeroIdx, dModelVal, twoIdx, ValueRange{},
-          [&](OpBuilder &builder, Location loc, Value dimIdx, ValueRange iterArgs) {
-            Value dimIdxPlus1 = builder.create<arith::AddIOp>(loc, dimIdx, oneIdx);
+        Value updatedTensor = b.create<scf::ForOp>(
+          loc, zeroIdx, dModelVal, twoIdx, ValueRange{currentTensor},
+          [&](OpBuilder &b2, Location loc, Value dimIdx, ValueRange args2) {
+            Value tensor = args2[0];
+            Value dimIdxPlus1 = b2.create<arith::AddIOp>(loc, dimIdx, oneIdx);
             
-            // Compute θ = base^(-2j/d_model)
-            Value dimIdxI64 = builder.create<arith::IndexCastOp>(loc, builder.getI64Type(), dimIdx);
-            Value dimIdxFloat = builder.create<arith::SIToFPOp>(loc, builder.getF32Type(), dimIdxI64);
-            Value dModelI64 = builder.create<arith::IndexCastOp>(loc, builder.getI64Type(), dModelVal);
-            Value dModelFloat = builder.create<arith::SIToFPOp>(loc, builder.getF32Type(), dModelI64);
-            Value ratio = builder.create<arith::DivFOp>(loc, dimIdxFloat, dModelFloat);
+            // Compute θ = base^(-2j/d_model) where j = dimIdx / 2
+            Value dimIdxI64 = b2.create<arith::IndexCastOp>(loc, b2.getI64Type(), dimIdx);
+            Value j_i64 = b2.create<arith::DivSIOp>(loc, dimIdxI64, two_i64);  // Integer division!
+            Value j_float = b2.create<arith::SIToFPOp>(loc, b2.getF32Type(), j_i64);
+            
+            Value dModelI64 = b2.create<arith::IndexCastOp>(loc, b2.getI64Type(), dModelVal);
+            Value dModelFloat = b2.create<arith::SIToFPOp>(loc, b2.getF32Type(), dModelI64);
+            
+            Value two_f32 = b2.create<arith::ConstantOp>(loc, b2.getF32FloatAttr(2.0f));
+            Value twoJ = b2.create<arith::MulFOp>(loc, two_f32, j_float);
+            Value ratio = b2.create<arith::DivFOp>(loc, twoJ, dModelFloat);
             
             // base^(-ratio) = exp(-ratio * log(base))
-            Value logBase = builder.create<math::LogOp>(loc, base);
-            Value negRatio = builder.create<arith::NegFOp>(loc, ratio);
-            Value exponent = builder.create<arith::MulFOp>(loc, negRatio, logBase);
-            Value theta = builder.create<math::ExpOp>(loc, exponent);
+            Value logBase = b2.create<math::LogOp>(loc, base);
+            Value negRatio = b2.create<arith::NegFOp>(loc, ratio);
+            Value exponent = b2.create<arith::MulFOp>(loc, negRatio, logBase);
+            Value theta = b2.create<math::ExpOp>(loc, exponent);
             
             // angle = pos * theta
-            Value angle = builder.create<arith::MulFOp>(loc, posFloat, theta);
-            Value cosAngle = builder.create<math::CosOp>(loc, angle);
-            Value sinAngle = builder.create<math::SinOp>(loc, angle);
+            Value angle = b2.create<arith::MulFOp>(loc, posFloat, theta);
+            Value cosAngle = b2.create<math::CosOp>(loc, angle);
+            Value sinAngle = b2.create<math::SinOp>(loc, angle);
             
-            // Load input pair
-            Value x0 = builder.create<memref::LoadOp>(loc, input, ValueRange{pos, dimIdx});
-            Value x1 = builder.create<memref::LoadOp>(loc, input, ValueRange{pos, dimIdxPlus1});
+            // Extract input pair using tensor.extract
+            Value x0 = b2.create<tensor::ExtractOp>(loc, input, ValueRange{pos, dimIdx});
+            Value x1 = b2.create<tensor::ExtractOp>(loc, input, ValueRange{pos, dimIdxPlus1});
             
             // Apply rotation
-            Value x0_cos = builder.create<arith::MulFOp>(loc, x0, cosAngle);
-            Value x1_sin = builder.create<arith::MulFOp>(loc, x1, sinAngle);
-            Value out0 = builder.create<arith::SubFOp>(loc, x0_cos, x1_sin);
+            Value x0_cos = b2.create<arith::MulFOp>(loc, x0, cosAngle);
+            Value x1_sin = b2.create<arith::MulFOp>(loc, x1, sinAngle);
+            Value out0 = b2.create<arith::SubFOp>(loc, x0_cos, x1_sin);
             
-            Value x0_sin = builder.create<arith::MulFOp>(loc, x0, sinAngle);
-            Value x1_cos = builder.create<arith::MulFOp>(loc, x1, cosAngle);
-            Value out1 = builder.create<arith::AddFOp>(loc, x0_sin, x1_cos);
+            Value x0_sin = b2.create<arith::MulFOp>(loc, x0, sinAngle);
+            Value x1_cos = b2.create<arith::MulFOp>(loc, x1, cosAngle);
+            Value out1 = b2.create<arith::AddFOp>(loc, x0_sin, x1_cos);
             
-            // Store output pair
-            builder.create<memref::StoreOp>(loc, out0, output, ValueRange{pos, dimIdx});
-            builder.create<memref::StoreOp>(loc, out1, output, ValueRange{pos, dimIdxPlus1});
+            // Insert results into output tensor
+            Value tensor1 = b2.create<tensor::InsertOp>(loc, out0, tensor, ValueRange{pos, dimIdx});
+            Value tensor2 = b2.create<tensor::InsertOp>(loc, out1, tensor1, ValueRange{pos, dimIdxPlus1});
             
-            builder.create<scf::YieldOp>(loc);
-          });
+            b2.create<scf::YieldOp>(loc, tensor2);
+          }).getResult(0);
         
-        builder.create<scf::YieldOp>(loc);
-      });
+        b.create<scf::YieldOp>(loc, updatedTensor);
+      }).getResult(0);
     
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
 ```
 
 The outer loop iterates over positions (0..seq_len-1), using the loop index `pos` as the implicit position. The inner loop processes dimension pairs with stride 2. Trigonometric functions (`cos`, `sin`, `exp`, `log`) compile to LLVM intrinsics mapping to hardware instructions.
+
+**Key Implementation Detail**: The pair index `j = dimIdx / 2` uses **integer division** (`arith::DivSIOp`), not floating-point division. This ensures dims 0,1 get j=0, dims 2,3 get j=1 (not j=1.5!). This was a critical bug fix—using float division caused numerical errors in theta computation.
+
+**Bufferization Transform**. After tensor-based lowering, the bufferization pipeline converts `tensor.extract/insert` to `memref.load/store`, `tensor.empty` to `memref.alloc`, and tensor loop-carried values to memref in-place updates. The result is efficient memref code with nested loops and direct memory access.
 
 **Integrating RoPE into Attention**. RoPE modifies the attention computation:
 
@@ -641,10 +661,10 @@ def initialize_model(vocab_size=256, d_model=64, num_blocks=2, seed=42):
             'wk': np.random.randn(d_model, d_model).astype(np.float32) * 0.02,
             'wv': np.random.randn(d_model, d_model).astype(np.float32) * 0.02,
             'wo': np.random.randn(d_model, d_model).astype(np.float32) * 0.02,
-            # FFN weights
-            'w1': np.random.randn(d_model, d_ff).astype(np.float32) * 0.02,
+            # FFN weights (PyTorch format: out_features, in_features)
+            'w1': np.random.randn(d_ff, d_model).astype(np.float32) * 0.02,
             'b1': np.zeros(d_ff, dtype=np.float32),
-            'w2': np.random.randn(d_ff, d_model).astype(np.float32) * 0.02,
+            'w2': np.random.randn(d_model, d_ff).astype(np.float32) * 0.02,
             'b2': np.zeros(d_model, dtype=np.float32),
             # Layer norm parameters
             'ln1_gamma': np.ones(d_model, dtype=np.float32),

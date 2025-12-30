@@ -38,8 +38,8 @@ else:
 
 try:
     import ch14
-    # Alias for easier porting from ch13 tests
-    ch13 = ch14
+    # Alias for easier porting from ch14 tests
+    ch14 = ch14
 except ImportError as e:
     print(f"Error: Could not import ch14 module: {e}")
     print("Please build Chapter 14 first:")
@@ -65,7 +65,7 @@ MAX_SEQ_LEN = 32
 # ============================================================================
 
 print("### Phase 1: Module Import ###")
-print("✓ ch13 module imported successfully")
+print("✓ ch14 module imported successfully")
 print()
 
 # ============================================================================
@@ -88,7 +88,7 @@ indices = np.array([0, 2, 5, 9], dtype=np.int32)
 expected = embedding_table[indices]
 
 # Compile and execute
-result = ch13.forward(ch13.embedding(indices, embedding_table))
+result = ch14.forward(ch14.embedding(indices, embedding_table))
 
 print(f"  Input indices shape: {indices.shape}")
 print(f"  Embedding table shape: {embedding_table.shape}")
@@ -110,7 +110,7 @@ indices = np.array([72, 101, 108, 108, 111, 32, 119, 111, 114, 108, 100, 33, 0, 
 embedding_table = np.random.randn(VOCAB_SIZE, D_MODEL).astype(np.float32) * 0.1
 expected = embedding_table[indices]
 
-result = ch13.forward(ch13.embedding(indices, embedding_table))
+result = ch14.forward(ch14.embedding(indices, embedding_table))
 
 print(f"  Sequence length: {seq_len}")
 print(f"  Vocab size: {VOCAB_SIZE}, d_model: {D_MODEL}")
@@ -141,7 +141,7 @@ print("### Phase 3: Causal Masking ###")
 # Test 1: Create causal mask
 print("Test 1: Create causal mask")
 seq_len = 4
-mask = ch13.forward(ch13.create_causal_mask(seq_len))
+mask = ch14.forward(ch14.create_causal_mask(seq_len))
 
 print(f"  Mask shape: {mask.shape}")
 print(f"  Expected shape: ({seq_len}, {seq_len})")
@@ -189,10 +189,10 @@ seq_len = 4
 
 # Create simple logits (all ones)
 logits = np.ones((batch, seq_len, seq_len), dtype=np.float32)
-mask_tensor = ch13.create_causal_mask(seq_len)
+mask_tensor = ch14.create_causal_mask(seq_len)
 
 # Apply masked softmax
-result = ch13.forward(ch13.masked_softmax(ch13.Tensor(logits), mask_tensor))
+result = ch14.forward(ch14.masked_softmax(ch14.Tensor(logits), mask_tensor))
 
 print(f"  Input logits shape: {logits.shape}")
 print(f"  Mask shape: {mask.shape}")
@@ -250,8 +250,8 @@ logits = np.array([[[1.0, 2.0, 3.0, 4.0],
                     [3.0, 4.0, 5.0, 6.0],
                     [4.0, 5.0, 6.0, 7.0]]], dtype=np.float32)  # [1, 4, 4]
 
-mask_tensor = ch13.create_causal_mask(seq_len)
-result = ch13.forward(ch13.masked_softmax(ch13.Tensor(logits), mask_tensor))
+mask_tensor = ch14.create_causal_mask(seq_len)
+result = ch14.forward(ch14.masked_softmax(ch14.Tensor(logits), mask_tensor))
 
 # Verify with NumPy reference
 mask_np = np.zeros((seq_len, seq_len), dtype=np.float32)
@@ -291,7 +291,7 @@ d_model = 8
 input_matrix = np.arange(seq_len * d_model, dtype=np.float32).reshape(seq_len, d_model)
 input_matrix = input_matrix / 10.0  # Scale down for easier interpretation
 
-result = ch13.forward(ch13.rope(ch13.Tensor(input_matrix)))
+result = ch14.forward(ch14.rope(ch14.Tensor(input_matrix)))
 
 print(f"  Input shape: {input_matrix.shape}")
 print(f"  Output shape: {result.shape}")
@@ -340,7 +340,7 @@ def rope_reference(x, base=10000.0):
     return output
 
 expected = rope_reference(input_matrix, base)
-result = ch13.forward(ch13.rope(ch13.Tensor(input_matrix)))
+result = ch14.forward(ch14.rope(ch14.Tensor(input_matrix)))
 
 if np.allclose(result, expected, rtol=1e-5, atol=1e-6):
     print("  ✓ RoPE matches NumPy reference")
@@ -363,7 +363,7 @@ d_model = 32
 input_matrix = np.random.randn(seq_len, d_model).astype(np.float32)
 input_norms = np.linalg.norm(input_matrix, axis=1)
 
-result = ch13.forward(ch13.rope(ch13.Tensor(input_matrix)))
+result = ch14.forward(ch14.rope(ch14.Tensor(input_matrix)))
 output_norms = np.linalg.norm(result, axis=1)
 
 # Norms should be preserved (within floating point precision)
@@ -412,10 +412,10 @@ def create_gpt_weights(d_model, d_ff, num_layers):
         weights.append(np.random.randn(d_model, d_model).astype(np.float32) * 0.02)  # W_O
         weights.append(np.zeros(d_model, dtype=np.float32))  # b_O
 
-        # FFN (d_model x d_ff and d_ff x d_model)
-        weights.append(np.random.randn(d_model, d_ff).astype(np.float32) * 0.02)  # W1
+        # FFN: PyTorch format weights (out_features, in_features)
+        weights.append(np.random.randn(d_ff, d_model).astype(np.float32) * 0.02)  # W1 (64x16)
         weights.append(np.zeros(d_ff, dtype=np.float32))  # b1
-        weights.append(np.random.randn(d_ff, d_model).astype(np.float32) * 0.02)  # W2
+        weights.append(np.random.randn(d_model, d_ff).astype(np.float32) * 0.02)  # W2 (16x64)
         weights.append(np.zeros(d_model, dtype=np.float32))  # b2
 
         # Layer norms (d_model each)
@@ -443,8 +443,8 @@ b_v = np.zeros(d_model, dtype=np.float32)
 w_o = np.random.randn(d_model, d_model).astype(np.float32) * 0.02
 b_o = np.zeros(d_model, dtype=np.float32)
 
-result = ch13.forward(ch13.gpt_attention(
-    ch13.Tensor(input_seq), w_q, b_q, w_k, b_k, w_v, b_v, w_o, b_o
+result = ch14.forward(ch14.gpt_attention(
+    ch14.Tensor(input_seq), w_q, b_q, w_k, b_k, w_v, b_v, w_o, b_o
 ))
 
 print(f"  Input shape: {input_seq.shape}")
@@ -473,8 +473,8 @@ d_ff = 64
 input_seq = np.random.randn(seq_len, d_model).astype(np.float32) * 0.1
 weights = create_gpt_weights(d_model, d_ff, num_layers=1)
 
-result = ch13.forward(ch13.gpt_block(
-    ch13.Tensor(input_seq),
+result = ch14.forward(ch14.gpt_block(
+    ch14.Tensor(input_seq),
     *weights  # Unpack all 16 weights
 ))
 
@@ -500,10 +500,10 @@ beta = np.zeros(d_model, dtype=np.float32)
 
 # Test just embedding + layer_norm (no attention)
 def simple_forward(indices_in, table, gamma_in, beta_in):
-    hidden = ch13.embedding(indices_in, table)
-    return ch13.layer_norm(hidden, gamma_in, beta_in)
+    hidden = ch14.embedding(indices_in, table)
+    return ch14.layer_norm(hidden, gamma_in, beta_in)
 
-result = ch13.forward(simple_forward(indices, embedding_table, gamma, beta))
+result = ch14.forward(simple_forward(indices, embedding_table, gamma, beta))
 print(f"  Output shape: {result.shape}")
 if result.shape == (seq_len, d_model):
     print("  ✓ Embedding + LayerNorm works")
@@ -531,7 +531,7 @@ all_weights = create_gpt_weights(d_model, d_ff, num_layers)
 final_gamma = np.ones(d_model, dtype=np.float32)
 final_beta = np.zeros(d_model, dtype=np.float32)
 
-result = ch13.forward(ch13.gpt_forward(
+result = ch14.forward(ch14.gpt_forward(
     indices, embedding_table, all_weights, final_gamma, final_beta
 ))
 
@@ -569,7 +569,7 @@ all_weights = create_gpt_weights(d_model, d_ff, num_layers)
 final_gamma = np.ones(d_model, dtype=np.float32)
 final_beta = np.zeros(d_model, dtype=np.float32)
 
-result = ch13.forward(ch13.gpt_forward(
+result = ch14.forward(ch14.gpt_forward(
     indices, embedding_table, all_weights, final_gamma, final_beta
 ))
 

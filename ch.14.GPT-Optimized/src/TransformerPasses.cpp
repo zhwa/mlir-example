@@ -7,6 +7,7 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Utils/StructuredOpsUtils.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
@@ -41,25 +42,32 @@ struct LayerNormOpLowering : public OpRewritePattern<LayerNormOp> {
     Value input = op.getInput();
     Value gamma = op.getGamma();
     Value beta = op.getBeta();
-    Value output = op.getOutput();
     float epsilon = 1e-5f;
 
-    auto inputType = cast<MemRefType>(input.getType());
-    ArrayRef<int64_t> shape = inputType.getShape();
+    // Get result type
+    auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
+    ArrayRef<int64_t> shape = resultType.getShape();
     int rank = shape.size();
 
-    // Create temporary buffers for mean and variance (reduce along last dim)
+    // Create reduced shape for mean and variance (reduce along last dim)
     SmallVector<int64_t> reducedShape(shape.begin(), shape.end() - 1);
-    auto reducedType = MemRefType::get(reducedShape, rewriter.getF32Type());
-    Value meanBuffer = rewriter.create<memref::AllocOp>(loc, reducedType);
-    Value varianceBuffer = rewriter.create<memref::AllocOp>(loc, reducedType);
+    SmallVector<Value> reducedDynamicDims;
+    for (int i = 0; i < rank - 1; ++i) {
+      if (resultType.isDynamicDim(i)) {
+        Value dim = rewriter.create<tensor::DimOp>(loc, input, i);
+        reducedDynamicDims.push_back(dim);
+      }
+    }
+    auto reducedType = RankedTensorType::get(reducedShape, rewriter.getF32Type());
 
     Value zero = createConstantFloat(rewriter, loc, 0.0f);
     Value epsilonVal = createConstantFloat(rewriter, loc, epsilon);
 
     // Step 1: Compute mean using linalg.reduce (sum along last dim)
-    rewriter.create<linalg::FillOp>(loc, zero, meanBuffer);
-    rewriter.create<linalg::ReduceOp>(
+    Value meanBufferEmpty = rewriter.create<tensor::EmptyOp>(loc, reducedType, reducedDynamicDims);
+    Value meanBuffer = rewriter.create<linalg::FillOp>(loc, zero, meanBufferEmpty).getResult(0);
+    
+    Value meanSum = rewriter.create<linalg::ReduceOp>(
         loc,
         ValueRange{input},
         ValueRange{meanBuffer},
@@ -68,32 +76,40 @@ struct LayerNormOpLowering : public OpRewritePattern<LayerNormOp> {
           Value sum = b.create<arith::AddFOp>(loc, args[0], args[1]);
           b.create<linalg::YieldOp>(loc, sum);
         }
-    );
+    ).getResult(0);
 
     // Divide by d_model to get mean
     Value dModel = createConstantFloat(rewriter, loc, static_cast<float>(shape[rank - 1]));
     SmallVector<AffineMap> meanNormalizeMaps;
     auto reducedIdentityMap = AffineMap::getMultiDimIdentityMap(rank - 1, rewriter.getContext());
-    meanNormalizeMaps.push_back(reducedIdentityMap);  // meanBuffer
-    meanNormalizeMaps.push_back(reducedIdentityMap);  // output (in-place)
+    meanNormalizeMaps.push_back(reducedIdentityMap);  // meanSum
+    meanNormalizeMaps.push_back(reducedIdentityMap);  // output
 
     SmallVector<utils::IteratorType> reducedIteratorTypes(rank - 1, utils::IteratorType::parallel);
 
-    rewriter.create<linalg::GenericOp>(
+    Value meanBufferEmptyNorm = rewriter.create<tensor::EmptyOp>(loc, reducedType, reducedDynamicDims);
+    Value meanResult = rewriter.create<linalg::GenericOp>(
         loc,
-        ValueRange{meanBuffer},
-        ValueRange{meanBuffer},  // in-place
+        reducedType,
+        ValueRange{meanSum},
+        ValueRange{meanBufferEmptyNorm},
         meanNormalizeMaps,
         reducedIteratorTypes,
         [dModel](OpBuilder &b, Location loc, ValueRange args) {
           Value normalized = b.create<arith::DivFOp>(loc, args[0], dModel);
           b.create<linalg::YieldOp>(loc, normalized);
         }
-    );
+    ).getResult(0);
 
     // Step 2: Compute variance: sum((input - mean)^2) / d_model
-    // Create temporary buffer for centered values
-    Value centeredBuffer = rewriter.create<memref::AllocOp>(loc, inputType);
+    // Extract dynamic dimensions for full tensors
+    SmallVector<Value> dynamicDims;
+    for (int i = 0; i < rank; ++i) {
+      if (resultType.isDynamicDim(i)) {
+        Value dim = rewriter.create<tensor::DimOp>(loc, input, i);
+        dynamicDims.push_back(dim);
+      }
+    }
 
     // Compute centered = input - mean (broadcast mean)
     SmallVector<AffineMap> centeringMaps;
@@ -105,26 +121,30 @@ struct LayerNormOpLowering : public OpRewritePattern<LayerNormOp> {
     auto broadcastMap = AffineMap::get(rank, 0, reducedExprs, rewriter.getContext());
 
     centeringMaps.push_back(identityMap);     // input
-    centeringMaps.push_back(broadcastMap);    // meanBuffer (broadcasted)
+    centeringMaps.push_back(broadcastMap);    // meanResult (broadcasted)
     centeringMaps.push_back(identityMap);     // centeredBuffer
 
     SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
 
-    rewriter.create<linalg::GenericOp>(
+    Value centeredBufferEmpty = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
+    Value centeredBuffer = rewriter.create<linalg::GenericOp>(
         loc,
-        ValueRange{input, meanBuffer},
-        ValueRange{centeredBuffer},
+        resultType,
+        ValueRange{input, meanResult},
+        ValueRange{centeredBufferEmpty},
         centeringMaps,
         iteratorTypes,
         [](OpBuilder &b, Location loc, ValueRange args) {
           Value centered = b.create<arith::SubFOp>(loc, args[0], args[1]);
           b.create<linalg::YieldOp>(loc, centered);
         }
-    );
+    ).getResult(0);
 
     // Compute variance: sum(centered^2) / d_model
-    rewriter.create<linalg::FillOp>(loc, zero, varianceBuffer);
-    rewriter.create<linalg::ReduceOp>(
+    Value varianceBufferEmpty = rewriter.create<tensor::EmptyOp>(loc, reducedType, reducedDynamicDims);
+    Value varianceBuffer = rewriter.create<linalg::FillOp>(loc, zero, varianceBufferEmpty).getResult(0);
+    
+    Value varianceSum = rewriter.create<linalg::ReduceOp>(
         loc,
         ValueRange{centeredBuffer},
         ValueRange{varianceBuffer},
@@ -134,13 +154,15 @@ struct LayerNormOpLowering : public OpRewritePattern<LayerNormOp> {
           Value sum = b.create<arith::AddFOp>(loc, squared, args[1]);
           b.create<linalg::YieldOp>(loc, sum);
         }
-    );
+    ).getResult(0);
 
     // Divide by d_model and compute rsqrt(variance + epsilon)
-    rewriter.create<linalg::GenericOp>(
+    Value invStdBufferEmpty = rewriter.create<tensor::EmptyOp>(loc, reducedType, reducedDynamicDims);
+    Value invStdResult = rewriter.create<linalg::GenericOp>(
         loc,
-        ValueRange{varianceBuffer},
-        ValueRange{varianceBuffer},  // in-place
+        reducedType,
+        ValueRange{varianceSum},
+        ValueRange{invStdBufferEmpty},
         meanNormalizeMaps,
         reducedIteratorTypes,
         [dModel, epsilonVal](OpBuilder &b, Location loc, ValueRange args) {
@@ -149,7 +171,7 @@ struct LayerNormOpLowering : public OpRewritePattern<LayerNormOp> {
           Value invStd = b.create<math::RsqrtOp>(loc, variancePlusEps);
           b.create<linalg::YieldOp>(loc, invStd);
         }
-    );
+    ).getResult(0);
 
     // Step 3: Normalize and apply scale/shift: output = ((input - mean) * invStd) * gamma + beta
     // Using centered values, multiply by invStd, then scale by gamma and shift by beta
@@ -160,32 +182,29 @@ struct LayerNormOpLowering : public OpRewritePattern<LayerNormOp> {
 
     SmallVector<AffineMap> normalizeMaps;
     normalizeMaps.push_back(identityMap);              // centeredBuffer
-    normalizeMaps.push_back(broadcastMap);             // varianceBuffer (invStd, broadcasted)
+    normalizeMaps.push_back(broadcastMap);             // invStdResult (broadcasted)
     normalizeMaps.push_back(gammaBetaBroadcastMap);    // gamma (broadcasted)
     normalizeMaps.push_back(gammaBetaBroadcastMap);    // beta (broadcasted)
     normalizeMaps.push_back(identityMap);              // output
 
-    rewriter.create<linalg::GenericOp>(
+    Value resultEmpty = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
+    Value result = rewriter.create<linalg::GenericOp>(
         loc,
-        ValueRange{centeredBuffer, varianceBuffer, gamma, beta},
-        ValueRange{output},
+        resultType,
+        ValueRange{centeredBuffer, invStdResult, gamma, beta},
+        ValueRange{resultEmpty},
         normalizeMaps,
         iteratorTypes,
         [](OpBuilder &b, Location loc, ValueRange args) {
           // args[0] = centered, args[1] = invStd, args[2] = gamma, args[3] = beta
           Value normalized = b.create<arith::MulFOp>(loc, args[0], args[1]);
           Value scaled = b.create<arith::MulFOp>(loc, normalized, args[2]);
-          Value result = b.create<arith::AddFOp>(loc, scaled, args[3]);
-          b.create<linalg::YieldOp>(loc, result);
+          Value finalResult = b.create<arith::AddFOp>(loc, scaled, args[3]);
+          b.create<linalg::YieldOp>(loc, finalResult);
         }
-    );
+    ).getResult(0);
 
-    // Clean up temporary buffers
-    rewriter.create<memref::DeallocOp>(loc, meanBuffer);
-    rewriter.create<memref::DeallocOp>(loc, varianceBuffer);
-    rewriter.create<memref::DeallocOp>(loc, centeredBuffer);
-
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
@@ -203,32 +222,62 @@ struct LinearOpLowering : public OpRewritePattern<LinearOp> {
     Value input = op.getInput();
     Value weight = op.getWeight();
     Value bias = op.getBias();
-    Value output = op.getOutput();
 
-    auto inputType = cast<MemRefType>(input.getType());
-    auto weightType = cast<MemRefType>(weight.getType());
-    auto outputType = cast<MemRefType>(output.getType());
+    // Get result type
+    auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
+    auto inputType = mlir::cast<RankedTensorType>(input.getType());
+    auto weightType = mlir::cast<RankedTensorType>(weight.getType());
 
-    // Linear: output = input @ weight + bias
-    // Ch14 convention: weight is already (in_features, out_features)
-    // input: (seq_len, in_features), weight: (in_features, out_features)
+    // Linear: output = input @ weight^T + bias
+    // input: (seq_len, in_features), weight: (out_features, in_features)
+    // Need to transpose weight to (in_features, out_features) for matmul
 
     int64_t seqLen = inputType.getShape()[0];
-    int64_t inFeatures = inputType.getShape()[1];
-    int64_t outFeatures = weightType.getShape()[1];  // Ch14: weight is [in, out]
+    int64_t inFeatures = inputType.getShape()[1];   // from input's second dim
+    int64_t outFeatures = weightType.getShape()[0]; // from weight's first dim
 
-    // Step 1: Initialize output to zero and perform matmul
+    // Extract dynamic dimensions for transposed weight
+    SmallVector<int64_t> transposedWeightShape = {inFeatures, outFeatures};
+    SmallVector<Value> transposedDynamicDims;
+    auto transposedWeightType = RankedTensorType::get(transposedWeightShape, rewriter.getF32Type());
+    for (int i = 0; i < 2; ++i) {
+      if (transposedWeightType.isDynamicDim(i)) {
+        Value dim = rewriter.create<tensor::DimOp>(loc, weight, i == 0 ? 1 : 0);
+        transposedDynamicDims.push_back(dim);
+      }
+    }
+
+    // Step 1: Transpose weight (out_features, in_features) -> (in_features, out_features)
+    Value transposedWeightEmpty = rewriter.create<tensor::EmptyOp>(loc, transposedWeightType, transposedDynamicDims);
+    Value transposedWeight = rewriter.create<linalg::TransposeOp>(
+        loc,
+        weight,
+        transposedWeightEmpty,
+        SmallVector<int64_t>{1, 0}  // swap dimensions
+    ).getResult()[0];
+
+    // Extract dynamic dimensions for output
+    SmallVector<Value> dynamicDims;
+    for (int i = 0; i < resultType.getRank(); ++i) {
+      if (resultType.isDynamicDim(i)) {
+        Value dim = rewriter.create<tensor::DimOp>(loc, input, i);
+        dynamicDims.push_back(dim);
+      }
+    }
+
+    // Step 2: Initialize output to zero and perform matmul
     Value zero = createConstantFloat(rewriter, loc, 0.0f);
-    rewriter.create<linalg::FillOp>(loc, zero, output);
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
+    Value filledTensor = rewriter.create<linalg::FillOp>(loc, zero, emptyTensor).getResult(0);
 
     // Matmul: (seq_len, in_features) @ (in_features, out_features) -> (seq_len, out_features)
-    rewriter.create<linalg::MatmulOp>(
+    Value matmulResult = rewriter.create<linalg::MatmulOp>(
         loc,
-        ValueRange{input, weight},  // No transpose needed for Ch14
-        ValueRange{output}
-    );
+        ValueRange{input, transposedWeight},
+        ValueRange{filledTensor}
+    ).getResult(0);
 
-    // Step 2: Add bias using linalg.generic (broadcast bias across seq_len)
+    // Step 3: Add bias using linalg.generic (broadcast bias across seq_len)
     int rank = 2;
     SmallVector<AffineMap> indexingMaps;
     auto identityMap = AffineMap::getMultiDimIdentityMap(rank, rewriter.getContext());
@@ -236,35 +285,37 @@ struct LinearOpLowering : public OpRewritePattern<LinearOp> {
     // Broadcast map for bias (only last dimension)
     SmallVector<AffineExpr> biasExprs;
     biasExprs.push_back(rewriter.getAffineDimExpr(1));  // only use second dimension
-    AffineMap biasMap = AffineMap::get(rank, 0, biasExprs, rewriter.getContext());
+    auto broadcastMap = AffineMap::get(rank, 0, biasExprs, rewriter.getContext());
 
-    indexingMaps.push_back(biasMap);       // bias input (1D)
-    indexingMaps.push_back(identityMap);   // output (2D)
+    indexingMaps.push_back(identityMap);     // matmulResult
+    indexingMaps.push_back(broadcastMap);    // bias (broadcasted)
+    indexingMaps.push_back(identityMap);     // output
 
     SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
 
-    rewriter.create<linalg::GenericOp>(
+    Value resultEmpty = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
+    Value result = rewriter.create<linalg::GenericOp>(
         loc,
-        TypeRange{},           // result types (output is updated in-place)
-        ValueRange{bias},      // inputs
-        ValueRange{output},    // outputs
+        resultType,
+        ValueRange{matmulResult, bias},
+        ValueRange{resultEmpty},
         indexingMaps,
         iteratorTypes,
-        [&](OpBuilder &b, Location loc, ValueRange args) {
-          Value biasVal = args[0];
-          Value outputVal = args[1];
-          Value sum = b.create<arith::AddFOp>(loc, outputVal, biasVal);
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          Value sum = b.create<arith::AddFOp>(loc, args[0], args[1]);
           b.create<linalg::YieldOp>(loc, sum);
         }
-    );
+    ).getResult(0);
 
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
 
 //===----------------------------------------------------------------------===//
 // GeluOp Lowering
+//===----------------------------------------------------------------------===//
+// GeluOp Lowering (Tensor-Based)
 //===----------------------------------------------------------------------===//
 
 struct GeluOpLowering : public OpRewritePattern<GeluOp> {
@@ -274,72 +325,87 @@ struct GeluOpLowering : public OpRewritePattern<GeluOp> {
                                  PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     Value input = op.getInput();
-    Value output = op.getOutput();
 
-    // Phase 2: Use linalg.generic for GELU
-    // Enables fusion with matmul+bias patterns
-    auto inputType = cast<MemRefType>(input.getType());
-    int64_t rank = inputType.getRank();
-    
-    // Create identity affine maps
-    SmallVector<AffineMap> indexingMaps;
-    auto identityMap = AffineMap::getMultiDimIdentityMap(rank, rewriter.getContext());
-    indexingMaps.push_back(identityMap); // input
-    indexingMaps.push_back(identityMap); // output
-    
-    // All dimensions are parallel
-    SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
-    
-    // Constants for GELU approximation
+    // Get result type
+    auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
+    int rank = resultType.getRank();
+
+    // GELU approximation constants: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
     Value c0_5 = createConstantFloat(rewriter, loc, 0.5f);
     Value c1 = createConstantFloat(rewriter, loc, 1.0f);
-    Value cSqrt2OverPi = createConstantFloat(rewriter, loc, 0.7978845608f);
+    Value cSqrt2OverPi = createConstantFloat(rewriter, loc, 0.7978845608f); // sqrt(2/pi)
     Value c0_044715 = createConstantFloat(rewriter, loc, 0.044715f);
-    
-    // Create linalg.generic for GELU: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-    rewriter.create<linalg::GenericOp>(
+
+    // Create empty output tensor
+    SmallVector<Value> dynamicDims;
+    for (int i = 0; i < rank; ++i) {
+      if (ShapedType::isDynamic(resultType.getShape()[i])) {
+        dynamicDims.push_back(rewriter.create<tensor::DimOp>(loc, input, i));
+      }
+    }
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
+
+    // Use linalg.generic for element-wise GELU activation
+    SmallVector<AffineMap> indexingMaps;
+    auto identityMap = AffineMap::getMultiDimIdentityMap(rank, rewriter.getContext());
+    indexingMaps.push_back(identityMap);  // input
+    indexingMaps.push_back(identityMap);  // result
+
+    SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
+
+    // Capture constants for use in body builder
+    Value capturedC0_5 = c0_5;
+    Value capturedC1 = c1;
+    Value capturedCSqrt2OverPi = cSqrt2OverPi;
+    Value capturedC0_044715 = c0_044715;
+
+    Value result = rewriter.create<linalg::GenericOp>(
         loc,
+        /*resultTensorTypes=*/resultType,
         /*inputs=*/ValueRange{input},
-        /*outputs=*/ValueRange{output},
+        /*outputs=*/ValueRange{emptyTensor},
         /*indexingMaps=*/indexingMaps,
         /*iteratorTypes=*/iteratorTypes,
-        [&](OpBuilder &b, Location loc, ValueRange args) {
+        /*bodyBuilder=*/[capturedC0_5, capturedC1, capturedCSqrt2OverPi, capturedC0_044715]
+        (OpBuilder &b, Location loc, ValueRange args) {
           Value x = args[0];
-          
+
           // Compute x^3
           Value x2 = b.create<arith::MulFOp>(loc, x, x);
           Value x3 = b.create<arith::MulFOp>(loc, x2, x);
-          
+
           // Compute 0.044715 * x^3
-          Value term = b.create<arith::MulFOp>(loc, c0_044715, x3);
-          
+          Value term = b.create<arith::MulFOp>(loc, capturedC0_044715, x3);
+
           // Compute x + 0.044715 * x^3
           Value inner = b.create<arith::AddFOp>(loc, x, term);
-          
+
           // Compute sqrt(2/pi) * (x + 0.044715 * x^3)
-          Value scaled = b.create<arith::MulFOp>(loc, cSqrt2OverPi, inner);
-          
+          Value scaled = b.create<arith::MulFOp>(loc, capturedCSqrt2OverPi, inner);
+
           // Compute tanh(...)
           Value tanhVal = b.create<math::TanhOp>(loc, scaled);
-          
-          // Compute 1 + tanh(...)
-          Value onePlusTanh = b.create<arith::AddFOp>(loc, c1, tanhVal);
-          
-          // Compute 0.5 * x * (1 + tanh(...))
-          Value halfX = b.create<arith::MulFOp>(loc, c0_5, x);
-          Value result = b.create<arith::MulFOp>(loc, halfX, onePlusTanh);
-          
-          b.create<linalg::YieldOp>(loc, result);
-        }
-    );
 
-    rewriter.eraseOp(op);
+          // Compute 1 + tanh(...)
+          Value onePlusTanh = b.create<arith::AddFOp>(loc, capturedC1, tanhVal);
+
+          // Compute 0.5 * x * (1 + tanh(...))
+          Value halfX = b.create<arith::MulFOp>(loc, capturedC0_5, x);
+          Value geluResult = b.create<arith::MulFOp>(loc, halfX, onePlusTanh);
+
+          b.create<linalg::YieldOp>(loc, geluResult);
+        }
+    ).getResult(0);
+
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
 
 //===----------------------------------------------------------------------===//
 // AddOp Lowering
+//===----------------------------------------------------------------------===//
+// AddOp Lowering (Tensor-Based)
 //===----------------------------------------------------------------------===//
 
 struct AddOpLowering : public OpRewritePattern<AddOp> {
@@ -350,44 +416,52 @@ struct AddOpLowering : public OpRewritePattern<AddOp> {
     Location loc = op.getLoc();
     Value lhs = op.getLhs();
     Value rhs = op.getRhs();
-    Value output = op.getOutput();
 
-    // Phase 2: Use linalg.generic for element-wise addition
-    // This enables fusion with adjacent operations
-    auto lhsType = cast<MemRefType>(lhs.getType());
-    int64_t rank = lhsType.getRank();
-    
-    // Create identity affine maps for parallel iteration
+    // Get result type
+    auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
+    int rank = resultType.getRank();
+
+    // Create indexing maps: all identity (parallel element-wise operation)
     SmallVector<AffineMap> indexingMaps;
     auto identityMap = AffineMap::getMultiDimIdentityMap(rank, rewriter.getContext());
-    indexingMaps.push_back(identityMap); // lhs
-    indexingMaps.push_back(identityMap); // rhs
-    indexingMaps.push_back(identityMap); // output
-    
-    // All dimensions are parallel (element-wise operation)
+    indexingMaps.push_back(identityMap);  // lhs
+    indexingMaps.push_back(identityMap);  // rhs
+    indexingMaps.push_back(identityMap);  // result
+
+    // All dimensions are parallel (no reductions)
     SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
-    
-    // Create linalg.generic op
-    rewriter.create<linalg::GenericOp>(
+
+    // Create empty tensor for output
+    SmallVector<Value> dynamicDims;
+    for (int i = 0; i < rank; ++i) {
+      if (ShapedType::isDynamic(resultType.getShape()[i])) {
+        dynamicDims.push_back(rewriter.create<tensor::DimOp>(loc, lhs, i));
+      }
+    }
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
+
+    // Create linalg.generic operation returning tensor
+    Value result = rewriter.create<linalg::GenericOp>(
         loc,
+        /*resultTensorTypes=*/resultType,
         /*inputs=*/ValueRange{lhs, rhs},
-        /*outputs=*/ValueRange{output},
+        /*outputs=*/ValueRange{emptyTensor},
         /*indexingMaps=*/indexingMaps,
         /*iteratorTypes=*/iteratorTypes,
-        [&](OpBuilder &b, Location loc, ValueRange args) {
-          // Body: output = lhs + rhs
+        /*bodyBuilder=*/[](OpBuilder &b, Location loc, ValueRange args) {
+          // args[0] = lhs element, args[1] = rhs element
           Value sum = b.create<arith::AddFOp>(loc, args[0], args[1]);
           b.create<linalg::YieldOp>(loc, sum);
         }
-    );
+    ).getResult(0);
 
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
 
 //===----------------------------------------------------------------------===//
-// MatmulOp Lowering
+// MatmulOp Lowering (Tensor-Based)
 //===----------------------------------------------------------------------===//
 
 struct MatmulOpLowering : public OpRewritePattern<MatmulOp> {
@@ -398,51 +472,37 @@ struct MatmulOpLowering : public OpRewritePattern<MatmulOp> {
     Location loc = op.getLoc();
     Value lhs = op.getLhs();
     Value rhs = op.getRhs();
-    Value output = op.getOutput();
 
-    // Phase 1: Use Linalg matmul instead of hand-written loops
-    // This enables automatic fusion, tiling, and vectorization
-    // linalg.matmul(lhs, rhs, output) where output is initialized to zero
-    
-    // First, initialize output to zero
-    auto outputType = cast<MemRefType>(output.getType());
+    // Get result type
+    auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
+
+    // Create empty tensor for output
+    SmallVector<Value> dynamicDims;
+    for (int i = 0; i < resultType.getRank(); ++i) {
+      if (ShapedType::isDynamic(resultType.getShape()[i])) {
+        dynamicDims.push_back(rewriter.create<tensor::DimOp>(loc, lhs, i));
+      }
+    }
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
+
+    // Zero-initialize with linalg.fill (returns tensor)
     Value zero = createConstantFloat(rewriter, loc, 0.0f);
-    
-    int64_t M = outputType.getShape()[0];
-    int64_t N = outputType.getShape()[1];
-    Value MVal = createConstantIndex(rewriter, loc, M);
-    Value NVal = createConstantIndex(rewriter, loc, N);
-    Value zeroIdx = createConstantIndex(rewriter, loc, 0);
-    Value oneIdx = createConstantIndex(rewriter, loc, 1);
-    
-    // Initialize output to zero
-    rewriter.create<scf::ForOp>(
-        loc, zeroIdx, MVal, oneIdx, ValueRange{},
-        [&](OpBuilder &builder, Location loc, Value i, ValueRange iterArgs) {
-          builder.create<scf::ForOp>(
-              loc, zeroIdx, NVal, oneIdx, ValueRange{},
-              [&](OpBuilder &builder, Location loc, Value j, ValueRange iterArgs) {
-                builder.create<memref::StoreOp>(loc, zero, output, ValueRange{i, j});
-                builder.create<scf::YieldOp>(loc);
-              });
-          builder.create<scf::YieldOp>(loc);
-        });
-    
-    // Create linalg.matmul: C = A * B
-    // This replaces the 3 nested loops with a single linalg op
-    rewriter.create<linalg::MatmulOp>(
+    Value filledTensor = rewriter.create<linalg::FillOp>(loc, zero, emptyTensor).getResult(0);
+
+    // Perform matrix multiplication (returns tensor)
+    Value result = rewriter.create<linalg::MatmulOp>(
         loc,
         ValueRange{lhs, rhs},  // inputs
-        ValueRange{output}     // output (initialized to zero, will be accumulated into)
-    );
+        ValueRange{filledTensor}     // output tensor
+    ).getResult(0);
 
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
 
 //===----------------------------------------------------------------------===//
-// TransposeOp Lowering
+// TransposeOp Lowering (Tensor-Based)
 //===----------------------------------------------------------------------===//
 
 struct TransposeOpLowering : public OpRewritePattern<TransposeOp> {
@@ -452,36 +512,40 @@ struct TransposeOpLowering : public OpRewritePattern<TransposeOp> {
                                  PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     Value input = op.getInput();
-    Value output = op.getOutput();
 
-    auto inputType = cast<MemRefType>(input.getType());
-    auto shape = inputType.getShape();
+    auto inputType = mlir::cast<RankedTensorType>(input.getType());
+    auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
+    int rank = inputType.getRank();
 
-    // Transpose: input is (dim0, dim1), output is (dim1, dim0)
-    int64_t inputDim0 = shape[0];
-    int64_t inputDim1 = shape[1];
+    // Create permutation: swap last two dimensions
+    // For rank=2: [0,1] -> [1,0]
+    // For rank=3: [0,1,2] -> [0,2,1]
+    SmallVector<int64_t> permutation;
+    for (int i = 0; i < rank - 2; i++) {
+      permutation.push_back(i);
+    }
+    permutation.push_back(rank - 1);  // Swap: last dimension first
+    permutation.push_back(rank - 2);  // Swap: second-to-last dimension second
 
-    Value inputDim0Val = createConstantIndex(rewriter, loc, inputDim0);
-    Value inputDim1Val = createConstantIndex(rewriter, loc, inputDim1);
-    Value zeroIdx = createConstantIndex(rewriter, loc, 0);
-    Value oneIdx = createConstantIndex(rewriter, loc, 1);
+    // Create empty output tensor with transposed shape
+    SmallVector<Value> dynamicDims;
+    for (int i = 0; i < rank; ++i) {
+      if (ShapedType::isDynamic(resultType.getShape()[i])) {
+        int64_t inputDim = permutation[i];
+        dynamicDims.push_back(rewriter.create<tensor::DimOp>(loc, input, inputDim));
+      }
+    }
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
 
-    // output[i, j] = input[j, i]
-    // Output shape is (inputDim1, inputDim0), so iterate accordingly
-    rewriter.create<scf::ForOp>(
-        loc, zeroIdx, inputDim1Val, oneIdx, ValueRange{},
-        [&](OpBuilder &builder, Location loc, Value i, ValueRange iterArgs) {
-          builder.create<scf::ForOp>(
-              loc, zeroIdx, inputDim0Val, oneIdx, ValueRange{},
-              [&](OpBuilder &builder, Location loc, Value j, ValueRange iterArgs) {
-                Value val = builder.create<memref::LoadOp>(loc, input, ValueRange{j, i});
-                builder.create<memref::StoreOp>(loc, val, output, ValueRange{i, j});
-                builder.create<scf::YieldOp>(loc);
-              });
-          builder.create<scf::YieldOp>(loc);
-        });
+    // Use linalg.transpose (returns tensor)
+    Value result = rewriter.create<linalg::TransposeOp>(
+        loc,
+        input,
+        emptyTensor,
+        permutation
+    ).getResult()[0];
 
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
@@ -497,63 +561,114 @@ struct SoftmaxOpLowering : public OpRewritePattern<SoftmaxOp> {
                                  PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     Value input = op.getInput();
-    Value output = op.getOutput();
 
-    auto inputType = cast<MemRefType>(input.getType());
-    auto shape = inputType.getShape();
+    // Get result type
+    auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
+    ArrayRef<int64_t> shape = resultType.getShape();
+    int rank = shape.size();
 
-    int64_t rows = shape[0];
-    int64_t cols = shape[1];
+    // Create reduced shape for max/sum buffers
+    SmallVector<int64_t> reducedShape(shape.begin(), shape.end() - 1);
+    SmallVector<Value> reducedDynamicDims;
+    for (int i = 0; i < rank - 1; ++i) {
+      if (resultType.isDynamicDim(i)) {
+        Value dim = rewriter.create<tensor::DimOp>(loc, input, i);
+        reducedDynamicDims.push_back(dim);
+      }
+    }
+    auto reducedType = RankedTensorType::get(reducedShape, rewriter.getF32Type());
 
-    Value negInf = createConstantFloat(rewriter, loc, -std::numeric_limits<float>::infinity());
+    // Extract dynamic dimensions for output tensor
+    SmallVector<Value> dynamicDims;
+    for (int i = 0; i < rank; ++i) {
+      if (resultType.isDynamicDim(i)) {
+        Value dim = rewriter.create<tensor::DimOp>(loc, input, i);
+        dynamicDims.push_back(dim);
+      }
+    }
+
+    // Step 1: Find max along last dimension using linalg.reduce
+    Value negInf = createConstantFloat(rewriter, loc, -1e9f);
+    Value maxBufferEmpty = rewriter.create<tensor::EmptyOp>(loc, reducedType, reducedDynamicDims);
+    Value maxBuffer = rewriter.create<linalg::FillOp>(loc, negInf, maxBufferEmpty).getResult(0);
+
+    Value maxResult = rewriter.create<linalg::ReduceOp>(
+        loc,
+        ValueRange{input},
+        ValueRange{maxBuffer},
+        SmallVector<int64_t>{rank - 1},  // reduce along last dimension
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          // args[0] = input element, args[1] = current max
+          Value newMax = b.create<arith::MaximumFOp>(loc, args[0], args[1]);
+          b.create<linalg::YieldOp>(loc, newMax);
+        }
+    ).getResult(0);
+
+    // Step 2: Compute exp(input - max) using linalg.generic
+    SmallVector<AffineMap> indexingMaps;
+    auto identityMap = AffineMap::getMultiDimIdentityMap(rank, rewriter.getContext());
+    SmallVector<AffineExpr> reducedExprs;
+    for (int i = 0; i < rank - 1; i++) {
+      reducedExprs.push_back(rewriter.getAffineDimExpr(i));
+    }
+    auto broadcastMap = AffineMap::get(rank, 0, reducedExprs, rewriter.getContext());
+
+    indexingMaps.push_back(identityMap);     // input
+    indexingMaps.push_back(broadcastMap);    // maxResult (broadcasted)
+    indexingMaps.push_back(identityMap);     // output
+
+    SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
+
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
+    Value expResult = rewriter.create<linalg::GenericOp>(
+        loc,
+        resultType,
+        ValueRange{input, maxResult},
+        ValueRange{emptyTensor},
+        indexingMaps,
+        iteratorTypes,
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          // args[0] = input element, args[1] = max value (broadcasted)
+          Value shifted = b.create<arith::SubFOp>(loc, args[0], args[1]);
+          Value expVal = b.create<math::ExpOp>(loc, shifted);
+          b.create<linalg::YieldOp>(loc, expVal);
+        }
+    ).getResult(0);
+
+    // Step 3: Sum exp values along last dimension using linalg.reduce
     Value zero = createConstantFloat(rewriter, loc, 0.0f);
-    Value rowsVal = createConstantIndex(rewriter, loc, rows);
-    Value colsVal = createConstantIndex(rewriter, loc, cols);
-    Value zeroIdx = createConstantIndex(rewriter, loc, 0);
-    Value oneIdx = createConstantIndex(rewriter, loc, 1);
+    Value sumBufferEmpty = rewriter.create<tensor::EmptyOp>(loc, reducedType, reducedDynamicDims);
+    Value sumBuffer = rewriter.create<linalg::FillOp>(loc, zero, sumBufferEmpty).getResult(0);
 
-    // For each row: softmax(x_i) = exp(x_i - max(x)) / sum(exp(x_j - max(x)))
-    rewriter.create<scf::ForOp>(
-        loc, zeroIdx, rowsVal, oneIdx, ValueRange{},
-        [&](OpBuilder &builder, Location loc, Value i, ValueRange iterArgs) {
-          // Step 1: Find max
-          Value maxVal = builder.create<scf::ForOp>(
-              loc, zeroIdx, colsVal, oneIdx, ValueRange{negInf},
-              [&](OpBuilder &builder, Location loc, Value j, ValueRange iterArgs) {
-                Value currentMax = iterArgs[0];
-                Value val = builder.create<memref::LoadOp>(loc, input, ValueRange{i, j});
-                Value newMax = builder.create<arith::MaximumFOp>(loc, currentMax, val);
-                builder.create<scf::YieldOp>(loc, newMax);
-              }).getResult(0);
+    Value sumResult = rewriter.create<linalg::ReduceOp>(
+        loc,
+        ValueRange{expResult},  // input is now the exp values
+        ValueRange{sumBuffer},
+        SmallVector<int64_t>{rank - 1},  // reduce along last dimension
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          // args[0] = exp element, args[1] = current sum
+          Value newSum = b.create<arith::AddFOp>(loc, args[0], args[1]);
+          b.create<linalg::YieldOp>(loc, newSum);
+        }
+    ).getResult(0);
 
-          // Step 2: Compute sum of exp(x - max)
-          Value sumExp = builder.create<scf::ForOp>(
-              loc, zeroIdx, colsVal, oneIdx, ValueRange{zero},
-              [&](OpBuilder &builder, Location loc, Value j, ValueRange iterArgs) {
-                Value currentSum = iterArgs[0];
-                Value val = builder.create<memref::LoadOp>(loc, input, ValueRange{i, j});
-                Value shifted = builder.create<arith::SubFOp>(loc, val, maxVal);
-                Value expVal = builder.create<math::ExpOp>(loc, shifted);
-                Value newSum = builder.create<arith::AddFOp>(loc, currentSum, expVal);
-                builder.create<scf::YieldOp>(loc, newSum);
-              }).getResult(0);
+    // Step 4: Normalize by dividing exp values by sum using linalg.generic
+    Value emptyResult = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
+    Value result = rewriter.create<linalg::GenericOp>(
+        loc,
+        resultType,
+        ValueRange{expResult, sumResult},  // exp values and sum
+        ValueRange{emptyResult},
+        SmallVector<AffineMap>{identityMap, broadcastMap, identityMap},
+        iteratorTypes,
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          // args[0] = exp element, args[1] = sum (broadcasted)
+          Value normalized = b.create<arith::DivFOp>(loc, args[0], args[1]);
+          b.create<linalg::YieldOp>(loc, normalized);
+        }
+    ).getResult(0);
 
-          // Step 3: Normalize
-          builder.create<scf::ForOp>(
-              loc, zeroIdx, colsVal, oneIdx, ValueRange{},
-              [&](OpBuilder &builder, Location loc, Value j, ValueRange iterArgs) {
-                Value val = builder.create<memref::LoadOp>(loc, input, ValueRange{i, j});
-                Value shifted = builder.create<arith::SubFOp>(loc, val, maxVal);
-                Value expVal = builder.create<math::ExpOp>(loc, shifted);
-                Value result = builder.create<arith::DivFOp>(loc, expVal, sumExp);
-                builder.create<memref::StoreOp>(loc, result, output, ValueRange{i, j});
-                builder.create<scf::YieldOp>(loc);
-              });
-
-          builder.create<scf::YieldOp>(loc);
-        });
-
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
@@ -570,40 +685,59 @@ struct ScaleOpLowering : public OpRewritePattern<ScaleOp> {
     Location loc = op.getLoc();
     Value input = op.getInput();
     Value scale = op.getScale();
-    Value output = op.getOutput();
 
-    auto inputType = cast<MemRefType>(input.getType());
-    auto shape = inputType.getShape();
+    // Get result type
+    auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
+    int rank = resultType.getRank();
 
-    // Load scalar scale value
+    // Extract dynamic dimensions
+    SmallVector<Value> dynamicDims;
+    for (int i = 0; i < rank; ++i) {
+      if (resultType.isDynamicDim(i)) {
+        Value dim = rewriter.create<tensor::DimOp>(loc, input, i);
+        dynamicDims.push_back(dim);
+      }
+    }
+
+    // Create empty tensor
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
+
+    // Load scalar scale value from 1D tensor
     Value zeroIdx = createConstantIndex(rewriter, loc, 0);
-    Value scaleVal = rewriter.create<memref::LoadOp>(loc, scale, ValueRange{zeroIdx});
+    Value scalarValue = rewriter.create<tensor::ExtractOp>(loc, scale, ValueRange{zeroIdx});
 
-    Value dim0Val = createConstantIndex(rewriter, loc, shape[0]);
-    Value dim1Val = createConstantIndex(rewriter, loc, shape[1]);
-    Value oneIdx = createConstantIndex(rewriter, loc, 1);
+    // Use linalg.generic for element-wise multiplication
+    SmallVector<AffineMap> indexingMaps;
+    auto identityMap = AffineMap::getMultiDimIdentityMap(rank, rewriter.getContext());
+    indexingMaps.push_back(identityMap);  // input
+    indexingMaps.push_back(identityMap);  // output
 
-    rewriter.create<scf::ForOp>(
-        loc, zeroIdx, dim0Val, oneIdx, ValueRange{},
-        [&](OpBuilder &builder, Location loc, Value i, ValueRange iterArgs) {
-          builder.create<scf::ForOp>(
-              loc, zeroIdx, dim1Val, oneIdx, ValueRange{},
-              [&](OpBuilder &builder, Location loc, Value j, ValueRange iterArgs) {
-                Value val = builder.create<memref::LoadOp>(loc, input, ValueRange{i, j});
-                Value result = builder.create<arith::MulFOp>(loc, val, scaleVal);
-                builder.create<memref::StoreOp>(loc, result, output, ValueRange{i, j});
-                builder.create<scf::YieldOp>(loc);
-              });
-          builder.create<scf::YieldOp>(loc);
-        });
+    SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
 
-    rewriter.eraseOp(op);
+    // Capture the scalar value for use in body builder
+    Value capturedScalar = scalarValue;
+
+    Value result = rewriter.create<linalg::GenericOp>(
+        loc,
+        resultType,
+        ValueRange{input},
+        ValueRange{emptyTensor},
+        indexingMaps,
+        iteratorTypes,
+        [capturedScalar](OpBuilder &b, Location loc, ValueRange args) {
+          Value product = b.create<arith::MulFOp>(loc, args[0], capturedScalar);
+          b.create<linalg::YieldOp>(loc, product);
+        }
+    ).getResult(0);
+
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
 
+
 //===----------------------------------------------------------------------===//
-// Chapter 13: GPT-specific Operations Lowering
+// EmbeddingOp Lowering (Chapter 13 - tensor-based)
 //===----------------------------------------------------------------------===//
 
 struct EmbeddingOpLowering : public OpRewritePattern<EmbeddingOp> {
@@ -614,48 +748,55 @@ struct EmbeddingOpLowering : public OpRewritePattern<EmbeddingOp> {
     Location loc = op.getLoc();
     Value indices = op.getIndices();
     Value table = op.getTable();
-    Value output = op.getOutput();
 
-    auto indicesType = cast<MemRefType>(indices.getType());
-    auto tableType = cast<MemRefType>(table.getType());
+    auto indicesType = mlir::cast<RankedTensorType>(indices.getType());
+    auto tableType = mlir::cast<RankedTensorType>(table.getType());
+    auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
 
-    int64_t seqLen = indicesType.getShape()[0];
-    int64_t dModel = tableType.getShape()[1];
+    SmallVector<Value> dynamicDims;
+    for (int i = 0; i < resultType.getRank(); ++i) {
+      if (resultType.isDynamicDim(i)) {
+        Value dim = rewriter.create<tensor::DimOp>(loc, i == 0 ? indices : table, i);
+        dynamicDims.push_back(dim);
+      }
+    }
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
 
-    Value seqLenVal = createConstantIndex(rewriter, loc, seqLen);
-    Value dModelVal = createConstantIndex(rewriter, loc, dModel);
-    Value zeroIdx = createConstantIndex(rewriter, loc, 0);
-    Value oneIdx = createConstantIndex(rewriter, loc, 1);
+    SmallVector<AffineMap> indexingMaps;
+    auto outputMap = AffineMap::getMultiDimIdentityMap(2, rewriter.getContext());
+    indexingMaps.push_back(outputMap);
 
-    // For each position in sequence
-    rewriter.create<scf::ForOp>(
-        loc, zeroIdx, seqLenVal, oneIdx, ValueRange{},
-        [&](OpBuilder &builder, Location loc, Value i, ValueRange iterArgs) {
-          // Load token ID (int32)
-          Value tokenId32 = builder.create<memref::LoadOp>(loc, indices, ValueRange{i});
+    SmallVector<utils::IteratorType> iteratorTypes(2, utils::IteratorType::parallel);
 
-          // Convert int32 token ID to index type
-          Value tokenIdx = builder.create<arith::IndexCastOp>(loc, builder.getIndexType(), tokenId32);
+    Value capturedIndices = indices;
+    Value capturedTable = table;
 
-          // Copy embedding vector from table to output
-          builder.create<scf::ForOp>(
-              loc, zeroIdx, dModelVal, oneIdx, ValueRange{},
-              [&](OpBuilder &builder, Location loc, Value j, ValueRange iterArgs) {
-                Value embVal = builder.create<memref::LoadOp>(loc, table, ValueRange{tokenIdx, j});
-                builder.create<memref::StoreOp>(loc, embVal, output, ValueRange{i, j});
-                builder.create<scf::YieldOp>(loc);
-              });
+    Value result = rewriter.create<linalg::GenericOp>(
+        loc,
+        resultType,
+        ValueRange{},
+        ValueRange{emptyTensor},
+        indexingMaps,
+        iteratorTypes,
+        [capturedIndices, capturedTable](OpBuilder &b, Location loc, ValueRange args) {
+          Value posIdx = b.create<linalg::IndexOp>(loc, 0);
+          Value dimIdx = b.create<linalg::IndexOp>(loc, 1);
+          
+          Value tokenId32 = b.create<tensor::ExtractOp>(loc, capturedIndices, ValueRange{posIdx});
+          Value tokenIdx = b.create<arith::IndexCastOp>(loc, b.getIndexType(), tokenId32);
+          
+          Value embVal = b.create<tensor::ExtractOp>(loc, capturedTable, ValueRange{tokenIdx, dimIdx});
+          b.create<linalg::YieldOp>(loc, embVal);
+        }
+    ).getResult(0);
 
-          builder.create<scf::YieldOp>(loc);
-        });
-
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
 
 //===----------------------------------------------------------------------===//
-// Create Causal Mask Lowering (Chapter 13)
+// CreateCausalMaskOp Lowering (Chapter 13 - tensor-based)
 //===----------------------------------------------------------------------===//
 
 struct CreateCausalMaskOpLowering : public OpRewritePattern<CreateCausalMaskOp> {
@@ -664,55 +805,49 @@ struct CreateCausalMaskOpLowering : public OpRewritePattern<CreateCausalMaskOp> 
   LogicalResult matchAndRewrite(CreateCausalMaskOp op,
                                  PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
-    Value output = op.getOutput();
+    
+    auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
 
-    // Get mask dimensions [seq_len, seq_len]
-    auto outputType = cast<MemRefType>(output.getType());
-    auto shape = outputType.getShape();
-
-    Value zeroIdx = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-    Value oneIdx = rewriter.create<arith::ConstantIndexOp>(loc, 1);
-
-    Value seqLenVal;
-    if (shape[0] == ShapedType::kDynamic) {
-      seqLenVal = rewriter.create<memref::DimOp>(loc, output, 0);
-    } else {
-      seqLenVal = rewriter.create<arith::ConstantIndexOp>(loc, shape[0]);
-    }
-
-    // Constants for mask values
-    Value zeroFloat = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getFloatAttr(rewriter.getF32Type(), llvm::APFloat(0.0f)));
+    Value zeroFloat = createConstantFloat(rewriter, loc, 0.0f);
     Value negInf = rewriter.create<arith::ConstantOp>(
         loc, rewriter.getFloatAttr(rewriter.getF32Type(),
             llvm::APFloat::getInf(llvm::APFloat::IEEEsingle(), /*Negative=*/true)));
 
-    // Generate mask: mask[i][j] = (j <= i) ? 0.0 : -inf
-    rewriter.create<scf::ForOp>(
-        loc, zeroIdx, seqLenVal, oneIdx, ValueRange{},
-        [&](OpBuilder &builder, Location loc, Value i, ValueRange iterArgs) {
-          builder.create<scf::ForOp>(
-              loc, zeroIdx, seqLenVal, oneIdx, ValueRange{},
-              [&](OpBuilder &builder, Location loc, Value j, ValueRange iterArgs) {
-                // Compare j <= i
-                Value cmp = builder.create<arith::CmpIOp>(
-                    loc, arith::CmpIPredicate::sle, j, i);
-                // Select: j <= i ? 0.0 : -inf
-                Value maskValue = builder.create<arith::SelectOp>(
-                    loc, cmp, zeroFloat, negInf);
-                builder.create<memref::StoreOp>(loc, maskValue, output, ValueRange{i, j});
-                builder.create<scf::YieldOp>(loc);
-              });
-          builder.create<scf::YieldOp>(loc);
-        });
+    SmallVector<Value> dynamicDims;
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
 
-    rewriter.eraseOp(op);
+    SmallVector<AffineMap> indexingMaps;
+    auto identityMap = AffineMap::getMultiDimIdentityMap(2, rewriter.getContext());
+    indexingMaps.push_back(identityMap);
+
+    SmallVector<utils::IteratorType> iteratorTypes(2, utils::IteratorType::parallel);
+
+    Value capturedZero = zeroFloat;
+    Value capturedNegInf = negInf;
+
+    Value result = rewriter.create<linalg::GenericOp>(
+        loc,
+        resultType,
+        ValueRange{},
+        ValueRange{emptyTensor},
+        indexingMaps,
+        iteratorTypes,
+        [capturedZero, capturedNegInf](OpBuilder &b, Location loc, ValueRange args) {
+          Value i = b.create<linalg::IndexOp>(loc, 0);
+          Value j = b.create<linalg::IndexOp>(loc, 1);
+          Value cmp = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sle, j, i);
+          Value maskValue = b.create<arith::SelectOp>(loc, cmp, capturedZero, capturedNegInf);
+          b.create<linalg::YieldOp>(loc, maskValue);
+        }
+    ).getResult(0);
+
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
 
 //===----------------------------------------------------------------------===//
-// Masked Softmax Lowering (Chapter 13)
+// MaskedSoftmaxOp Lowering (Chapter 13 - tensor-based)
 //===----------------------------------------------------------------------===//
 
 struct MaskedSoftmaxOpLowering : public OpRewritePattern<MaskedSoftmaxOp> {
@@ -723,131 +858,137 @@ struct MaskedSoftmaxOpLowering : public OpRewritePattern<MaskedSoftmaxOp> {
     Location loc = op.getLoc();
     Value input = op.getInput();
     Value mask = op.getMask();
-    Value output = op.getOutput();
 
-    // Get dimensions
-    auto inputType = cast<MemRefType>(input.getType());
-    auto shape = inputType.getShape();
-    size_t ndim = shape.size();
+    auto inputType = mlir::cast<RankedTensorType>(input.getType());
+    auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
+    int rank = inputType.getRank();
 
-    Value zeroIdx = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-    Value oneIdx = rewriter.create<arith::ConstantIndexOp>(loc, 1);
-
-    // Handle both 2D [seq_len, seq_len] and 3D [batch, seq_len, seq_len]
-    Value dim0Val, dim1Val, dim2Val;
-    bool is2D = (ndim == 2);
-
-    if (is2D) {
-      // 2D case: treat as batch=1, process [seq_len, seq_len]
-      dim0Val = oneIdx;  // batch size = 1
-      if (shape[0] == ShapedType::kDynamic) {
-        dim1Val = rewriter.create<memref::DimOp>(loc, input, 0);
-      } else {
-        dim1Val = rewriter.create<arith::ConstantIndexOp>(loc, shape[0]);
-      }
-      if (shape[1] == ShapedType::kDynamic) {
-        dim2Val = rewriter.create<memref::DimOp>(loc, input, 1);
-      } else {
-        dim2Val = rewriter.create<arith::ConstantIndexOp>(loc, shape[1]);
-      }
-    } else {
-      // 3D case
-      if (shape[0] == ShapedType::kDynamic) {
-        dim0Val = rewriter.create<memref::DimOp>(loc, input, 0);
-      } else {
-        dim0Val = rewriter.create<arith::ConstantIndexOp>(loc, shape[0]);
-      }
-      if (shape[1] == ShapedType::kDynamic) {
-        dim1Val = rewriter.create<memref::DimOp>(loc, input, 1);
-      } else {
-        dim1Val = rewriter.create<arith::ConstantIndexOp>(loc, shape[1]);
-      }
-      if (shape[2] == ShapedType::kDynamic) {
-        dim2Val = rewriter.create<memref::DimOp>(loc, input, 2);
-      } else {
-        dim2Val = rewriter.create<arith::ConstantIndexOp>(loc, shape[2]);
+    SmallVector<Value> dynamicDims;
+    for (int i = 0; i < rank; ++i) {
+      if (resultType.isDynamicDim(i)) {
+        Value dim = rewriter.create<tensor::DimOp>(loc, input, i);
+        dynamicDims.push_back(dim);
       }
     }
 
-    Value zero = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getFloatAttr(rewriter.getF32Type(), llvm::APFloat(0.0f)));
-    Value negInfInit = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getFloatAttr(rewriter.getF32Type(),
-            llvm::APFloat::getLargest(llvm::APFloat::IEEEsingle(), /*Negative=*/true)));
+    // Step 1: Add mask to input
+    SmallVector<AffineMap> addMaskMaps;
+    auto identityMap = AffineMap::getMultiDimIdentityMap(rank, rewriter.getContext());
+    SmallVector<AffineExpr> maskExprs;
+    for (int i = rank - 2; i < rank; i++) {
+      maskExprs.push_back(rewriter.getAffineDimExpr(i));
+    }
+    auto maskBroadcastMap = AffineMap::get(rank, 0, maskExprs, rewriter.getContext());
 
-    // For each position in batch and row
-    rewriter.create<scf::ForOp>(
-        loc, zeroIdx, dim0Val, oneIdx, ValueRange{},
-        [&, is2D](OpBuilder &builder, Location loc, Value i, ValueRange iterArgs) {
-          builder.create<scf::ForOp>(
-              loc, zeroIdx, dim1Val, oneIdx, ValueRange{},
-              [&, is2D](OpBuilder &builder, Location loc, Value j, ValueRange iterArgs) {
+    addMaskMaps.push_back(identityMap);
+    addMaskMaps.push_back(maskBroadcastMap);
+    addMaskMaps.push_back(identityMap);
 
-                // Step 1: Find max for numerical stability
-                Value maxVal = builder.create<scf::ForOp>(
-                    loc, zeroIdx, dim2Val, oneIdx, 
-                    ValueRange{negInfInit},
-                    [&, is2D](OpBuilder &builder, Location loc, Value k, ValueRange iterArgs) {
-                      Value currentMax = iterArgs[0];
-                      // Load input: 2D uses [j,k], 3D uses [i,j,k]
-                      Value logit = is2D 
-                          ? builder.create<memref::LoadOp>(loc, input, ValueRange{j, k})
-                          : builder.create<memref::LoadOp>(loc, input, ValueRange{i, j, k});
-                      Value maskVal = builder.create<memref::LoadOp>(loc, mask, ValueRange{j, k});
-                      Value maskedLogit = builder.create<arith::AddFOp>(loc, logit, maskVal);
-                      Value newMax = builder.create<arith::MaximumFOp>(loc, currentMax, maskedLogit);
-                      builder.create<scf::YieldOp>(loc, newMax);
-                    }).getResult(0);
+    SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
 
-                // Step 2: Compute exp sum
-                Value expSum = builder.create<scf::ForOp>(
-                    loc, zeroIdx, dim2Val, oneIdx, ValueRange{zero},
-                    [&, is2D](OpBuilder &builder, Location loc, Value k, ValueRange iterArgs) {
-                      Value currentSum = iterArgs[0];
-                      Value logit = is2D
-                          ? builder.create<memref::LoadOp>(loc, input, ValueRange{j, k})
-                          : builder.create<memref::LoadOp>(loc, input, ValueRange{i, j, k});
-                      Value maskVal = builder.create<memref::LoadOp>(loc, mask, ValueRange{j, k});
-                      Value maskedLogit = builder.create<arith::AddFOp>(loc, logit, maskVal);
-                      Value shifted = builder.create<arith::SubFOp>(loc, maskedLogit, maxVal);
-                      Value expVal = builder.create<math::ExpOp>(loc, shifted);
-                      Value newSum = builder.create<arith::AddFOp>(loc, currentSum, expVal);
-                      builder.create<scf::YieldOp>(loc, newSum);
-                    }).getResult(0);
+    Value emptyMasked = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
+    Value maskedInput = rewriter.create<linalg::GenericOp>(
+        loc,
+        resultType,
+        ValueRange{input, mask},
+        ValueRange{emptyMasked},
+        addMaskMaps,
+        iteratorTypes,
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          Value masked = b.create<arith::AddFOp>(loc, args[0], args[1]);
+          b.create<linalg::YieldOp>(loc, masked);
+        }
+    ).getResult(0);
 
-                // Step 3: Compute softmax
-                builder.create<scf::ForOp>(
-                    loc, zeroIdx, dim2Val, oneIdx, ValueRange{},
-                    [&, is2D](OpBuilder &builder, Location loc, Value k, ValueRange iterArgs) {
-                      Value logit = is2D
-                          ? builder.create<memref::LoadOp>(loc, input, ValueRange{j, k})
-                          : builder.create<memref::LoadOp>(loc, input, ValueRange{i, j, k});
-                      Value maskVal = builder.create<memref::LoadOp>(loc, mask, ValueRange{j, k});
-                      Value maskedLogit = builder.create<arith::AddFOp>(loc, logit, maskVal);
-                      Value shifted = builder.create<arith::SubFOp>(loc, maskedLogit, maxVal);
-                      Value expVal = builder.create<math::ExpOp>(loc, shifted);
-                      Value result = builder.create<arith::DivFOp>(loc, expVal, expSum);
-                      // Store output: 2D uses [j,k], 3D uses [i,j,k]
-                      if (is2D) {
-                        builder.create<memref::StoreOp>(loc, result, output, ValueRange{j, k});
-                      } else {
-                        builder.create<memref::StoreOp>(loc, result, output, ValueRange{i, j, k});
-                      }
-                      builder.create<scf::YieldOp>(loc);
-                    });
+    // Step 2-4: Apply standard softmax to masked input
+    ArrayRef<int64_t> shape = resultType.getShape();
+    SmallVector<int64_t> reducedShape(shape.begin(), shape.end() - 1);
+    SmallVector<Value> reducedDynamicDims;
+    for (int i = 0; i < rank - 1; ++i) {
+      if (resultType.isDynamicDim(i)) {
+        Value dim = rewriter.create<tensor::DimOp>(loc, maskedInput, i);
+        reducedDynamicDims.push_back(dim);
+      }
+    }
+    auto reducedType = RankedTensorType::get(reducedShape, rewriter.getF32Type());
 
-                builder.create<scf::YieldOp>(loc);
-              });
-          builder.create<scf::YieldOp>(loc);
-        });
+    Value negInf = createConstantFloat(rewriter, loc, -1e9f);
+    Value maxBufferEmpty = rewriter.create<tensor::EmptyOp>(loc, reducedType, reducedDynamicDims);
+    Value maxBuffer = rewriter.create<linalg::FillOp>(loc, negInf, maxBufferEmpty).getResult(0);
 
-    rewriter.eraseOp(op);
+    Value maxResult = rewriter.create<linalg::ReduceOp>(
+        loc,
+        ValueRange{maskedInput},
+        ValueRange{maxBuffer},
+        SmallVector<int64_t>{rank - 1},
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          Value newMax = b.create<arith::MaximumFOp>(loc, args[0], args[1]);
+          b.create<linalg::YieldOp>(loc, newMax);
+        }
+    ).getResult(0);
+
+    SmallVector<AffineExpr> reducedExprs;
+    for (int i = 0; i < rank - 1; i++) {
+      reducedExprs.push_back(rewriter.getAffineDimExpr(i));
+    }
+    auto broadcastMap = AffineMap::get(rank, 0, reducedExprs, rewriter.getContext());
+
+    SmallVector<AffineMap> expMaps;
+    expMaps.push_back(identityMap);
+    expMaps.push_back(broadcastMap);
+    expMaps.push_back(identityMap);
+
+    Value emptyExp = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
+    Value expResult = rewriter.create<linalg::GenericOp>(
+        loc,
+        resultType,
+        ValueRange{maskedInput, maxResult},
+        ValueRange{emptyExp},
+        expMaps,
+        iteratorTypes,
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          Value shifted = b.create<arith::SubFOp>(loc, args[0], args[1]);
+          Value expVal = b.create<math::ExpOp>(loc, shifted);
+          b.create<linalg::YieldOp>(loc, expVal);
+        }
+    ).getResult(0);
+
+    Value zero = createConstantFloat(rewriter, loc, 0.0f);
+    Value sumBufferEmpty = rewriter.create<tensor::EmptyOp>(loc, reducedType, reducedDynamicDims);
+    Value sumBuffer = rewriter.create<linalg::FillOp>(loc, zero, sumBufferEmpty).getResult(0);
+
+    Value sumResult = rewriter.create<linalg::ReduceOp>(
+        loc,
+        ValueRange{expResult},
+        ValueRange{sumBuffer},
+        SmallVector<int64_t>{rank - 1},
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          Value newSum = b.create<arith::AddFOp>(loc, args[0], args[1]);
+          b.create<linalg::YieldOp>(loc, newSum);
+        }
+    ).getResult(0);
+
+    Value emptyResult = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
+    Value result = rewriter.create<linalg::GenericOp>(
+        loc,
+        resultType,
+        ValueRange{expResult, sumResult},
+        ValueRange{emptyResult},
+        SmallVector<AffineMap>{identityMap, broadcastMap, identityMap},
+        iteratorTypes,
+        [](OpBuilder &b, Location loc, ValueRange args) {
+          Value normalized = b.create<arith::DivFOp>(loc, args[0], args[1]);
+          b.create<linalg::YieldOp>(loc, normalized);
+        }
+    ).getResult(0);
+
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
 
 //===----------------------------------------------------------------------===//
-// RoPE (Rotary Position Embeddings) Lowering (Chapter 13)
+// RoPEOp Lowering (Chapter 13 - tensor-based, simplified)
 //===----------------------------------------------------------------------===//
 
 struct RoPEOpLowering : public OpRewritePattern<RoPEOp> {
@@ -857,116 +998,108 @@ struct RoPEOpLowering : public OpRewritePattern<RoPEOp> {
                                  PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     Value input = op.getInput();
-    Value output = op.getOutput();
 
-    // Get dimensions
-    auto inputType = cast<MemRefType>(input.getType());
-    auto shape = inputType.getShape();
-    size_t ndim = shape.size();
+    auto inputType = mlir::cast<RankedTensorType>(input.getType());
+    auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
+    int rank = inputType.getRank();
 
-    Value zeroIdx = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-    Value oneIdx = rewriter.create<arith::ConstantIndexOp>(loc, 1);
-    Value twoIdx = rewriter.create<arith::ConstantIndexOp>(loc, 2);
+    ArrayRef<int64_t> shape = inputType.getShape();
+    int64_t dModel = shape[rank - 1];
 
-    // Get dimension values
-    Value seqLenVal, dModelVal;
-    if (ndim == 2) {
-      // Shape: [seq_len, d_model]
-      if (shape[0] == ShapedType::kDynamic) {
-        seqLenVal = rewriter.create<memref::DimOp>(loc, input, 0);
-      } else {
-        seqLenVal = rewriter.create<arith::ConstantIndexOp>(loc, shape[0]);
+    Value base = createConstantFloat(rewriter, loc, 10000.0f);
+    Value two = createConstantFloat(rewriter, loc, 2.0f);
+    Value dModelFloat = createConstantFloat(rewriter, loc, static_cast<float>(dModel));
+
+    SmallVector<Value> dynamicDims;
+    for (int i = 0; i < rank; ++i) {
+      if (resultType.isDynamicDim(i)) {
+        Value dim = rewriter.create<tensor::DimOp>(loc, input, i);
+        dynamicDims.push_back(dim);
       }
-      if (shape[1] == ShapedType::kDynamic) {
-        dModelVal = rewriter.create<memref::DimOp>(loc, input, 1);
-      } else {
-        dModelVal = rewriter.create<arith::ConstantIndexOp>(loc, shape[1]);
-      }
-    } else if (ndim == 3) {
-      // Shape: [batch, seq_len, d_model] - handle later if needed
-      return failure();
-    } else {
-      return failure();
     }
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
 
-    // Constants for RoPE computation
-    Value base = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getFloatAttr(rewriter.getF32Type(), llvm::APFloat(10000.0f)));
+    SmallVector<AffineMap> indexingMaps;
+    auto identityMap = AffineMap::getMultiDimIdentityMap(rank, rewriter.getContext());
+    indexingMaps.push_back(identityMap);
+    indexingMaps.push_back(identityMap);
 
-    // For each position and dimension pair
-    rewriter.create<scf::ForOp>(
-        loc, zeroIdx, seqLenVal, oneIdx, ValueRange{},
-        [&](OpBuilder &builder, Location loc, Value pos, ValueRange iterArgs) {
-          // pos is the position index (i) - convert index → i64 → f32
-          Value posI64 = builder.create<arith::IndexCastOp>(
-              loc, builder.getI64Type(), pos);
-          Value posFloat = builder.create<arith::SIToFPOp>(
-              loc, builder.getF32Type(), posI64);
+    SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
 
-          // Process dimension pairs: (0,1), (2,3), (4,5), ...
-          builder.create<scf::ForOp>(
-              loc, zeroIdx, dModelVal, twoIdx, ValueRange{},
-              [&](OpBuilder &builder, Location loc, Value dimIdx, ValueRange iterArgs) {
-                // dimIdx is 2j (even dimension index)
-                Value dimIdxPlus1 = builder.create<arith::AddIOp>(loc, dimIdx, oneIdx);
+    Value capturedBase = base;
+    Value capturedTwo = two;
+    Value capturedDModel = dModelFloat;
+    Value capturedInput = input;
 
-                // Compute θ = base^(-2j/d_model)
-                // First: 2j / d_model
-                Value dimIdxI64 = builder.create<arith::IndexCastOp>(
-                    loc, builder.getI64Type(), dimIdx);
-                Value dimIdxFloat = builder.create<arith::SIToFPOp>(
-                    loc, builder.getF32Type(), dimIdxI64);
-                Value dModelI64 = builder.create<arith::IndexCastOp>(
-                    loc, builder.getI64Type(), dModelVal);
-                Value dModelFloat = builder.create<arith::SIToFPOp>(
-                    loc, builder.getF32Type(), dModelI64);
-                Value ratio = builder.create<arith::DivFOp>(loc, dimIdxFloat, dModelFloat);
+    Value result = rewriter.create<linalg::GenericOp>(
+        loc,
+        resultType,
+        ValueRange{input},
+        ValueRange{emptyTensor},
+        indexingMaps,
+        iteratorTypes,
+        [capturedBase, capturedTwo, capturedDModel, capturedInput, rank](OpBuilder &b, Location loc, ValueRange args) {
+          Value x = args[0];
+          
+          Value posIdx = b.create<linalg::IndexOp>(loc, rank - 2);
+          Value dimIdx = b.create<linalg::IndexOp>(loc, rank - 1);
 
-                // Compute: base^(-ratio) = exp(-ratio * log(base))
-                Value logBase = builder.create<math::LogOp>(loc, base);
-                Value negRatio = builder.create<arith::NegFOp>(loc, ratio);
-                Value exponent = builder.create<arith::MulFOp>(loc, negRatio, logBase);
-                Value theta = builder.create<math::ExpOp>(loc, exponent);
+          Value posI64 = b.create<arith::IndexCastOp>(loc, b.getI64Type(), posIdx);
+          Value posFloat = b.create<arith::SIToFPOp>(loc, b.getF32Type(), posI64);
 
-                // Compute: angle = pos * theta
-                Value angle = builder.create<arith::MulFOp>(loc, posFloat, theta);
+          Value dimI64 = b.create<arith::IndexCastOp>(loc, b.getI64Type(), dimIdx);
+          
+          // Compute pair index j = dim / 2 (integer division)
+          Value two_i64 = b.create<arith::ConstantOp>(loc, b.getI64Type(), b.getI64IntegerAttr(2));
+          Value j_i64 = b.create<arith::DivSIOp>(loc, dimI64, two_i64);
+          Value j_float = b.create<arith::SIToFPOp>(loc, b.getF32Type(), j_i64);
+          
+          // Check if dimension is even
+          Value dimIdxMod2 = b.create<arith::RemSIOp>(loc, dimI64, two_i64);
+          Value zero_i64 = b.create<arith::ConstantOp>(loc, b.getI64Type(), b.getI64IntegerAttr(0));
+          Value isEven = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, dimIdxMod2, zero_i64);
 
-                // Compute: cos(angle), sin(angle)
-                Value cosAngle = builder.create<math::CosOp>(loc, angle);
-                Value sinAngle = builder.create<math::SinOp>(loc, angle);
+          // Compute theta_j = 10000^(-2j/d_model)
+          Value twoJ = b.create<arith::MulFOp>(loc, capturedTwo, j_float);
+          Value exponent = b.create<arith::DivFOp>(loc, twoJ, capturedDModel);
+          Value negExponent = b.create<arith::NegFOp>(loc, exponent);
+          Value theta = b.create<math::PowFOp>(loc, capturedBase, negExponent);
+          Value angle = b.create<arith::MulFOp>(loc, posFloat, theta);
 
-                // Load input values: x0 = input[pos, 2j], x1 = input[pos, 2j+1]
-                Value x0 = builder.create<memref::LoadOp>(loc, input, ValueRange{pos, dimIdx});
-                Value x1 = builder.create<memref::LoadOp>(loc, input, ValueRange{pos, dimIdxPlus1});
+          Value cosAngle = b.create<math::CosOp>(loc, angle);
+          Value sinAngle = b.create<math::SinOp>(loc, angle);
 
-                // Apply rotation:
-                // output[pos, 2j]   = x0 * cos(angle) - x1 * sin(angle)
-                // output[pos, 2j+1] = x0 * sin(angle) + x1 * cos(angle)
-                Value x0_cos = builder.create<arith::MulFOp>(loc, x0, cosAngle);
-                Value x1_sin = builder.create<arith::MulFOp>(loc, x1, sinAngle);
-                Value out0 = builder.create<arith::SubFOp>(loc, x0_cos, x1_sin);
+          Value one = b.create<arith::ConstantIndexOp>(loc, 1);
+          Value nextDim = b.create<arith::AddIOp>(loc, dimIdx, one);
+          Value prevDim = b.create<arith::SubIOp>(loc, dimIdx, one);
+          
+          Value pairDimIdx = b.create<arith::SelectOp>(loc, isEven, nextDim, prevDim);
 
-                Value x0_sin = builder.create<arith::MulFOp>(loc, x0, sinAngle);
-                Value x1_cos = builder.create<arith::MulFOp>(loc, x1, cosAngle);
-                Value out1 = builder.create<arith::AddFOp>(loc, x0_sin, x1_cos);
+          SmallVector<Value> pairIndices;
+          for (int i = 0; i < rank - 1; i++) {
+            pairIndices.push_back(b.create<linalg::IndexOp>(loc, i));
+          }
+          pairIndices.push_back(pairDimIdx);
+          Value xPair = b.create<tensor::ExtractOp>(loc, capturedInput, pairIndices);
 
-                // Store output values
-                builder.create<memref::StoreOp>(loc, out0, output, ValueRange{pos, dimIdx});
-                builder.create<memref::StoreOp>(loc, out1, output, ValueRange{pos, dimIdxPlus1});
+          Value xCos = b.create<arith::MulFOp>(loc, x, cosAngle);
+          Value xPairSin = b.create<arith::MulFOp>(loc, xPair, sinAngle);
+          
+          Value evenResult = b.create<arith::SubFOp>(loc, xCos, xPairSin);
+          Value oddResult = b.create<arith::AddFOp>(loc, xPairSin, xCos);
+          Value rotated = b.create<arith::SelectOp>(loc, isEven, evenResult, oddResult);
 
-                builder.create<scf::YieldOp>(loc);
-              });
+          b.create<linalg::YieldOp>(loc, rotated);
+        }
+    ).getResult(0);
 
-          builder.create<scf::YieldOp>(loc);
-        });
-
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
 
 //===----------------------------------------------------------------------===//
-// Lower Transformer to Standard Pass
+// Lower Transformer to Standard Pass (Chapter 13)
 //===----------------------------------------------------------------------===//
 
 namespace {
@@ -975,7 +1108,8 @@ struct LowerTransformerToStandardPass
 
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<arith::ArithDialect, scf::SCFDialect,
-                    memref::MemRefDialect, math::MathDialect>();
+                    memref::MemRefDialect, math::MathDialect,
+                    linalg::LinalgDialect, tensor::TensorDialect>();
   }
 
   void runOnOperation() override {

@@ -10,6 +10,16 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/Bufferization/Transforms/Bufferize.h"
+#include "mlir/Dialect/Bufferization/Transforms/OneShotAnalysis.h"
+#include "mlir/Dialect/Bufferization/Transforms/OneShotModuleBufferize.h"
+#include "mlir/Dialect/Bufferization/Transforms/Passes.h"
+#include "mlir/Dialect/Linalg/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Bufferization/Transforms/FuncBufferizableOpInterfaceImpl.h"
 #include "mlir/ExecutionEngine/ExecutionEngine.h"
 #include "mlir/ExecutionEngine/OptUtils.h"
 #include "mlir/IR/Builders.h"
@@ -21,6 +31,7 @@
 #include "mlir/Transforms/Passes.h"
 
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
+#include "mlir/Conversion/BufferizationToMemRef/BufferizationToMemRef.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h"
 #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
@@ -28,6 +39,7 @@
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
+#include "mlir/Conversion/TensorToLinalg/TensorToLinalgPass.h"
 #include "mlir/Dialect/Linalg/Passes.h"
 
 #include <llvm/Support/TargetSelect.h>
@@ -67,7 +79,8 @@ public:
     context_.loadDialect<transformer::TransformerDialect,
                          func::FuncDialect, arith::ArithDialect,
                          memref::MemRefDialect, scf::SCFDialect, math::MathDialect,
-                         linalg::LinalgDialect,
+                         linalg::LinalgDialect, tensor::TensorDialect,
+                         bufferization::BufferizationDialect,
                          LLVM::LLVMDialect>();
   }
 
@@ -75,14 +88,34 @@ public:
 
   bool lowerToLLVM(ModuleOp module) {
     PassManager pm(&context_);
+    
+    // Enable error reporting
+    pm.enableVerifier(true);
 
-    // Lower transformer dialect to standard dialects
+    // Lower transformer dialect to linalg (tensor-based)
     pm.addNestedPass<func::FuncOp>(createLowerTransformerToStandardPass());
+    
     pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
     pm.addNestedPass<func::FuncOp>(createCSEPass());
 
+    // Bufferization: tensor → memref
+    DialectRegistry registry;
+    arith::registerBufferizableOpInterfaceExternalModels(registry);
+    linalg::registerBufferizableOpInterfaceExternalModels(registry);
+    tensor::registerBufferizableOpInterfaceExternalModels(registry);
+    bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(registry);
+    context_.appendDialectRegistry(registry);
+
+    bufferization::OneShotBufferizePassOptions bufferizeOptions;
+    bufferizeOptions.bufferizeFunctionBoundaries = true;
+    pm.addPass(bufferization::createOneShotBufferizePass(bufferizeOptions));
+    pm.addPass(createConvertTensorToLinalgPass());
+    pm.addPass(bufferization::createBufferResultsToOutParamsPass());
+    pm.addPass(createConvertBufferizationToMemRefPass());
+
     // Lower linalg operations to loops
     pm.addNestedPass<func::FuncOp>(createConvertLinalgToLoopsPass());
+    pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
 
     // Lower to LLVM
     pm.addPass(createConvertMathToLLVMPass());
@@ -281,8 +314,9 @@ Tensor linear(const Tensor& input, py::array_t<float> weight, py::array_t<float>
   node->weight = weight;
   node->bias = bias;
   auto weight_info = weight.request();
-  // Ch13: weight is (in_features, out_features)
-  node->shape = {input.node->shape[0], weight_info.shape[1]};
+  // PyTorch format: weight is (out_features, in_features)
+  // Output shape: (seq_len, out_features) = (input.shape[0], weight.shape[0])
+  node->shape = {input.node->shape[0], weight_info.shape[0]};
   return Tensor(node);
 }
 
@@ -594,85 +628,79 @@ public:
 
     switch (node->type) {
       case OpType::Input: {
-        result = createAlloc(node->shape);
+        auto resultType = RankedTensorType::get(node->shape, builder.getF32Type());
+        result = builder.create<tensor::EmptyOp>(loc, resultType.getShape(), builder.getF32Type()).getResult();
         break;
       }
 
       case OpType::Add: {
         Value lhs = compileNode(node->inputs[0]);
         Value rhs = compileNode(node->inputs[1]);
-        Value output = createAlloc(node->shape);
-        builder.create<transformer::AddOp>(loc, lhs, rhs, output);
-        result = output;
+        auto resultType = RankedTensorType::get(node->shape, builder.getF32Type());
+        result = builder.create<transformer::AddOp>(loc, resultType, lhs, rhs).getResult();
         break;
       }
 
       case OpType::LayerNorm: {
         Value input = compileNode(node->inputs[0]);
-        Value output = createAlloc(node->shape);
         Value gamma = getParameter(node->gamma.request().ptr);
         Value beta = getParameter(node->beta.request().ptr);
-        builder.create<transformer::LayerNormOp>(loc, input, gamma, beta, output);
-        result = output;
+        auto resultType = RankedTensorType::get(node->shape, builder.getF32Type());
+        result = builder.create<transformer::LayerNormOp>(loc, resultType, input, gamma, beta).getResult();
         break;
       }
 
       case OpType::Linear: {
         Value input = compileNode(node->inputs[0]);
-        Value output = createAlloc(node->shape);
         Value weight = getParameter(node->weight.request().ptr);
         Value bias = getParameter(node->bias.request().ptr);
-        builder.create<transformer::LinearOp>(loc, input, weight, bias, output);
-        result = output;
+        auto resultType = RankedTensorType::get(node->shape, builder.getF32Type());
+        result = builder.create<transformer::LinearOp>(loc, resultType, input, weight, bias).getResult();
         break;
       }
 
       case OpType::Gelu: {
         Value input = compileNode(node->inputs[0]);
-        Value output = createAlloc(node->shape);
-        builder.create<transformer::GeluOp>(loc, input, output);
-        result = output;
+        auto resultType = RankedTensorType::get(node->shape, builder.getF32Type());
+        result = builder.create<transformer::GeluOp>(loc, resultType, input).getResult();
         break;
       }
 
       case OpType::Matmul: {
         Value lhs = compileNode(node->inputs[0]);
         Value rhs = compileNode(node->inputs[1]);
-        Value output = createAlloc(node->shape);
-        builder.create<transformer::MatmulOp>(loc, lhs, rhs, output);
-        result = output;
+        auto resultType = RankedTensorType::get(node->shape, builder.getF32Type());
+        result = builder.create<transformer::MatmulOp>(loc, resultType, lhs, rhs).getResult();
         break;
       }
 
       case OpType::Transpose: {
         Value input = compileNode(node->inputs[0]);
-        Value output = createAlloc(node->shape);
-        builder.create<transformer::TransposeOp>(loc, input, output);
-        result = output;
+        auto resultType = RankedTensorType::get(node->shape, builder.getF32Type());
+        result = builder.create<transformer::TransposeOp>(loc, resultType, input).getResult();
         break;
       }
 
       case OpType::Softmax: {
         Value input = compileNode(node->inputs[0]);
-        Value output = createAlloc(node->shape);
-        builder.create<transformer::SoftmaxOp>(loc, input, output);
-        result = output;
+        auto resultType = RankedTensorType::get(node->shape, builder.getF32Type());
+        result = builder.create<transformer::SoftmaxOp>(loc, resultType, input).getResult();
         break;
       }
 
       case OpType::Scale: {
         Value input = compileNode(node->inputs[0]);
-        Value output = createAlloc(node->shape);
 
-        // Create constant scale factor
-        Value scale = createAlloc({1});
+        // Create constant scale factor as tensor
+        auto scalarType = RankedTensorType::get({1}, builder.getF32Type());
+        Value scalarTensor = builder.create<tensor::EmptyOp>(loc, ArrayRef<int64_t>{1}, builder.getF32Type()).getResult();
         Value zeroIdx = builder.create<arith::ConstantIndexOp>(loc, 0);
         Value scaleConst = builder.create<arith::ConstantOp>(
             loc, builder.getFloatAttr(builder.getF32Type(), llvm::APFloat(node->scale_factor)));
-        builder.create<memref::StoreOp>(loc, scaleConst, scale, ValueRange{zeroIdx});
+        Value scaleTensor = builder.create<tensor::InsertOp>(loc, scaleConst, scalarTensor, ValueRange{zeroIdx}).getResult();
 
-        builder.create<transformer::ScaleOp>(loc, input, scale, output);
-        result = output;
+        auto resultType = RankedTensorType::get(node->shape, builder.getF32Type());
+        result = builder.create<transformer::ScaleOp>(loc, resultType, input, scaleTensor).getResult();
         break;
       }
 
@@ -681,17 +709,15 @@ public:
         // output: [seq_len, d_model] float
         Value indicesValue = getParameter(node->indices.request().ptr);
         Value tableValue = getParameter(node->table.request().ptr);
-        Value output = createAlloc(node->shape);
-        builder.create<transformer::EmbeddingOp>(loc, indicesValue, tableValue, output);
-        result = output;
+        auto resultType = RankedTensorType::get(node->shape, builder.getF32Type());
+        result = builder.create<transformer::EmbeddingOp>(loc, resultType, indicesValue, tableValue).getResult();
         break;
       }
 
       case OpType::CreateCausalMask: {
         // output: [seq_len, seq_len] causal mask
-        Value output = createAlloc(node->shape);
-        builder.create<transformer::CreateCausalMaskOp>(loc, output);
-        result = output;
+        auto resultType = RankedTensorType::get(node->shape, builder.getF32Type());
+        result = builder.create<transformer::CreateCausalMaskOp>(loc, resultType).getResult();
         break;
       }
 
@@ -700,9 +726,8 @@ public:
         // output: [batch, seq_len, seq_len]
         Value input = compileNode(node->inputs[0]);
         Value mask = compileNode(node->inputs[1]);
-        Value output = createAlloc(node->shape);
-        builder.create<transformer::MaskedSoftmaxOp>(loc, input, mask, output);
-        result = output;
+        auto resultType = RankedTensorType::get(node->shape, builder.getF32Type());
+        result = builder.create<transformer::MaskedSoftmaxOp>(loc, resultType, input, mask).getResult();
         break;
       }
 
@@ -710,9 +735,8 @@ public:
         // input: [seq_len, d_model]
         // output: [seq_len, d_model] with rotary position embeddings
         Value input = compileNode(node->inputs[0]);
-        Value output = createAlloc(node->shape);
-        builder.create<transformer::RoPEOp>(loc, input, output);
-        result = output;
+        auto resultType = RankedTensorType::get(node->shape, builder.getF32Type());
+        result = builder.create<transformer::RoPEOp>(loc, resultType, input).getResult();
         break;
       }
     }
@@ -804,11 +828,11 @@ py::array_t<float> forward(const Tensor& output) {
   auto module = ModuleOp::create(builder.getUnknownLoc());
   builder.setInsertionPointToEnd(module.getBody());
 
-  // Create function signature: (inputs..., int32_params..., float_params..., output) -> ()
+  // Create function signature: (tensor inputs..., tensor int32_params..., tensor float_params...) -> tensor output
   std::vector<Type> funcInputTypes;
   for (auto& inp : inputs) {
-    auto memrefType = MemRefType::get(inp->shape, builder.getF32Type());
-    funcInputTypes.emplace_back(memrefType);
+    auto tensorType = RankedTensorType::get(inp->shape, builder.getF32Type());
+    funcInputTypes.emplace_back(tensorType);
   }
   // Add int32 parameters (e.g., embedding indices)
   for (auto& param : int32_parameters) {
@@ -817,8 +841,8 @@ py::array_t<float> forward(const Tensor& output) {
     for (ssize_t i = 0; i < buf.ndim; i++) {
       shape.emplace_back(buf.shape[i]);
     }
-    auto memrefType = MemRefType::get(shape, builder.getI32Type());
-    funcInputTypes.emplace_back(memrefType);
+    auto tensorType = RankedTensorType::get(shape, builder.getI32Type());
+    funcInputTypes.emplace_back(tensorType);
   }
   // Add float parameters (gamma, beta, weight, bias, table)
   for (auto& param : parameters) {
@@ -827,13 +851,12 @@ py::array_t<float> forward(const Tensor& output) {
     for (ssize_t i = 0; i < buf.ndim; i++) {
       shape.emplace_back(buf.shape[i]);
     }
-    auto memrefType = MemRefType::get(shape, builder.getF32Type());
-    funcInputTypes.emplace_back(memrefType);
+    auto tensorType = RankedTensorType::get(shape, builder.getF32Type());
+    funcInputTypes.emplace_back(tensorType);
   }
-  auto outputType = MemRefType::get(output.node->shape, builder.getF32Type());
-  funcInputTypes.emplace_back(outputType); // Output as last argument
+  auto outputTensorType = RankedTensorType::get(output.node->shape, builder.getF32Type());
 
-  auto funcType = builder.getFunctionType(funcInputTypes, {});
+  auto funcType = builder.getFunctionType(funcInputTypes, {outputTensorType});
   auto func = func::FuncOp::create(builder.getUnknownLoc(), "compute", funcType);
   auto& entryBlock = *func.addEntryBlock();
   builder.setInsertionPointToStart(&entryBlock);
@@ -848,11 +871,9 @@ py::array_t<float> forward(const Tensor& output) {
 
   // Compile computation graph
   Value resultValue = irBuilder.compileNode(output.node);
-  Value outputArg = entryBlock.getArgument(inputs.size() + int32_parameters.size() + parameters.size());
 
-  // Copy result to output
-  builder.create<memref::CopyOp>(builder.getUnknownLoc(), resultValue, outputArg);
-  builder.create<func::ReturnOp>(builder.getUnknownLoc());
+  // Return the tensor result
+  builder.create<func::ReturnOp>(builder.getUnknownLoc(), resultValue);
 
   module.push_back(func);
 
