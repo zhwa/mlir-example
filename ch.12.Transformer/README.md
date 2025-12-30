@@ -29,11 +29,13 @@ python3 test_jit.py
 
 ### Design Decisions
 
-1. **Pure MLIR JIT Compilation**: Follows Chapter 9's pattern
-   - Tensor API → Computation Graph → MLIR IR → Native Code
-   - IRBuilder translates graph nodes to MLIR operations
-   - ExecutionEngine compiles MLIR to LLVM IR to machine code
-   - libffi handles calling convention for memref descriptors
+1. **Pure MLIR JIT Compilation with Tensor-First Architecture**: Follows Chapter 11's pattern
+   - Tensor API → Computation Graph → MLIR IR (tensor-based) → Bufferization → Native Code
+   - Operations use `AnyTensor` types and return results (functional style)
+   - Bufferization pipeline (OneShotBufferize → BufferResultsToOutParams → ConvertBufferizationToMemRef) converts tensors to memrefs for execution
+   - IRBuilder translates graph nodes to tensor-based MLIR operations
+   - ExecutionEngine compiles MLIR → LLVM IR → machine code
+   - libffi handles calling convention for final memref descriptors
 
 2. **Minimalist Approach**: Focused on core transformer functionality
    - No causal masking (Chapter 13)
@@ -41,9 +43,9 @@ python3 test_jit.py
    - No RoPE (Chapter 13)
    - Clean foundation for advanced features
 
-3. **Architecture** (606 lines total):
-   - TransformerCompiler: MLIR context, lowering pipeline, JIT compilation
-   - IRBuilder: Graph → MLIR IR translation
+3. **Architecture** (708 lines total):
+   - TransformerCompiler: MLIR context, bufferization + lowering pipeline, JIT compilation
+   - IRBuilder: Graph → Tensor-based MLIR IR translation
    - Tensor API: High-level Python interface with operator overloading
    - forward(): JIT entry point with topological graph traversal
 
@@ -53,10 +55,15 @@ python3 test_jit.py
 ### JIT Execution Flow
 1. **Graph Construction**: Tensor operations build computation graph (OpType::LayerNorm, etc.)
 2. **Topological Traversal**: Collect inputs and parameters (gamma, beta, weight, bias)
-3. **IR Generation**: IRBuilder translates graph nodes to MLIR operations
-4. **Function Signature**: `func.func @compute(inputs..., parameters..., output) -> ()`
-5. **JIT Compilation**: ExecutionEngine compiles MLIR → LLVM IR → Native code
-6. **libffi Call**: Proper memref descriptor marshalling (7 args per 2D memref)
+3. **IR Generation**: IRBuilder translates graph nodes to tensor-based MLIR operations
+4. **Function Signature**: `func.func @compute(tensor inputs..., tensor parameters...) -> tensor`
+5. **Bufferization Pipeline**: 
+   - OneShotBufferize: Convert tensors to bufferization dialect
+   - BufferResultsToOutParams: Transform return values to output parameters
+   - ConvertBufferizationToMemRef: Lower to memrefs
+   - Final signature: `func.func @compute(memref*, ..., memref* output) -> ()`
+6. **JIT Compilation**: ExecutionEngine compiles MLIR → LLVM IR → Native code
+7. **libffi Call**: Proper memref descriptor marshalling (7 args per 2D memref)
 
 ### Key Fixes
 - **Segfault Resolution**: Used libffi instead of `void(*)(void**)` casting

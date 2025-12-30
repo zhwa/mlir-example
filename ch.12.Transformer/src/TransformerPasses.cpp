@@ -7,6 +7,7 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Utils/StructuredOpsUtils.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
@@ -41,25 +42,32 @@ struct LayerNormOpLowering : public OpRewritePattern<LayerNormOp> {
     Value input = op.getInput();
     Value gamma = op.getGamma();
     Value beta = op.getBeta();
-    Value output = op.getOutput();
     float epsilon = 1e-5f;
 
-    auto inputType = cast<MemRefType>(input.getType());
-    ArrayRef<int64_t> shape = inputType.getShape();
+    // Get result type
+    auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
+    ArrayRef<int64_t> shape = resultType.getShape();
     int rank = shape.size();
 
-    // Create temporary buffers for mean and variance (reduce along last dim)
+    // Create reduced shape for mean and variance (reduce along last dim)
     SmallVector<int64_t> reducedShape(shape.begin(), shape.end() - 1);
-    auto reducedType = MemRefType::get(reducedShape, rewriter.getF32Type());
-    Value meanBuffer = rewriter.create<memref::AllocOp>(loc, reducedType);
-    Value varianceBuffer = rewriter.create<memref::AllocOp>(loc, reducedType);
+    SmallVector<Value> reducedDynamicDims;
+    for (int i = 0; i < rank - 1; ++i) {
+      if (resultType.isDynamicDim(i)) {
+        Value dim = rewriter.create<tensor::DimOp>(loc, input, i);
+        reducedDynamicDims.push_back(dim);
+      }
+    }
+    auto reducedType = RankedTensorType::get(reducedShape, rewriter.getF32Type());
 
     Value zero = createConstantFloat(rewriter, loc, 0.0f);
     Value epsilonVal = createConstantFloat(rewriter, loc, epsilon);
 
     // Step 1: Compute mean using linalg.reduce (sum along last dim)
-    rewriter.create<linalg::FillOp>(loc, zero, meanBuffer);
-    rewriter.create<linalg::ReduceOp>(
+    Value meanBufferEmpty = rewriter.create<tensor::EmptyOp>(loc, reducedType, reducedDynamicDims);
+    Value meanBuffer = rewriter.create<linalg::FillOp>(loc, zero, meanBufferEmpty).getResult(0);
+    
+    Value meanSum = rewriter.create<linalg::ReduceOp>(
         loc,
         ValueRange{input},
         ValueRange{meanBuffer},
@@ -68,32 +76,40 @@ struct LayerNormOpLowering : public OpRewritePattern<LayerNormOp> {
           Value sum = b.create<arith::AddFOp>(loc, args[0], args[1]);
           b.create<linalg::YieldOp>(loc, sum);
         }
-    );
+    ).getResult(0);
 
     // Divide by d_model to get mean
     Value dModel = createConstantFloat(rewriter, loc, static_cast<float>(shape[rank - 1]));
     SmallVector<AffineMap> meanNormalizeMaps;
     auto reducedIdentityMap = AffineMap::getMultiDimIdentityMap(rank - 1, rewriter.getContext());
-    meanNormalizeMaps.push_back(reducedIdentityMap);  // meanBuffer
-    meanNormalizeMaps.push_back(reducedIdentityMap);  // output (in-place)
+    meanNormalizeMaps.push_back(reducedIdentityMap);  // meanSum
+    meanNormalizeMaps.push_back(reducedIdentityMap);  // output
 
     SmallVector<utils::IteratorType> reducedIteratorTypes(rank - 1, utils::IteratorType::parallel);
 
-    rewriter.create<linalg::GenericOp>(
+    Value meanBufferEmptyNorm = rewriter.create<tensor::EmptyOp>(loc, reducedType, reducedDynamicDims);
+    Value meanResult = rewriter.create<linalg::GenericOp>(
         loc,
-        ValueRange{meanBuffer},
-        ValueRange{meanBuffer},  // in-place
+        reducedType,
+        ValueRange{meanSum},
+        ValueRange{meanBufferEmptyNorm},
         meanNormalizeMaps,
         reducedIteratorTypes,
         [dModel](OpBuilder &b, Location loc, ValueRange args) {
           Value normalized = b.create<arith::DivFOp>(loc, args[0], dModel);
           b.create<linalg::YieldOp>(loc, normalized);
         }
-    );
+    ).getResult(0);
 
     // Step 2: Compute variance: sum((input - mean)^2) / d_model
-    // Create temporary buffer for centered values
-    Value centeredBuffer = rewriter.create<memref::AllocOp>(loc, inputType);
+    // Extract dynamic dimensions for full tensors
+    SmallVector<Value> dynamicDims;
+    for (int i = 0; i < rank; ++i) {
+      if (resultType.isDynamicDim(i)) {
+        Value dim = rewriter.create<tensor::DimOp>(loc, input, i);
+        dynamicDims.push_back(dim);
+      }
+    }
 
     // Compute centered = input - mean (broadcast mean)
     SmallVector<AffineMap> centeringMaps;
@@ -105,26 +121,30 @@ struct LayerNormOpLowering : public OpRewritePattern<LayerNormOp> {
     auto broadcastMap = AffineMap::get(rank, 0, reducedExprs, rewriter.getContext());
 
     centeringMaps.push_back(identityMap);     // input
-    centeringMaps.push_back(broadcastMap);    // meanBuffer (broadcasted)
+    centeringMaps.push_back(broadcastMap);    // meanResult (broadcasted)
     centeringMaps.push_back(identityMap);     // centeredBuffer
 
     SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
 
-    rewriter.create<linalg::GenericOp>(
+    Value centeredBufferEmpty = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
+    Value centeredBuffer = rewriter.create<linalg::GenericOp>(
         loc,
-        ValueRange{input, meanBuffer},
-        ValueRange{centeredBuffer},
+        resultType,
+        ValueRange{input, meanResult},
+        ValueRange{centeredBufferEmpty},
         centeringMaps,
         iteratorTypes,
         [](OpBuilder &b, Location loc, ValueRange args) {
           Value centered = b.create<arith::SubFOp>(loc, args[0], args[1]);
           b.create<linalg::YieldOp>(loc, centered);
         }
-    );
+    ).getResult(0);
 
     // Compute variance: sum(centered^2) / d_model
-    rewriter.create<linalg::FillOp>(loc, zero, varianceBuffer);
-    rewriter.create<linalg::ReduceOp>(
+    Value varianceBufferEmpty = rewriter.create<tensor::EmptyOp>(loc, reducedType, reducedDynamicDims);
+    Value varianceBuffer = rewriter.create<linalg::FillOp>(loc, zero, varianceBufferEmpty).getResult(0);
+    
+    Value varianceSum = rewriter.create<linalg::ReduceOp>(
         loc,
         ValueRange{centeredBuffer},
         ValueRange{varianceBuffer},
@@ -134,13 +154,15 @@ struct LayerNormOpLowering : public OpRewritePattern<LayerNormOp> {
           Value sum = b.create<arith::AddFOp>(loc, squared, args[1]);
           b.create<linalg::YieldOp>(loc, sum);
         }
-    );
+    ).getResult(0);
 
     // Divide by d_model and compute rsqrt(variance + epsilon)
-    rewriter.create<linalg::GenericOp>(
+    Value invStdBufferEmpty = rewriter.create<tensor::EmptyOp>(loc, reducedType, reducedDynamicDims);
+    Value invStdResult = rewriter.create<linalg::GenericOp>(
         loc,
-        ValueRange{varianceBuffer},
-        ValueRange{varianceBuffer},  // in-place
+        reducedType,
+        ValueRange{varianceSum},
+        ValueRange{invStdBufferEmpty},
         meanNormalizeMaps,
         reducedIteratorTypes,
         [dModel, epsilonVal](OpBuilder &b, Location loc, ValueRange args) {
@@ -149,7 +171,7 @@ struct LayerNormOpLowering : public OpRewritePattern<LayerNormOp> {
           Value invStd = b.create<math::RsqrtOp>(loc, variancePlusEps);
           b.create<linalg::YieldOp>(loc, invStd);
         }
-    );
+    ).getResult(0);
 
     // Step 3: Normalize and apply scale/shift: output = ((input - mean) * invStd) * gamma + beta
     // Using centered values, multiply by invStd, then scale by gamma and shift by beta
@@ -160,32 +182,29 @@ struct LayerNormOpLowering : public OpRewritePattern<LayerNormOp> {
 
     SmallVector<AffineMap> normalizeMaps;
     normalizeMaps.push_back(identityMap);              // centeredBuffer
-    normalizeMaps.push_back(broadcastMap);             // varianceBuffer (invStd, broadcasted)
+    normalizeMaps.push_back(broadcastMap);             // invStdResult (broadcasted)
     normalizeMaps.push_back(gammaBetaBroadcastMap);    // gamma (broadcasted)
     normalizeMaps.push_back(gammaBetaBroadcastMap);    // beta (broadcasted)
     normalizeMaps.push_back(identityMap);              // output
 
-    rewriter.create<linalg::GenericOp>(
+    Value resultEmpty = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
+    Value result = rewriter.create<linalg::GenericOp>(
         loc,
-        ValueRange{centeredBuffer, varianceBuffer, gamma, beta},
-        ValueRange{output},
+        resultType,
+        ValueRange{centeredBuffer, invStdResult, gamma, beta},
+        ValueRange{resultEmpty},
         normalizeMaps,
         iteratorTypes,
         [](OpBuilder &b, Location loc, ValueRange args) {
           // args[0] = centered, args[1] = invStd, args[2] = gamma, args[3] = beta
           Value normalized = b.create<arith::MulFOp>(loc, args[0], args[1]);
           Value scaled = b.create<arith::MulFOp>(loc, normalized, args[2]);
-          Value result = b.create<arith::AddFOp>(loc, scaled, args[3]);
-          b.create<linalg::YieldOp>(loc, result);
+          Value finalResult = b.create<arith::AddFOp>(loc, scaled, args[3]);
+          b.create<linalg::YieldOp>(loc, finalResult);
         }
-    );
+    ).getResult(0);
 
-    // Clean up temporary buffers
-    rewriter.create<memref::DeallocOp>(loc, meanBuffer);
-    rewriter.create<memref::DeallocOp>(loc, varianceBuffer);
-    rewriter.create<memref::DeallocOp>(loc, centeredBuffer);
-
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
@@ -203,11 +222,11 @@ struct LinearOpLowering : public OpRewritePattern<LinearOp> {
     Value input = op.getInput();
     Value weight = op.getWeight();
     Value bias = op.getBias();
-    Value output = op.getOutput();
 
-    auto inputType = cast<MemRefType>(input.getType());
-    auto weightType = cast<MemRefType>(weight.getType());
-    auto outputType = cast<MemRefType>(output.getType());
+    // Get result type
+    auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
+    auto inputType = mlir::cast<RankedTensorType>(input.getType());
+    auto weightType = mlir::cast<RankedTensorType>(weight.getType());
 
     // Linear: output = input @ weight^T + bias
     // input: (seq_len, in_features), weight: (out_features, in_features)
@@ -217,28 +236,46 @@ struct LinearOpLowering : public OpRewritePattern<LinearOp> {
     int64_t inFeatures = inputType.getShape()[1];
     int64_t outFeatures = weightType.getShape()[0];
 
-    // Step 1: Transpose weight (out_features, in_features) -> (in_features, out_features)
+    // Extract dynamic dimensions for transposed weight
     SmallVector<int64_t> transposedWeightShape = {inFeatures, outFeatures};
-    auto transposedWeightType = MemRefType::get(transposedWeightShape, rewriter.getF32Type());
-    Value transposedWeight = rewriter.create<memref::AllocOp>(loc, transposedWeightType);
+    SmallVector<Value> transposedDynamicDims;
+    auto transposedWeightType = RankedTensorType::get(transposedWeightShape, rewriter.getF32Type());
+    for (int i = 0; i < 2; ++i) {
+      if (transposedWeightType.isDynamicDim(i)) {
+        Value dim = rewriter.create<tensor::DimOp>(loc, weight, i == 0 ? 1 : 0);
+        transposedDynamicDims.push_back(dim);
+      }
+    }
 
-    rewriter.create<linalg::TransposeOp>(
+    // Step 1: Transpose weight (out_features, in_features) -> (in_features, out_features)
+    Value transposedWeightEmpty = rewriter.create<tensor::EmptyOp>(loc, transposedWeightType, transposedDynamicDims);
+    Value transposedWeight = rewriter.create<linalg::TransposeOp>(
         loc,
         weight,
-        transposedWeight,
+        transposedWeightEmpty,
         SmallVector<int64_t>{1, 0}  // swap dimensions
-    );
+    ).getResult()[0];
+
+    // Extract dynamic dimensions for output
+    SmallVector<Value> dynamicDims;
+    for (int i = 0; i < resultType.getRank(); ++i) {
+      if (resultType.isDynamicDim(i)) {
+        Value dim = rewriter.create<tensor::DimOp>(loc, input, i);
+        dynamicDims.push_back(dim);
+      }
+    }
 
     // Step 2: Initialize output to zero and perform matmul
     Value zero = createConstantFloat(rewriter, loc, 0.0f);
-    rewriter.create<linalg::FillOp>(loc, zero, output);
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
+    Value filledTensor = rewriter.create<linalg::FillOp>(loc, zero, emptyTensor).getResult(0);
 
     // Matmul: (seq_len, in_features) @ (in_features, out_features) -> (seq_len, out_features)
-    rewriter.create<linalg::MatmulOp>(
+    Value matmulResult = rewriter.create<linalg::MatmulOp>(
         loc,
         ValueRange{input, transposedWeight},
-        ValueRange{output}
-    );
+        ValueRange{filledTensor}
+    ).getResult(0);
 
     // Step 3: Add bias using linalg.generic (broadcast bias across seq_len)
     int rank = 2;
@@ -250,34 +287,35 @@ struct LinearOpLowering : public OpRewritePattern<LinearOp> {
     biasExprs.push_back(rewriter.getAffineDimExpr(1));  // only use second dimension
     auto broadcastMap = AffineMap::get(rank, 0, biasExprs, rewriter.getContext());
 
-    indexingMaps.push_back(identityMap);     // output (read)
+    indexingMaps.push_back(identityMap);     // matmulResult
     indexingMaps.push_back(broadcastMap);    // bias (broadcasted)
-    indexingMaps.push_back(identityMap);     // output (write)
+    indexingMaps.push_back(identityMap);     // output
 
     SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
 
-    rewriter.create<linalg::GenericOp>(
+    Value resultEmpty = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
+    Value result = rewriter.create<linalg::GenericOp>(
         loc,
-        ValueRange{output, bias},
-        ValueRange{output},  // in-place
+        resultType,
+        ValueRange{matmulResult, bias},
+        ValueRange{resultEmpty},
         indexingMaps,
         iteratorTypes,
         [](OpBuilder &b, Location loc, ValueRange args) {
-          Value result = b.create<arith::AddFOp>(loc, args[0], args[1]);
-          b.create<linalg::YieldOp>(loc, result);
+          Value sum = b.create<arith::AddFOp>(loc, args[0], args[1]);
+          b.create<linalg::YieldOp>(loc, sum);
         }
-    );
+    ).getResult(0);
 
-    // Clean up
-    rewriter.create<memref::DeallocOp>(loc, transposedWeight);
-
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
 
 //===----------------------------------------------------------------------===//
 // GeluOp Lowering
+//===----------------------------------------------------------------------===//
+// GeluOp Lowering (Tensor-Based)
 //===----------------------------------------------------------------------===//
 
 struct GeluOpLowering : public OpRewritePattern<GeluOp> {
@@ -287,10 +325,10 @@ struct GeluOpLowering : public OpRewritePattern<GeluOp> {
                                  PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     Value input = op.getInput();
-    Value output = op.getOutput();
 
-    auto outputType = cast<MemRefType>(output.getType());
-    int rank = outputType.getRank();
+    // Get result type
+    auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
+    int rank = resultType.getRank();
 
     // GELU approximation constants: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
     Value c0_5 = createConstantFloat(rewriter, loc, 0.5f);
@@ -298,11 +336,20 @@ struct GeluOpLowering : public OpRewritePattern<GeluOp> {
     Value cSqrt2OverPi = createConstantFloat(rewriter, loc, 0.7978845608f); // sqrt(2/pi)
     Value c0_044715 = createConstantFloat(rewriter, loc, 0.044715f);
 
+    // Create empty output tensor
+    SmallVector<Value> dynamicDims;
+    for (int i = 0; i < rank; ++i) {
+      if (ShapedType::isDynamic(resultType.getShape()[i])) {
+        dynamicDims.push_back(rewriter.create<tensor::DimOp>(loc, input, i));
+      }
+    }
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
+
     // Use linalg.generic for element-wise GELU activation
     SmallVector<AffineMap> indexingMaps;
     auto identityMap = AffineMap::getMultiDimIdentityMap(rank, rewriter.getContext());
     indexingMaps.push_back(identityMap);  // input
-    indexingMaps.push_back(identityMap);  // output
+    indexingMaps.push_back(identityMap);  // result
 
     SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
 
@@ -312,13 +359,14 @@ struct GeluOpLowering : public OpRewritePattern<GeluOp> {
     Value capturedCSqrt2OverPi = cSqrt2OverPi;
     Value capturedC0_044715 = c0_044715;
 
-    rewriter.create<linalg::GenericOp>(
+    Value result = rewriter.create<linalg::GenericOp>(
         loc,
-        ValueRange{input},
-        ValueRange{output},
-        indexingMaps,
-        iteratorTypes,
-        [capturedC0_5, capturedC1, capturedCSqrt2OverPi, capturedC0_044715]
+        /*resultTensorTypes=*/resultType,
+        /*inputs=*/ValueRange{input},
+        /*outputs=*/ValueRange{emptyTensor},
+        /*indexingMaps=*/indexingMaps,
+        /*iteratorTypes=*/iteratorTypes,
+        /*bodyBuilder=*/[capturedC0_5, capturedC1, capturedCSqrt2OverPi, capturedC0_044715]
         (OpBuilder &b, Location loc, ValueRange args) {
           Value x = args[0];
 
@@ -343,19 +391,21 @@ struct GeluOpLowering : public OpRewritePattern<GeluOp> {
 
           // Compute 0.5 * x * (1 + tanh(...))
           Value halfX = b.create<arith::MulFOp>(loc, capturedC0_5, x);
-          Value result = b.create<arith::MulFOp>(loc, halfX, onePlusTanh);
+          Value geluResult = b.create<arith::MulFOp>(loc, halfX, onePlusTanh);
 
-          b.create<linalg::YieldOp>(loc, result);
+          b.create<linalg::YieldOp>(loc, geluResult);
         }
-    );
+    ).getResult(0);
 
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
 
 //===----------------------------------------------------------------------===//
 // AddOp Lowering
+//===----------------------------------------------------------------------===//
+// AddOp Lowering (Tensor-Based)
 //===----------------------------------------------------------------------===//
 
 struct AddOpLowering : public OpRewritePattern<AddOp> {
@@ -366,26 +416,36 @@ struct AddOpLowering : public OpRewritePattern<AddOp> {
     Location loc = op.getLoc();
     Value lhs = op.getLhs();
     Value rhs = op.getRhs();
-    Value output = op.getOutput();
 
-    auto outputType = cast<MemRefType>(output.getType());
-    int rank = outputType.getRank();
+    // Get result type
+    auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
+    int rank = resultType.getRank();
 
     // Create indexing maps: all identity (parallel element-wise operation)
     SmallVector<AffineMap> indexingMaps;
     auto identityMap = AffineMap::getMultiDimIdentityMap(rank, rewriter.getContext());
     indexingMaps.push_back(identityMap);  // lhs
     indexingMaps.push_back(identityMap);  // rhs
-    indexingMaps.push_back(identityMap);  // output
+    indexingMaps.push_back(identityMap);  // result
 
     // All dimensions are parallel (no reductions)
     SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
 
-    // Create linalg.generic operation
-    rewriter.create<linalg::GenericOp>(
+    // Create empty tensor for output
+    SmallVector<Value> dynamicDims;
+    for (int i = 0; i < rank; ++i) {
+      if (ShapedType::isDynamic(resultType.getShape()[i])) {
+        dynamicDims.push_back(rewriter.create<tensor::DimOp>(loc, lhs, i));
+      }
+    }
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
+
+    // Create linalg.generic operation returning tensor
+    Value result = rewriter.create<linalg::GenericOp>(
         loc,
+        /*resultTensorTypes=*/resultType,
         /*inputs=*/ValueRange{lhs, rhs},
-        /*outputs=*/ValueRange{output},
+        /*outputs=*/ValueRange{emptyTensor},
         /*indexingMaps=*/indexingMaps,
         /*iteratorTypes=*/iteratorTypes,
         /*bodyBuilder=*/[](OpBuilder &b, Location loc, ValueRange args) {
@@ -393,15 +453,15 @@ struct AddOpLowering : public OpRewritePattern<AddOp> {
           Value sum = b.create<arith::AddFOp>(loc, args[0], args[1]);
           b.create<linalg::YieldOp>(loc, sum);
         }
-    );
+    ).getResult(0);
 
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
 
 //===----------------------------------------------------------------------===//
-// MatmulOp Lowering
+// MatmulOp Lowering (Tensor-Based)
 //===----------------------------------------------------------------------===//
 
 struct MatmulOpLowering : public OpRewritePattern<MatmulOp> {
@@ -412,30 +472,37 @@ struct MatmulOpLowering : public OpRewritePattern<MatmulOp> {
     Location loc = op.getLoc();
     Value lhs = op.getLhs();
     Value rhs = op.getRhs();
-    Value output = op.getOutput();
 
-    auto outputType = cast<MemRefType>(output.getType());
+    // Get result type
+    auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
 
-    // Step 1: Initialize output to zero using linalg.fill
-    // linalg.matmul uses accumulation semantics (C += A @ B), so we need C = 0 first
+    // Create empty tensor for output
+    SmallVector<Value> dynamicDims;
+    for (int i = 0; i < resultType.getRank(); ++i) {
+      if (ShapedType::isDynamic(resultType.getShape()[i])) {
+        dynamicDims.push_back(rewriter.create<tensor::DimOp>(loc, lhs, i));
+      }
+    }
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
+
+    // Zero-initialize with linalg.fill (returns tensor)
     Value zero = createConstantFloat(rewriter, loc, 0.0f);
-    rewriter.create<linalg::FillOp>(loc, zero, output);
+    Value filledTensor = rewriter.create<linalg::FillOp>(loc, zero, emptyTensor).getResult(0);
 
-    // Step 2: Perform matrix multiplication using linalg.matmul
-    // For both 2D and 3D (batched), linalg.matmul handles it automatically
-    rewriter.create<linalg::MatmulOp>(
+    // Perform matrix multiplication (returns tensor)
+    Value result = rewriter.create<linalg::MatmulOp>(
         loc,
         ValueRange{lhs, rhs},  // inputs
-        ValueRange{output}     // output (accumulates into initialized buffer)
-    );
+        ValueRange{filledTensor}     // output tensor
+    ).getResult(0);
 
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
 
 //===----------------------------------------------------------------------===//
-// TransposeOp Lowering
+// TransposeOp Lowering (Tensor-Based)
 //===----------------------------------------------------------------------===//
 
 struct TransposeOpLowering : public OpRewritePattern<TransposeOp> {
@@ -445,9 +512,9 @@ struct TransposeOpLowering : public OpRewritePattern<TransposeOp> {
                                  PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     Value input = op.getInput();
-    Value output = op.getOutput();
 
-    auto inputType = cast<MemRefType>(input.getType());
+    auto inputType = mlir::cast<RankedTensorType>(input.getType());
+    auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
     int rank = inputType.getRank();
 
     // Create permutation: swap last two dimensions
@@ -460,15 +527,25 @@ struct TransposeOpLowering : public OpRewritePattern<TransposeOp> {
     permutation.push_back(rank - 1);  // Swap: last dimension first
     permutation.push_back(rank - 2);  // Swap: second-to-last dimension second
 
-    // Use linalg.transpose with the permutation
-    rewriter.create<linalg::TransposeOp>(
+    // Create empty output tensor with transposed shape
+    SmallVector<Value> dynamicDims;
+    for (int i = 0; i < rank; ++i) {
+      if (ShapedType::isDynamic(resultType.getShape()[i])) {
+        int64_t inputDim = permutation[i];
+        dynamicDims.push_back(rewriter.create<tensor::DimOp>(loc, input, inputDim));
+      }
+    }
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
+
+    // Use linalg.transpose (returns tensor)
+    Value result = rewriter.create<linalg::TransposeOp>(
         loc,
         input,
-        output,
+        emptyTensor,
         permutation
-    );
+    ).getResult()[0];
 
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
@@ -484,23 +561,38 @@ struct SoftmaxOpLowering : public OpRewritePattern<SoftmaxOp> {
                                  PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     Value input = op.getInput();
-    Value output = op.getOutput();
 
-    auto inputType = cast<MemRefType>(input.getType());
-    ArrayRef<int64_t> shape = inputType.getShape();
+    // Get result type
+    auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
+    ArrayRef<int64_t> shape = resultType.getShape();
     int rank = shape.size();
 
-    // Create temporary buffers for intermediate results
+    // Create reduced shape for max/sum buffers
     SmallVector<int64_t> reducedShape(shape.begin(), shape.end() - 1);
-    auto reducedType = MemRefType::get(reducedShape, rewriter.getF32Type());
-    Value maxBuffer = rewriter.create<memref::AllocOp>(loc, reducedType);
-    Value sumBuffer = rewriter.create<memref::AllocOp>(loc, reducedType);
+    SmallVector<Value> reducedDynamicDims;
+    for (int i = 0; i < rank - 1; ++i) {
+      if (resultType.isDynamicDim(i)) {
+        Value dim = rewriter.create<tensor::DimOp>(loc, input, i);
+        reducedDynamicDims.push_back(dim);
+      }
+    }
+    auto reducedType = RankedTensorType::get(reducedShape, rewriter.getF32Type());
+
+    // Extract dynamic dimensions for output tensor
+    SmallVector<Value> dynamicDims;
+    for (int i = 0; i < rank; ++i) {
+      if (resultType.isDynamicDim(i)) {
+        Value dim = rewriter.create<tensor::DimOp>(loc, input, i);
+        dynamicDims.push_back(dim);
+      }
+    }
 
     // Step 1: Find max along last dimension using linalg.reduce
     Value negInf = createConstantFloat(rewriter, loc, -1e9f);
-    rewriter.create<linalg::FillOp>(loc, negInf, maxBuffer);
+    Value maxBufferEmpty = rewriter.create<tensor::EmptyOp>(loc, reducedType, reducedDynamicDims);
+    Value maxBuffer = rewriter.create<linalg::FillOp>(loc, negInf, maxBufferEmpty).getResult(0);
 
-    rewriter.create<linalg::ReduceOp>(
+    Value maxResult = rewriter.create<linalg::ReduceOp>(
         loc,
         ValueRange{input},
         ValueRange{maxBuffer},
@@ -510,10 +602,9 @@ struct SoftmaxOpLowering : public OpRewritePattern<SoftmaxOp> {
           Value newMax = b.create<arith::MaximumFOp>(loc, args[0], args[1]);
           b.create<linalg::YieldOp>(loc, newMax);
         }
-    );
+    ).getResult(0);
 
     // Step 2: Compute exp(input - max) using linalg.generic
-    // This broadcasts max across the last dimension and computes exp
     SmallVector<AffineMap> indexingMaps;
     auto identityMap = AffineMap::getMultiDimIdentityMap(rank, rewriter.getContext());
     SmallVector<AffineExpr> reducedExprs;
@@ -523,15 +614,17 @@ struct SoftmaxOpLowering : public OpRewritePattern<SoftmaxOp> {
     auto broadcastMap = AffineMap::get(rank, 0, reducedExprs, rewriter.getContext());
 
     indexingMaps.push_back(identityMap);     // input
-    indexingMaps.push_back(broadcastMap);    // maxBuffer (broadcasted)
+    indexingMaps.push_back(broadcastMap);    // maxResult (broadcasted)
     indexingMaps.push_back(identityMap);     // output
 
     SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
 
-    rewriter.create<linalg::GenericOp>(
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
+    Value expResult = rewriter.create<linalg::GenericOp>(
         loc,
-        ValueRange{input, maxBuffer},
-        ValueRange{output},
+        resultType,
+        ValueRange{input, maxResult},
+        ValueRange{emptyTensor},
         indexingMaps,
         iteratorTypes,
         [](OpBuilder &b, Location loc, ValueRange args) {
@@ -540,15 +633,16 @@ struct SoftmaxOpLowering : public OpRewritePattern<SoftmaxOp> {
           Value expVal = b.create<math::ExpOp>(loc, shifted);
           b.create<linalg::YieldOp>(loc, expVal);
         }
-    );
+    ).getResult(0);
 
     // Step 3: Sum exp values along last dimension using linalg.reduce
     Value zero = createConstantFloat(rewriter, loc, 0.0f);
-    rewriter.create<linalg::FillOp>(loc, zero, sumBuffer);
+    Value sumBufferEmpty = rewriter.create<tensor::EmptyOp>(loc, reducedType, reducedDynamicDims);
+    Value sumBuffer = rewriter.create<linalg::FillOp>(loc, zero, sumBufferEmpty).getResult(0);
 
-    rewriter.create<linalg::ReduceOp>(
+    Value sumResult = rewriter.create<linalg::ReduceOp>(
         loc,
-        ValueRange{output},  // input is now the exp values
+        ValueRange{expResult},  // input is now the exp values
         ValueRange{sumBuffer},
         SmallVector<int64_t>{rank - 1},  // reduce along last dimension
         [](OpBuilder &b, Location loc, ValueRange args) {
@@ -556,13 +650,15 @@ struct SoftmaxOpLowering : public OpRewritePattern<SoftmaxOp> {
           Value newSum = b.create<arith::AddFOp>(loc, args[0], args[1]);
           b.create<linalg::YieldOp>(loc, newSum);
         }
-    );
+    ).getResult(0);
 
     // Step 4: Normalize by dividing exp values by sum using linalg.generic
-    rewriter.create<linalg::GenericOp>(
+    Value emptyResult = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
+    Value result = rewriter.create<linalg::GenericOp>(
         loc,
-        ValueRange{output, sumBuffer},  // exp values and sum
-        ValueRange{output},              // in-place normalization
+        resultType,
+        ValueRange{expResult, sumResult},  // exp values and sum
+        ValueRange{emptyResult},
         SmallVector<AffineMap>{identityMap, broadcastMap, identityMap},
         iteratorTypes,
         [](OpBuilder &b, Location loc, ValueRange args) {
@@ -570,13 +666,9 @@ struct SoftmaxOpLowering : public OpRewritePattern<SoftmaxOp> {
           Value normalized = b.create<arith::DivFOp>(loc, args[0], args[1]);
           b.create<linalg::YieldOp>(loc, normalized);
         }
-    );
+    ).getResult(0);
 
-    // Clean up temporary buffers
-    rewriter.create<memref::DeallocOp>(loc, maxBuffer);
-    rewriter.create<memref::DeallocOp>(loc, sumBuffer);
-
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
@@ -593,14 +685,26 @@ struct ScaleOpLowering : public OpRewritePattern<ScaleOp> {
     Location loc = op.getLoc();
     Value input = op.getInput();
     Value scale = op.getScale();
-    Value output = op.getOutput();
 
-    auto outputType = cast<MemRefType>(output.getType());
-    int rank = outputType.getRank();
+    // Get result type
+    auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
+    int rank = resultType.getRank();
 
-    // Load scalar scale value from 1D memref
+    // Extract dynamic dimensions
+    SmallVector<Value> dynamicDims;
+    for (int i = 0; i < rank; ++i) {
+      if (resultType.isDynamicDim(i)) {
+        Value dim = rewriter.create<tensor::DimOp>(loc, input, i);
+        dynamicDims.push_back(dim);
+      }
+    }
+
+    // Create empty tensor
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
+
+    // Load scalar scale value from 1D tensor
     Value zeroIdx = createConstantIndex(rewriter, loc, 0);
-    Value scalarValue = rewriter.create<memref::LoadOp>(loc, scale, ValueRange{zeroIdx});
+    Value scalarValue = rewriter.create<tensor::ExtractOp>(loc, scale, ValueRange{zeroIdx});
 
     // Use linalg.generic for element-wise multiplication
     SmallVector<AffineMap> indexingMaps;
@@ -613,19 +717,20 @@ struct ScaleOpLowering : public OpRewritePattern<ScaleOp> {
     // Capture the scalar value for use in body builder
     Value capturedScalar = scalarValue;
 
-    rewriter.create<linalg::GenericOp>(
+    Value result = rewriter.create<linalg::GenericOp>(
         loc,
+        resultType,
         ValueRange{input},
-        ValueRange{output},
+        ValueRange{emptyTensor},
         indexingMaps,
         iteratorTypes,
         [capturedScalar](OpBuilder &b, Location loc, ValueRange args) {
           Value product = b.create<arith::MulFOp>(loc, args[0], capturedScalar);
           b.create<linalg::YieldOp>(loc, product);
         }
-    );
+    ).getResult(0);
 
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };

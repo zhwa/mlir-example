@@ -28,26 +28,27 @@ def Transformer_LayerNormOp : Transformer_Op<"layer_norm"> {
     
     Example:
     ```mlir
-    transformer.layer_norm %input, %gamma, %beta, %output, %epsilon
-      : memref<?x?xf32>, memref<?xf32>, memref<?xf32>, memref<?x?xf32>, f32
+    %result = transformer.layer_norm %input, %gamma, %beta
+      : (tensor<?x?xf32>, tensor<?xf32>, tensor<?xf32>) -> tensor<?x?xf32>
     ```
     
     Input shape: [seq_len, d_model]
     Gamma/Beta shape: [d_model]
-    Output shape: [seq_len, d_model]
+    Result shape: [seq_len, d_model]
   }];
   
   let arguments = (ins 
-    AnyMemRef:$input,
-    AnyMemRef:$gamma,    // Scale parameter
-    AnyMemRef:$beta,     // Shift parameter
-    AnyMemRef:$output
-    // NOTE: epsilon removed - pass as runtime value to avoid BytecodeOpInterface issues
+    AnyTensor:$input,
+    AnyTensor:$gamma,    // Scale parameter
+    AnyTensor:$beta      // Shift parameter
+    // NOTE: epsilon handled as constant in lowering for numerical stability
   );
   
+  let results = (outs AnyTensor:$result);
+  
   let assemblyFormat = [{
-    $input `,` $gamma `,` $beta `,` $output
-    attr-dict `:` type($input) `,` type($gamma) `,` type($beta) `,` type($output)
+    $input `,` $gamma `,` $beta
+    attr-dict `:` `(` type($input) `,` type($gamma) `,` type($beta) `)` `->` type($result)
   }];
 }
 
@@ -62,26 +63,27 @@ def Transformer_LinearOp : Transformer_Op<"linear"> {
     
     Example:
     ```mlir
-    transformer.linear %input, %weight, %bias, %output
-      : memref<?x?xf32>, memref<?x?xf32>, memref<?xf32>, memref<?x?xf32>
+    %result = transformer.linear %input, %weight, %bias
+      : (tensor<?x?xf32>, tensor<?x?xf32>, tensor<?xf32>) -> tensor<?x?xf32>
     ```
     
     Input shape: [seq_len, in_features]
     Weight shape: [out_features, in_features]
     Bias shape: [out_features]
-    Output shape: [seq_len, out_features]
+    Result shape: [seq_len, out_features]
   }];
   
   let arguments = (ins 
-    AnyMemRef:$input,
-    AnyMemRef:$weight,
-    AnyMemRef:$bias,
-    AnyMemRef:$output
+    AnyTensor:$input,
+    AnyTensor:$weight,
+    AnyTensor:$bias
   );
   
+  let results = (outs AnyTensor:$result);
+  
   let assemblyFormat = [{
-    $input `,` $weight `,` $bias `,` $output
-    attr-dict `:` type($input) `,` type($weight) `,` type($bias) `,` type($output)
+    $input `,` $weight `,` $bias
+    attr-dict `:` `(` type($input) `,` type($weight) `,` type($bias) `)` `->` type($result)
   }];
 }
 
@@ -95,12 +97,13 @@ def Transformer_GeluOp : Transformer_Op<"gelu"> {
     
     Example:
     ```mlir
-    transformer.gelu %input, %output : memref<?x?xf32>, memref<?x?xf32>
+    %result = transformer.gelu %input : tensor<?x?xf32> -> tensor<?x?xf32>
     ```
   }];
   
-  let arguments = (ins AnyMemRef:$input, AnyMemRef:$output);
-  let assemblyFormat = "$input `,` $output attr-dict `:` type($input) `,` type($output)";
+  let arguments = (ins AnyTensor:$input);
+  let results = (outs AnyTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
 }
 
 //===----------------------------------------------------------------------===//
@@ -110,15 +113,16 @@ def Transformer_GeluOp : Transformer_Op<"gelu"> {
 def Transformer_MatmulOp : Transformer_Op<"matmul"> {
   let summary = "Matrix multiplication";
   let description = [{
-    Performs matrix multiplication: output = lhs @ rhs
+    Performs matrix multiplication: result = lhs @ rhs
     
     Supports 2D and 3D tensors (batched matmul).
     For 2D: (M, K) @ (K, N) -> (M, N)
     For 3D: (B, M, K) @ (B, K, N) -> (B, M, N)
   }];
   
-  let arguments = (ins AnyMemRef:$lhs, AnyMemRef:$rhs, AnyMemRef:$output);
-  let assemblyFormat = "$lhs `,` $rhs `,` $output attr-dict `:` type($lhs) `,` type($rhs) `,` type($output)";
+  let arguments = (ins AnyTensor:$lhs, AnyTensor:$rhs);
+  let results = (outs AnyTensor:$result);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` `(` type($lhs) `,` type($rhs) `)` `->` type($result)";
 }
 
 def Transformer_TransposeOp : Transformer_Op<"transpose"> {
@@ -131,12 +135,13 @@ def Transformer_TransposeOp : Transformer_Op<"transpose"> {
     
     Example:
     ```mlir
-    transformer.transpose %input, %output : memref<?x?xf32>, memref<?x?xf32>
+    %result = transformer.transpose %input : tensor<?x?xf32> -> tensor<?x?xf32>
     ```
   }];
   
-  let arguments = (ins AnyMemRef:$input, AnyMemRef:$output);
-  let assemblyFormat = "$input `,` $output attr-dict `:` type($input) `,` type($output)";
+  let arguments = (ins AnyTensor:$input);
+  let results = (outs AnyTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
 }
 
 def Transformer_SoftmaxOp : Transformer_Op<"softmax"> {
@@ -151,26 +156,27 @@ def Transformer_SoftmaxOp : Transformer_Op<"softmax"> {
     
     Example:
     ```mlir
-    transformer.softmax %input, %output : memref<?x?xf32>, memref<?x?xf32>
+    %result = transformer.softmax %input : tensor<?x?xf32> -> tensor<?x?xf32>
     ```
   }];
   
-  let arguments = (ins AnyMemRef:$input, AnyMemRef:$output);
-  let assemblyFormat = "$input `,` $output attr-dict `:` type($input) `,` type($output)";
+  let arguments = (ins AnyTensor:$input);
+  let results = (outs AnyTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
 }
 
 def Transformer_ScaleOp : Transformer_Op<"scale"> {
   let summary = "Scale tensor by constant";
   let description = [{
-    Multiplies all elements by a scalar: output = input * scale
+    Multiplies all elements by a scalar: result = input * scale
     
     Used for scaling attention scores by 1/sqrt(d_k).
-    
-    Note: scale passed as memref to avoid attribute/BytecodeOpInterface issues.
+    Scale can be a scalar tensor or broadcasted tensor.
   }];
   
-  let arguments = (ins AnyMemRef:$input, AnyMemRef:$scale, AnyMemRef:$output);
-  let assemblyFormat = "$input `,` $scale `,` $output attr-dict `:` type($input) `,` type($scale) `,` type($output)";
+  let arguments = (ins AnyTensor:$input, AnyTensor:$scale);
+  let results = (outs AnyTensor:$result);
+  let assemblyFormat = "$input `,` $scale attr-dict `:` `(` type($input) `,` type($scale) `)` `->` type($result)";
 }
 
 //===----------------------------------------------------------------------===//
@@ -180,17 +186,18 @@ def Transformer_ScaleOp : Transformer_Op<"scale"> {
 def Transformer_AddOp : Transformer_Op<"add"> {
   let summary = "Element-wise addition";
   let description = [{
-    Computes element-wise addition: output = lhs + rhs
+    Computes element-wise addition: result = lhs + rhs
     Used for residual connections in transformer blocks.
     
     Example:
     ```mlir
-    transformer.add %lhs, %rhs, %output : memref<?x?xf32>, memref<?x?xf32>, memref<?x?xf32>
+    %result = transformer.add %lhs, %rhs : (tensor<?x?xf32>, tensor<?x?xf32>) -> tensor<?x?xf32>
     ```
   }];
   
-  let arguments = (ins AnyMemRef:$lhs, AnyMemRef:$rhs, AnyMemRef:$output);
-  let assemblyFormat = "$lhs `,` $rhs `,` $output attr-dict `:` type($lhs) `,` type($rhs) `,` type($output)";
+  let arguments = (ins AnyTensor:$lhs, AnyTensor:$rhs);
+  let results = (outs AnyTensor:$result);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` `(` type($lhs) `,` type($rhs) `)` `->` type($result)";
 }
 
 #endif // TRANSFORMER_OPS

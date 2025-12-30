@@ -196,25 +196,28 @@ def Transformer_LayerNormOp : Transformer_Op<"layer_norm"> {
 
     For input shape [seq_len, d_model], computes seq_len independent normalizations.
     Epsilon (1e-5) is hardcoded in the lowering pattern for numerical stability.
+
+    Follows tensor-first architecture: operations use AnyTensor types and return results.
   }];
 
   let arguments = (ins
-    AnyMemRef:$input,
-    AnyMemRef:$gamma,  // [d_model]
-    AnyMemRef:$beta,   // [d_model]
-    AnyMemRef:$output  // [seq_len, d_model] - out-parameter
+    AnyTensor:$input,
+    AnyTensor:$gamma,  // [d_model]
+    AnyTensor:$beta    // [d_model]
   );
 
+  let results = (outs AnyTensor:$result);
+
   let assemblyFormat = [{
-    $input `,` $gamma `,` $beta `,` $output attr-dict `:` 
-    type($input) `,` type($gamma) `,` type($beta) `,` type($output)
+    $input `,` $gamma `,` $beta attr-dict `:` 
+    type($input) `,` type($gamma) `,` type($beta) `->` type($result)
   }];
 }
 ```
 
-The operation takes input tensor, gamma/beta parameters, and epsilon attribute. It returns normalized output with the same shape as input.
+The operation takes input tensor, gamma/beta parameters, and returns normalized output with the same shape as input. This follows Chapter 11's tensor-first architecture pattern.
 
-**Lowering to Linalg**. Layer normalization lowers to a sequence of Linalg operations combining reductions and element-wise computations. Following Chapter 11's pattern, we leverage `linalg.reduce` for computing statistics and `linalg.generic` for element-wise transformations:
+**Lowering to Linalg**. Layer normalization lowers to a sequence of tensor-based Linalg operations combining reductions and element-wise computations. Following Chapter 11's tensor-first pattern, we use `tensor::EmptyOp` for outputs, linalg ops that return tensors, and `replaceOp` instead of `eraseOp`:
 
 ```cpp
 // src/TransformerPasses.cpp
@@ -228,21 +231,30 @@ struct LayerNormOpLowering : public OpRewritePattern<LayerNormOp> {
     Value beta = op.getBeta();
     float epsilon = 1e-5f;
 
-    auto inputType = cast<MemRefType>(input.getType());
-    ArrayRef<int64_t> shape = inputType.getShape();  // [seq_len, d_model]
+    // Get result type
+    auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
+    ArrayRef<int64_t> shape = resultType.getShape();  // [seq_len, d_model]
     int rank = shape.size();
 
-    // Create temporary buffers for mean and variance (reduced shape)
+    // Create reduced shape for mean and variance
     SmallVector<int64_t> reducedShape(shape.begin(), shape.end() - 1);
-    auto reducedType = MemRefType::get(reducedShape, rewriter.getF32Type());
-    Value meanBuffer = rewriter.create<memref::AllocOp>(loc, reducedType);
-    Value varianceBuffer = rewriter.create<memref::AllocOp>(loc, reducedType);
+    auto reducedType = RankedTensorType::get(reducedShape, rewriter.getF32Type());
+
+    // Extract dynamic dimensions
+    SmallVector<Value> reducedDynamicDims;
+    for (int i = 0; i < rank - 1; ++i) {
+      if (resultType.isDynamicDim(i)) {
+        Value dim = rewriter.create<tensor::DimOp>(loc, input, i);
+        reducedDynamicDims.push_back(dim);
+      }
+    }
 
     // Step 1: Compute mean using linalg.reduce along last dimension
     Value zero = createConstantFloat(rewriter, loc, 0.0f);
-    rewriter.create<linalg::FillOp>(loc, zero, meanBuffer);
+    Value meanBufferEmpty = rewriter.create<tensor::EmptyOp>(loc, reducedType, reducedDynamicDims);
+    Value meanBuffer = rewriter.create<linalg::FillOp>(loc, zero, meanBufferEmpty).getResult(0);
 
-    rewriter.create<linalg::ReduceOp>(
+    Value meanSum = rewriter.create<linalg::ReduceOp>(
         loc,
         ValueRange{input},
         ValueRange{meanBuffer},
@@ -251,45 +263,51 @@ struct LayerNormOpLowering : public OpRewritePattern<LayerNormOp> {
           Value sum = b.create<arith::AddFOp>(loc, args[0], args[1]);
           b.create<linalg::YieldOp>(loc, sum);
         }
-    );
+    ).getResult(0);
 
     // Normalize mean: divide by d_model
     Value dModel = createConstantFloat(rewriter, loc, static_cast<float>(shape[rank - 1]));
-    rewriter.create<linalg::GenericOp>(
+    Value meanResult = rewriter.create<linalg::GenericOp>(
         loc,
-        ValueRange{meanBuffer},
-        ValueRange{meanBuffer},  // in-place division
-        SmallVector<AffineMap>{reducedIdentityMap, reducedIdentityMap},
+        reducedType,
+        ValueRange{meanSum},
+        ValueRange{meanBufferEmpty},
+        meanNormalizeMaps,
         reducedIteratorTypes,
         [dModel](OpBuilder &b, Location loc, ValueRange args) {
           Value normalized = b.create<arith::DivFOp>(loc, args[0], dModel);
           b.create<linalg::YieldOp>(loc, normalized);
         }
-    );
+    ).getResult(0);
 
     // Step 2: Compute centered values (input - mean) with broadcasting
-    Value centeredBuffer = rewriter.create<memref::AllocOp>(loc, inputType);
+    SmallVector<Value> dynamicDims;
+    for (int i = 0; i < rank; ++i) {
+      if (resultType.isDynamicDim(i)) {
+        Value dim = rewriter.create<tensor::DimOp>(loc, input, i);
+        dynamicDims.push_back(dim);
+      }
+    }
 
-    // Broadcasting affine map: mean has shape [seq_len], broadcast to [seq_len, d_model]
-    auto broadcastMap = AffineMap::get(rank, 0, 
-        {rewriter.getAffineDimExpr(0), /* omit last dim */}, 
-        rewriter.getContext());
-
-    rewriter.create<linalg::GenericOp>(
+    Value centeredBufferEmpty = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
+    Value centeredBuffer = rewriter.create<linalg::GenericOp>(
         loc,
-        ValueRange{input, meanBuffer},
-        ValueRange{centeredBuffer},
-        SmallVector<AffineMap>{identityMap, broadcastMap, identityMap},
+        resultType,
+        ValueRange{input, meanResult},
+        ValueRange{centeredBufferEmpty},
+        centeringMaps,  // Broadcasting affine map
         iteratorTypes,
         [](OpBuilder &b, Location loc, ValueRange args) {
           Value centered = b.create<arith::SubFOp>(loc, args[0], args[1]);
           b.create<linalg::YieldOp>(loc, centered);
         }
-    );
+    ).getResult(0);
 
     // Step 3: Compute variance = sum(centered^2) / d_model
-    rewriter.create<linalg::FillOp>(loc, zero, varianceBuffer);
-    rewriter.create<linalg::ReduceOp>(
+    Value varianceBufferEmpty = rewriter.create<tensor::EmptyOp>(loc, reducedType, reducedDynamicDims);
+    Value varianceBuffer = rewriter.create<linalg::FillOp>(loc, zero, varianceBufferEmpty).getResult(0);
+
+    Value varianceSum = rewriter.create<linalg::ReduceOp>(
         loc,
         ValueRange{centeredBuffer},
         ValueRange{varianceBuffer},
@@ -299,15 +317,16 @@ struct LayerNormOpLowering : public OpRewritePattern<LayerNormOp> {
           Value sum = b.create<arith::AddFOp>(loc, squared, args[1]);
           b.create<linalg::YieldOp>(loc, sum);
         }
-    );
+    ).getResult(0);
 
     // Compute invStd = rsqrt(variance/d_model + epsilon)
     Value epsilonVal = createConstantFloat(rewriter, loc, epsilon);
-    rewriter.create<linalg::GenericOp>(
+    Value invStdResult = rewriter.create<linalg::GenericOp>(
         loc,
-        ValueRange{varianceBuffer},
-        ValueRange{varianceBuffer},  // in-place
-        SmallVector<AffineMap>{reducedIdentityMap, reducedIdentityMap},
+        reducedType,
+        ValueRange{varianceSum},
+        ValueRange{invStdBufferEmpty},
+        meanNormalizeMaps,
         reducedIteratorTypes,
         [dModel, epsilonVal](OpBuilder &b, Location loc, ValueRange args) {
           Value variance = b.create<arith::DivFOp>(loc, args[0], dModel);
@@ -315,41 +334,33 @@ struct LayerNormOpLowering : public OpRewritePattern<LayerNormOp> {
           Value invStd = b.create<math::RsqrtOp>(loc, variancePlusEps);
           b.create<linalg::YieldOp>(loc, invStd);
         }
-    );
+    ).getResult(0);
 
-    // Step 4: Normalize and apply scale/shift: output = ((input - mean) * invStd) * gamma + beta
-    // Broadcasting maps: invStd [seq_len], gamma/beta [d_model]
-    auto gammaBetaBroadcastMap = AffineMap::get(rank, 0,
-        {rewriter.getAffineDimExpr(rank - 1)},  // only last dimension
-        rewriter.getContext());
-
-    rewriter.create<linalg::GenericOp>(
+    // Step 4: Normalize and apply scale/shift
+    Value resultEmpty = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
+    Value result = rewriter.create<linalg::GenericOp>(
         loc,
-        ValueRange{centeredBuffer, varianceBuffer, gamma, beta},
-        ValueRange{output},
-        SmallVector<AffineMap>{identityMap, broadcastMap, gammaBetaBroadcastMap, gammaBetaBroadcastMap, identityMap},
+        resultType,
+        ValueRange{centeredBuffer, invStdResult, gamma, beta},
+        ValueRange{resultEmpty},
+        normalizeMaps,  // Broadcasting maps for invStd, gamma, beta
         iteratorTypes,
         [](OpBuilder &b, Location loc, ValueRange args) {
           // args[0]=centered, args[1]=invStd, args[2]=gamma, args[3]=beta
           Value normalized = b.create<arith::MulFOp>(loc, args[0], args[1]);
           Value scaled = b.create<arith::MulFOp>(loc, normalized, args[2]);
-          Value result = b.create<arith::AddFOp>(loc, scaled, args[3]);
-          b.create<linalg::YieldOp>(loc, result);
+          Value finalResult = b.create<arith::AddFOp>(loc, scaled, args[3]);
+          b.create<linalg::YieldOp>(loc, finalResult);
         }
-    );
+    ).getResult(0);
 
-    // Clean up temporary buffers
-    rewriter.create<memref::DeallocOp>(loc, meanBuffer);
-    rewriter.create<memref::DeallocOp>(loc, varianceBuffer);
-    rewriter.create<memref::DeallocOp>(loc, centeredBuffer);
-
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
 ```
 
-This lowering demonstrates **structured reduction patterns** that MLIR's optimization passes can exploit:
+This lowering demonstrates **tensor-first structured reduction patterns** that enable MLIR's optimization and bufferization:
 
 1. **Two-stage reductions**: First `linalg.reduce` computes sums, then `linalg.generic` normalizes—this enables fusion opportunities
 2. **Broadcast semantics**: Affine maps explicitly encode how 1D statistics (mean, variance) broadcast across 2D tensors—no manual index arithmetic
@@ -443,17 +454,18 @@ This approximation, proposed in the original GELU paper, provides excellent accu
 def Transformer_LinearOp : Transformer_Op<"linear"> {
   let summary = "Linear transformation with bias";
   let description = [{ Computes: output = input @ weight^T + bias }];
-  let arguments = (ins AnyMemRef:$input, AnyMemRef:$weight, 
-                       AnyMemRef:$bias, AnyMemRef:$output);
+  let arguments = (ins AnyTensor:$input, AnyTensor:$weight, AnyTensor:$bias);
+  let results = (outs AnyTensor:$result);
 }
 
 def Transformer_GeluOp : Transformer_Op<"gelu"> {
   let summary = "Gaussian Error Linear Unit activation";
-  let arguments = (ins AnyMemRef:$input, AnyMemRef:$output);
+  let arguments = (ins AnyTensor:$input);
+  let results = (outs AnyTensor:$result);
 }
 ```
 
-The Python API provides a composite `ffn()` function:
+The Python API provides a composite `ffn()` function that works with the tensor-based operations:
 
 ```python
 # Python API (bindings.cpp)
@@ -467,7 +479,7 @@ def ffn(input, w1, b1, w2, b2):
 
 This compositional design enables operation reuse—`LinearOp` is used in both FFN layers and in attention projections.
 
-**Lowering to Linalg**. Each primitive operation lowers independently. The `LinearOp` that encapsulates `input @ weight^T + bias` lowers to Linalg operations. The complete FFN lowering chain demonstrates MLIR's compositional design:
+**Lowering to Linalg**. Each primitive operation lowers independently using the tensor-first pattern. The `LinearOp` that encapsulates `input @ weight^T + bias` lowers to tensor-based Linalg operations:
 
 ```cpp
 // src/TransformerPasses.cpp
@@ -476,33 +488,35 @@ struct LinearOpLowering : public OpRewritePattern<LinearOp> {
 
   LogicalResult matchAndRewrite(LinearOp op, PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
-    Value input = op.getInput();   // [seq_len, in_features] - memref
-    Value weight = op.getWeight(); // [out_features, in_features] - memref
-    Value bias = op.getBias();     // [out_features] - memref
-    Value output = op.getOutput(); // [seq_len, out_features] - memref (out-parameter)
+    Value input = op.getInput();   // [seq_len, in_features] - tensor
+    Value weight = op.getWeight(); // [out_features, in_features] - tensor
+    Value bias = op.getBias();     // [out_features] - tensor
+
+    // Get result type
+    auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
 
     // Step 1: Transpose weight for matmul compatibility
     // Need (in_features, out_features) for input @ weight
     SmallVector<int64_t> transposedShape = {inFeatures, outFeatures};
-    auto transposedType = MemRefType::get(transposedShape, rewriter.getF32Type());
-    Value transposedWeight = rewriter.create<memref::AllocOp>(loc, transposedType);
-
-    rewriter.create<linalg::TransposeOp>(
+    auto transposedType = RankedTensorType::get(transposedShape, rewriter.getF32Type());
+    Value transposedWeightEmpty = rewriter.create<tensor::EmptyOp>(loc, transposedType, transposedDynamicDims);
+    Value transposedWeight = rewriter.create<linalg::TransposeOp>(
         loc,
         weight,
-        transposedWeight,
+        transposedWeightEmpty,
         SmallVector<int64_t>{1, 0}  // swap dimensions
-    );
+    ).getResult()[0];
 
     // Step 2: Perform matmul with zero initialization
     Value zero = createConstantFloat(rewriter, loc, 0.0f);
-    rewriter.create<linalg::FillOp>(loc, zero, output);
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
+    Value filledTensor = rewriter.create<linalg::FillOp>(loc, zero, emptyTensor).getResult(0);
 
-    rewriter.create<linalg::MatmulOp>(
+    Value matmulResult = rewriter.create<linalg::MatmulOp>(
         loc,
         ValueRange{input, transposedWeight},
-        ValueRange{output}  // accumulates: output += input @ weight^T
-    );
+        ValueRange{filledTensor}
+    ).getResult(0);
 
     // Step 3: Add bias with broadcasting (bias broadcasts across seq_len)
     auto identityMap = AffineMap::getMultiDimIdentityMap(2, rewriter.getContext());
@@ -510,20 +524,21 @@ struct LinearOpLowering : public OpRewritePattern<LinearOp> {
         {rewriter.getAffineDimExpr(1)},  // only second dimension
         rewriter.getContext());
 
-    rewriter.create<linalg::GenericOp>(
+    Value resultEmpty = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
+    Value result = rewriter.create<linalg::GenericOp>(
         loc,
-        ValueRange{output, bias},
-        ValueRange{output},  // in-place addition
+        resultType,
+        ValueRange{matmulResult, bias},
+        ValueRange{resultEmpty},
         SmallVector<AffineMap>{identityMap, biasBroadcastMap, identityMap},
         SmallVector<utils::IteratorType>(2, utils::IteratorType::parallel),
         [](OpBuilder &b, Location loc, ValueRange args) {
-          Value result = b.create<arith::AddFOp>(loc, args[0], args[1]);
-          b.create<linalg::YieldOp>(loc, result);
+          Value sum = b.create<arith::AddFOp>(loc, args[0], args[1]);
+          b.create<linalg::YieldOp>(loc, sum);
         }
-    );
+    ).getResult(0);
 
-    rewriter.create<memref::DeallocOp>(loc, transposedWeight);
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
@@ -534,10 +549,10 @@ struct GeluOpLowering : public OpRewritePattern<GeluOp> {
   LogicalResult matchAndRewrite(GeluOp op, PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     Value input = op.getInput();
-    Value output = op.getOutput();
 
-    auto outputType = cast<MemRefType>(output.getType());
-    int rank = outputType.getRank();
+    // Get result type
+    auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
+    int rank = resultType.getRank();
 
     // GELU approximation constants
     Value c0_5 = createConstantFloat(rewriter, loc, 0.5f);
@@ -545,13 +560,24 @@ struct GeluOpLowering : public OpRewritePattern<GeluOp> {
     Value cSqrt2OverPi = createConstantFloat(rewriter, loc, 0.7978845608f);
     Value c0_044715 = createConstantFloat(rewriter, loc, 0.044715f);
 
+    // Extract dynamic dimensions
+    SmallVector<Value> dynamicDims;
+    for (int i = 0; i < rank; ++i) {
+      if (resultType.isDynamicDim(i)) {
+        Value dim = rewriter.create<tensor::DimOp>(loc, input, i);
+        dynamicDims.push_back(dim);
+      }
+    }
+
     // Element-wise GELU using linalg.generic
     auto identityMap = AffineMap::getMultiDimIdentityMap(rank, rewriter.getContext());
+    Value emptyTensor = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
 
-    rewriter.create<linalg::GenericOp>(
+    Value result = rewriter.create<linalg::GenericOp>(
         loc,
+        resultType,
         ValueRange{input},
-        ValueRange{output},
+        ValueRange{emptyTensor},
         SmallVector<AffineMap>{identityMap, identityMap},
         SmallVector<utils::IteratorType>(rank, utils::IteratorType::parallel),
         [c0_5, c1, cSqrt2OverPi, c0_044715](OpBuilder &b, Location loc, ValueRange args) {
@@ -566,28 +592,30 @@ struct GeluOpLowering : public OpRewritePattern<GeluOp> {
           Value tanhVal = b.create<math::TanhOp>(loc, scaled);
           Value onePlusTanh = b.create<arith::AddFOp>(loc, c1, tanhVal);
           Value halfX = b.create<arith::MulFOp>(loc, c0_5, x);
-          Value result = b.create<arith::MulFOp>(loc, halfX, onePlusTanh);
+          Value geluResult = b.create<arith::MulFOp>(loc, halfX, onePlusTanh);
 
-          b.create<linalg::YieldOp>(loc, result);
+          b.create<linalg::YieldOp>(loc, geluResult);
         }
-    );
+    ).getResult(0);
 
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
 ```
 
-The complete FFN operation composes these building blocks:
+The complete FFN operation composes these tensor-based building blocks:
 
 ```python
 # High-level FFN API
 ffn_out = transformer.ffn(input, W1, b1, W2, b2)
 
-# Lowers to:
-hidden = transformer.linear(input, W1, b1)     # → linalg.transpose + linalg.matmul + linalg.generic
-activated = transformer.gelu(hidden)            # → linalg.generic
-output = transformer.linear(activated, W2, b2)  # → linalg.transpose + linalg.matmul + linalg.generic
+# Lowers to tensor operations:
+hidden = transformer.linear(input, W1, b1)     # → tensor-based linalg ops
+activated = transformer.gelu(hidden)            # → tensor-based linalg.generic
+output = transformer.linear(activated, W2, b2)  # → tensor-based linalg ops
+
+# After bufferization pipeline, these become efficient memref operations
 ```
 
 **Why This Design Works**. Breaking FFN into composable operations (`linear`, `gelu`) rather than monolithic lowering provides:
@@ -781,16 +809,19 @@ def multi_head_attention(x, W_q, W_k, W_v, W_o, num_heads=8):
 
 In practice, we implement head splitting via tensor reshaping and strided memory access rather than explicit loops. MLIR's `tensor.reshape` and `memref.reinterpret_cast` operations enable efficient head manipulation without data copying.
 
-**Residual Connections**. The residual addition `x = x + sub_layer(x)` is straightforward element-wise addition:
+**Residual Connections**. The residual addition `x = x + sub_layer(x)` uses tensor-based element-wise addition:
 
 ```cpp
-// In lowering pattern
-Value residual = rewriter.create<linalg::GenericOp>(
-  loc, x.getType(), ValueRange{x, subLayerOutput},
-  [&](OpBuilder &b, Location loc, ValueRange args) {
-    return b.create<arith::AddFOp>(loc, args[0], args[1]);
-  }
-);
+// In Python API - operations return tensors
+Value residual = add(x, subLayerOutput);  // Returns new tensor
+
+// Lowers to linalg.generic returning a tensor
+Value result = rewriter.create<linalg::GenericOp>(
+  loc, resultType,
+  ValueRange{x, subLayerOutput},
+  ValueRange{emptyTensor},
+  ...
+).getResult(0);
 ```
 
 Residuals require that the sub-layer output has the same shape as the input—this is why attention and feedforward both map `[seq_len, d_model] → [seq_len, d_model]`. If shapes mismatch, residuals can't add, and the model breaks.
@@ -1132,7 +1163,7 @@ Chapter 12 assembled complete transformer blocks by composing layer normalizatio
 Key insights:
 
 - **Compositional Design**: Transformer blocks compose from 8 primitive dialect operations (layer_norm, linear, gelu, matmul, transpose, softmax, scale, add), with higher-level abstractions (ffn, attention, transformer_block) implemented as Python API functions. Each primitive is optimizable separately yet works together efficiently.
-- **Memref-Based Semantics**: Operations use memrefs with out-parameter patterns rather than tensor-based functional style, enabling in-place optimization and explicit memory management
+- **Tensor-First Architecture**: Operations use tensor types and return results (functional style), enabling MLIR's bufferization pipeline to make informed decisions about memory allocation. The 3-pass bufferization (OneShotBufferize → BufferResultsToOutParams → ConvertBufferizationToMemRef) converts high-level tensors to efficient memref execution.
 - **Pre-Normalization Architecture**: Modern transformers normalize before sub-layers (pre-norm) rather than after (post-norm), improving training stability for deep networks
 - **Residual Connections**: Skip connections enable gradient flow through deep architectures, preventing vanishing gradients that plagued earlier deep learning
 - **Linalg-Based Lowering**: All operations lower to structured Linalg operations (linalg.reduce, linalg.generic, linalg.matmul), enabling MLIR's optimization passes to apply fusion, vectorization, and loop tiling automatically
