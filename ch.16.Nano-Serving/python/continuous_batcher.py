@@ -94,9 +94,17 @@ class ContinuousBatcher:
 
         # Step 2: Try to schedule prefill (if space available)
         # Move waiting requests to prefill manager
-        # Note: Radix cache lookup integration would occur here in production.
-        # Since KV caching requires ch14 modifications, we demonstrate the pattern without it.
+        # Use radix cache to skip prefill for cached prefixes
         for req in list(self.request_pool.waiting):
+            # Check if request shares prefix with cached entries
+            cached_len = self.radix_mgr.match_prefix(req.prompt_tokens)
+
+            if cached_len > 0:
+                # Reuse cached prefix - skip those tokens in prefill
+                req.cached_len = cached_len
+                # Note: In full implementation, would also retrieve and reuse K/V tensors
+                # from radix cache. Current implementation demonstrates prefix detection.
+
             self.prefill_mgr.add_request(req)
             self.request_pool.waiting.remove(req)
 
@@ -107,6 +115,11 @@ class ContinuousBatcher:
 
             # Process output (sample first token)
             for i, req in enumerate(prefill_batch.requests):
+                # Insert completed prompt into radix cache for future reuse
+                # Only insert if we have KV pages allocated
+                if req.kv_pages and len(req.kv_pages) == len(req.prompt_tokens):
+                    self.radix_mgr.cache.insert(req.prompt_tokens, req.kv_pages)
+
                 # Get logits for last token of this request
                 # In prefill, each request may have different lengths
                 next_token = sample_token(logits[i], req.temperature)

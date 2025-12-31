@@ -125,16 +125,13 @@ req.output_tokens = [42, 73]
 class Batch:
     """Group of requests processed together"""
     
-    reqs: List[Request]        # Requests in this batch
-    phase: str                 # "prefill" or "decode"
+    requests: List[Request]    # Requests in this batch
+    is_prefill: bool          # True for prefill, False for decode
     
     # Prepared for GPU execution
-    input_ids: Tensor          # [batch_size] or [total_tokens]
-    positions: Tensor          # Position indices for each token
-    out_loc: Tensor            # KV cache write locations
-    
-    # Attention metadata
-    attn_metadata: AttentionMetadata  # Backend-specific attention info
+    input_ids: np.ndarray     # [total_tokens] for prefill or [batch_size] for decode
+    positions: np.ndarray     # Position indices for each token (for RoPE)
+    out_loc: np.ndarray       # KV cache write locations
 ```
 
 **Batch Phases**. Requests have two execution phases with different characteristics:
@@ -696,26 +693,20 @@ def process_request_with_cache(req, radix_cache):
     """Process request using radix cache for prefix reuse"""
     
     # 1. Find cached prefix
-    node, cached_len = radix_cache.match_prefix(req.tokens)
+    cached_len = radix_cache.match_prefix(req.tokens)
     
-    # 2. Set request state
-    req.cached_len = cached_len
-    req.device_len = len(req.tokens)
-    req.cache_node = node
+    # 2. Set request state to skip cached tokens
+    req.cached_len = cached_len  # Skip this many tokens in prefill
     
-    # 3. Allocate pages for new tokens only
-    new_token_count = req.device_len - req.cached_len
-    if new_token_count > 0:
-        new_pages = kv_pool.allocate(pages_needed(new_token_count))
-        
-        # 4. Insert new tokens into radix tree
-        radix_cache.insert(req.tokens, new_pages)
-    
-    # 5. Build page table from tree path
-    req.page_table = collect_pages_from_tree_path(req.cache_node)
+    # 3. After prefill completes, insert into cache for future reuse
+    # (Done by scheduler after forward pass)
+    if req.kv_pages and len(req.kv_pages) == len(req.tokens):
+        radix_cache.insert(req.tokens, req.kv_pages)
     
     return req.extend_len  # Tokens needing forward pass
 ```
+
+In practice, the scheduler checks for prefix matches before scheduling prefill, then inserts completed prompts into the cache after prefill finishes.
 
 **Cache Hit Rate**. Real-world workload (chatbots with system prompts):
 
@@ -1009,6 +1000,8 @@ With this foundation, we can now understand how prefill and decode schedulers im
 
 **Separate Schedulers Implementation**:
 
+Production systems can use either a simple `PrefillManager` (FCFS with token budget) or a more sophisticated `ChunkedPrefillManager` (supports splitting long prompts). Our nano-serving implementation uses the chunked variant for better fairness.
+
 ```python
 class PrefillManager:
     """Schedules prefill phase (prompt processing)
@@ -1017,6 +1010,8 @@ class PrefillManager:
     - Prevents convoy effect by limiting batch token count
     - Ensures bounded prefill latency
     - Enables fair scheduling when combined with chunked prefill
+    
+    Note: Nano-serving uses ChunkedPrefillManager which extends this concept.
     """
     
     def __init__(self, token_budget=512):
@@ -1131,6 +1126,8 @@ Different attention kernels for different phases—FlashAttention (prefill) mini
 ## 16.7 Production System Architecture
 
 Modern LLM serving systems combine all techniques into a cohesive architecture. This section describes the overall system structure inspired by SGLang, vLLM, and TensorRT-LLM.
+
+**Note**: This section describes full-scale production architectures. Our nano-serving implementation (Part 2) uses a simplified single-process design with `ContinuousBatcher` directly calling the model executor, which is sufficient for educational purposes and demonstrates the core scheduling algorithms.
 
 **Component Overview**:
 

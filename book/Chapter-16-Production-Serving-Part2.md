@@ -200,7 +200,7 @@ The `std::set<int>` provides $O(\log n)$ allocation/deallocation. Production sys
 **Python Bindings** via pybind11 (from [`bindings.cpp`](../ch.16.Nano-Serving/src/bindings.cpp)):
 
 ```cpp
-PYBIND11_MODULE(_nano_serving, m) {
+PYBIND11_MODULE(ch16, m) {
     py::class_<KVCachePool>(m, "KVCachePool")
         .def(py::init<int, int, int, int, int>())
         .def("allocate", &KVCachePool::allocate)
