@@ -6,7 +6,7 @@ RoPE represents a significant improvement over earlier positional encoding metho
 
 Autoregressive generation transforms the forward pass (batch prediction over known sequences) into iterative token production. Starting from a prompt, we predict the next token, append it to the sequence, predict again, and repeat. Sampling strategies control this process: **temperature** adjusts confidence, **top-k** restricts candidates to most probable tokens, **nucleus (top-p)** samples from a cumulative probability mass. These techniques balance creativity and coherence, enabling diverse text generation from the same prompt.
 
-By the end of Part 2, you'll have a complete GPT implementation capable of generating text—small-scale but architecturally identical to production systems. Chapter 14 will then optimize this architecture for production serving with KV caching, FlashAttention fusion, and batching strategies.
+By the end of Part 2, you'll have a complete GPT implementation capable of generating text—small-scale but architecturally identical to production systems. Chapter 14 will then optimize this architecture for production serving with KV caching, Transform dialect optimizations, and advanced compilation techniques.
 
 ## 13.8 Rotary Position Embeddings (RoPE)
 

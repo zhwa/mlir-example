@@ -580,7 +580,7 @@ For example, fusion combines bias addition with matmul:
 } ins(%input, %w1, %b1) outs(%init)
 ```
 
-This fusion eliminates intermediate buffer traffic (`%hidden`), improving memory locality. The optimization passes also apply loop invariant code motion (hoisting constants like epsilon, sqrt(d_k) outside loops) and common subexpression elimination. These optimizations happen automatically without changing the high-level Python API—users call `transformer_block()`, and MLIR applies Chapter 10's optimizations transparently. Chapter 14 will add production-grade optimizations (FlashAttention fusion, operator quantization, KV caching) building on these foundations.
+This fusion eliminates intermediate buffer traffic (`%hidden`), improving memory locality. The optimization passes also apply loop invariant code motion (hoisting constants like epsilon, sqrt(d_k) outside loops) and common subexpression elimination. These optimizations happen automatically without changing the high-level Python API—users call `transformer_block()`, and MLIR applies Chapter 10's optimizations transparently. Chapter 14 will add production-grade optimizations (Transform dialect tiling/vectorization, KV caching) building on these foundations.
 
 Feedforward networks complete the second major component of transformer blocks. Combined with layer normalization (Section 12.2) and attention (Chapter 11), we're ready to compose these pieces into the full transformer block architecture (next section).
 
@@ -614,10 +614,11 @@ Layer Norm 1:  gamma [512] + beta [512]                      = 1,024
 Attention:     W_q/k/v/o [512, 512] × 4                      = 1,048,576
                (Note: biases omitted per Chapter 11 design)
 Layer Norm 2:  gamma [512] + beta [512]                      = 1,024
-Feedforward:   W_1 [512, 2048] = 1,048,576                   = 2,099,712
+Feedforward:   W_1 [512, 2048] = 1,048,576
                b_1 [2048] = 2,048
                W_2 [2048, 512] = 1,048,576
                b_2 [512] = 512
+               (FFN subtotal: 2,099,712)
 ──────────────────────────────────────────────────────────────────────
 Total:                                                         3,150,336
 ```
@@ -685,9 +686,7 @@ Tests validate:
 - **Attention**: ~30% of FLOPs, memory-bound due to softmax and attention score materialization (8 × seq_len × d_model² + 4 × seq_len² × d_model)
 - **Layer Norms**: ~5% of FLOPs, negligible
 
-Attention is memory-bound because softmax and score computation require many memory reads/writes relative to arithmetic operations—Chapter 14's FlashAttention specifically addresses this bottleneck by fusing operations to keep intermediate values in fast memory.
-
-The transformer block is now complete. Chapter 13 will stack multiple blocks, add positional embeddings and output layers, and implement GPT-style autoregressive generation. Chapter 14 will optimize with FlashAttention fusion, operator quantization, and KV caching for production serving.
+The transformer block is now complete. Chapter 13 will stack multiple blocks, add positional embeddings and output layers, and implement GPT-style autoregressive generation. Chapter 14 will optimize this architecture with Transform dialect techniques (tiling, vectorization), KV caching, and advanced lowering patterns for production serving.
 
 ## 12.5 Summary
 
@@ -702,4 +701,4 @@ Key insights:
 
 Chapter 12 established transformer blocks as reusable, testable components with ~3 million parameters each. These blocks are the fundamental units of models like GPT-2 (12 blocks), GPT-3 (96 blocks), and LLaMA (32-80 blocks depending on variant).
 
-**Looking Ahead**. Chapter 13 builds complete GPT architecture by stacking transformer blocks, adding token/positional embeddings, implementing causal masking for autoregressive generation, and developing text generation capabilities. We'll see how transformer blocks replicate throughout the model, differentiated only by learned parameters. Chapter 14 then optimizes this architecture for production serving with FlashAttention-style fusion, KV caching for efficient autoregressive inference, and quantization for reduced memory bandwidth—achieving latencies suitable for real-time LLM applications.
+**Looking Ahead**. Chapter 13 builds complete GPT architecture by stacking transformer blocks, adding token/positional embeddings, implementing causal masking for autoregressive generation, and developing text generation capabilities. We'll see how transformer blocks replicate throughout the model, differentiated only by learned parameters. Chapter 14 then optimizes this architecture for production serving with Transform dialect optimizations, KV caching for efficient autoregressive inference, and advanced compilation techniques—achieving significant performance improvements for production deployment.
