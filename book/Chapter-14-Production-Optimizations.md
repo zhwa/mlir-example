@@ -35,24 +35,22 @@ GPT-3 (d_model=12288, 96 layers):
 
 The optimization techniques in this chapter are production-tested but require production-scale problems to demonstrate their value. We implement them for completeness and to prepare for real deployments.
 
-**Problem 1: Limited Optimization Transformations**. Chapters 11-14 all use Linalg operations for structured computation—LayerNorm uses `linalg.reduce` and `linalg.generic`, Linear uses `linalg.matmul` and `linalg.transpose`, and element-wise operations lower to `linalg.generic`. After IR is generated, the bufferization pipeline automatically converts to efficient memref code. This consistency ensures that all chapters benefit from the same high-level IR and optimization infrastructure. The implementations are identical across chapters for common operations, with only the GPT-specific operations (Embedding, MaskedSoftmax, RoPE) using manual lowering for specialized logic.
+**Problem 1: Limited Optimization Transformations**. All chapters (11-14) use Linalg-based lowering: LayerNorm uses `linalg.reduce` and `linalg.generic`, Linear uses `linalg.matmul`, element-wise operations use `linalg.generic`. This high-level IR enables optimization through pattern recognition.
 
-Chapters 11-14 apply **basic compiler optimizations** from Chapter 10: Linalg elementwise operation fusion (merging adjacent element-wise operations like add+multiply), loop invariant code motion (LICM, hoisting invariant computations out of loops), and common subexpression elimination (CSE, eliminating redundant calculations). These optimizations provide moderate speedups (10-30% on production-scale models) by reducing memory traffic and redundant computation.
-
-However, Chapters 11-13 stop at basic optimizations. After Linalg fusion and bufferization, `createConvertLinalgToLoopsPass()` generates naive nested loops without further transformation:
+Chapters 11-13 apply **basic optimizations** from Chapter 10—Linalg elementwise fusion, loop invariant code motion (LICM), and common subexpression elimination (CSE)—providing moderate speedups (10-30%). However, after these optimizations and `createConvertLinalgToLoopsPass()`, the generated loops remain naive:
 
 ```cpp
-// After basic optimizations, loops are still naive:
+// Chapters 11-13: Basic optimizations applied, but loops are still naive
 auto iLoop = rewriter.create<scf::ForOp>(loc, zero, M, one);
   auto jLoop = rewriter.create<scf::ForOp>(loc, zero, N, one);
     auto kLoop = rewriter.create<scf::ForOp>(loc, zero, K, one);
       // Scalar operations (no SIMD vectorization)
 ```
 
-Chapter 14 adds **aggressive loop transformations** that provide much larger gains (3-5× for production models):
+Chapter 14 adds **aggressive loop transformations** via Transform Dialect, providing much larger gains (3-5× for production models):
 
 - **Tiling**: Break loops into cache-friendly blocks (32×32 tiles fit L1 cache)
-- **Vectorization**: Exploit SIMD units (8× float32 with AVX2, 16× with AVX-512)
+- **Vectorization**: Exploit SIMD units (8 float32 values with AVX2, 16 with AVX-512)
 - **Advanced Fusion**: Use Transform Dialect to fuse operations across entire subgraphs
 
 **Problem 2: Sequential Operations Waste Memory Bandwidth**. Operations execute independently:
