@@ -534,25 +534,47 @@ Multiplication follows identically, replacing `arith.AddFOp` with `arith.MulFOp`
 
 ### 11.3.5 From Tensors to Executable Code: The Pass Pipeline
 
-Our transformer operations lower to linalg operations, which then go through bufferization and loop generation. The complete pass pipeline:
+Our transformer operations lower to linalg operations, which then go through optimization, bufferization, and loop generation. Chapter 11 applies the optimization techniques learned in Chapter 10, demonstrating how dialect-agnostic passes compose naturally. The complete pass pipeline from [src/bindings.cpp](ch.11.Attention/src/bindings.cpp):
 
 ```cpp
-pm.addPass(createLowerTransformerToStandardPass());  // transformer -> linalg
-// Optimization passes work on linalg operations here
-pm.addPass(createBufferizePass());                   // tensors -> memrefs
-pm.addPass(createConvertLinalgToLoopsPass());        // linalg -> scf.for
-pm.addPass(createSCFToControlFlowPass());            // scf -> control flow
+// Lower transformer dialect to linalg (tensor-based)
+pm.addNestedPass<func::FuncOp>(createLowerTransformerToStandardPass());
+pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
+pm.addNestedPass<func::FuncOp>(createCSEPass());
+
+// Linalg optimizations (on tensors before bufferization)
+pm.addPass(createLinalgGeneralizeNamedOpsPass());
+pm.addPass(createCanonicalizerPass());
+pm.addPass(createLinalgElementwiseOpFusionPass());
+pm.addPass(createCanonicalizerPass());
+
+// Bufferization: tensor → memref
+pm.addPass(bufferization::createOneShotBufferizePass(bufferizeOptions));
+pm.addPass(bufferization::createBufferResultsToOutParamsPass());
+pm.addPass(createConvertBufferizationToMemRefPass());
+pm.addPass(createCanonicalizerPass());
+
+// Lower linalg to loops
+pm.addPass(createConvertLinalgToLoopsPass());
+
+// SCF optimizations (loop invariant code motion)
+pm.addPass(createLoopInvariantCodeMotionPass());
+pm.addPass(createCanonicalizerPass());
+pm.addPass(createCSEPass());
+
+// Lower to LLVM
+pm.addPass(createConvertMathToLLVMPass());
+pm.addPass(createConvertMathToLibmPass());
 // ... remaining passes to LLVM IR
 ```
 
-**Optimization Opportunities**: Our lowering produces linalg operations that enable optimization passes:
+**Applied Optimizations**: The pipeline includes Chapter 10's optimization passes working on attention's linalg operations:
 
-- **Tiling**: Break operations into cache-friendly blocks
-- **Fusion**: Merge producer-consumer operations, eliminating intermediate tensors
-- **Vectorization**: Generate SIMD instructions (AVX, NEON)
-- **Parallelization**: Distribute across threads
+- **Fusion** (`createLinalgElementwiseOpFusionPass()`): Merges adjacent element-wise operations, eliminating intermediate buffers. For attention, this fuses scaling with QK^T computation and softmax's exponential with normalization.
+- **Loop Invariant Code Motion** (`createLoopInvariantCodeMotionPass()`): Hoists the scaling factor `1/sqrt(d_k)` outside attention score loops, computing it once rather than per-element.
+- **Common Subexpression Elimination**: Removes redundant computations across the attention pipeline.
 
-After optimizations, bufferization converts tensors to memrefs, and loop lowering generates actual control flow. This staged approach gives us composable functional-style IR and efficient imperative execution.
+These optimizations happen automatically—users call `attention(Q, K, V)` and MLIR applies Chapter 10's passes transparently. The staged approach (optimize on tensors, then bufferize) enables optimizations that would be difficult after memory allocation decisions are baked in.
 
 **Registering the Linalg Dialect**. From [src/bindings.cpp](ch.11.Attention/src/bindings.cpp):
 

@@ -10,7 +10,7 @@ The chapter progresses from understanding transformer block architecture (why ea
 
 ## 12.1 Transformer Block Architecture
 
-Before implementing code, we must understand what a transformer block computes and why its components matter. Modern transformer architectures (GPT-3, GPT-4, LLaMA, Claude) share a common structure: stacked transformer blocks, each containing attention and feedforward sub-layers with layer normalization and residual connections. This section dissects the architecture, explaining each component's purpose and how they interact.
+Before implementing code, we must understand what a transformer block computes and why its components matter. Modern transformer architectures (GPT, LLaMA, DeepSeek) share a common structure: stacked transformer blocks, each containing attention and feedforward sub-layers with layer normalization and residual connections. This section dissects the architecture, explaining each component's purpose and how they interact.
 
 **The Standard Transformer Block**. A transformer block processes input `x` (shape: `[seq_len, d_model]`) through two main sub-layers:
 
@@ -62,62 +62,42 @@ def multi_head_attention(x, W_q, W_k, W_v, W_o, num_heads):
 
 Multiple heads let the model attend to different aspects of the input simultaneously—one head might focus on syntactic dependencies, another on semantic relationships. Chapter 12 will implement this multi-head structure on top of Chapter 11's single-head attention primitive.
 
-**Layer Normalization**. Training deep neural networks suffers from **internal covariate shift**: layer input distributions change as earlier layers update, making training unstable. Layer normalization addresses this by normalizing activations to zero mean and unit variance:
+**Layer Normalization**. Training deep neural networks suffers from **internal covariate shift**—layer input distributions change as earlier layers update—though modern research suggests normalization primarily works by **smoothing the optimization landscape**, making gradients more predictable. Layer normalization addresses this by normalizing activations to zero mean and unit variance:
 
-```
-LayerNorm(x) = gamma * (x - mean) / sqrt(variance + epsilon) + beta
-```
+$$\text{LayerNorm}(\mathbf{x}) = \boldsymbol{\gamma} \odot \frac{\mathbf{x} - \mu}{\sqrt{\sigma^2 + \epsilon}} + \boldsymbol{\beta}$$
 
-Where:
-- `mean = sum(x) / d_model` (mean across embedding dimension)
-- `variance = sum((x - mean)^2) / d_model` (variance across embedding dimension)
-- `gamma`, `beta` are learned scale and shift parameters
-- `epsilon` is a small constant (1e-5) for numerical stability
+Where $\mu$ and $\sigma^2$ are the mean and variance computed across the embedding dimension $d_{\text{model}}$, and $\odot$ represents element-wise multiplication with the learnable parameter vectors $\boldsymbol{\gamma}$ and $\boldsymbol{\beta}$. The epsilon value (typically $10^{-5}$ or $10^{-6}$) prevents division by zero.
 
 Layer normalization computes these statistics **per token independently** (unlike batch normalization which normalizes across batches). For input shape `[seq_len, d_model]`, we compute `seq_len` separate normalizations—one for each token's embedding vector. This independence across tokens makes layer norm well-suited for variable-length sequences.
 
-**Feedforward Networks**. After attention aggregates information across tokens, the feedforward network processes each token **independently** through a two-layer MLP:
+**Pre-Norm vs Post-Norm Architecture**. The original Transformer (Vaswani et al., 2017) applied LayerNorm **after** the residual connection (Post-Norm): `LayerNorm(x + SubLayer(x))`. Modern transformers (GPT-3, LLaMA) apply it **before** the sub-layer (Pre-Norm): `x + SubLayer(LayerNorm(x))`, which provides significantly more stable training for deep networks. Chapter 12 implements Pre-Norm architecture, the current production standard.
 
-```
-FFN(x) = W_2 @ GELU(W_1 @ x + b_1) + b_2
-```
+**Feedforward Networks**. After attention aggregates information across tokens, the feedforward network processes each token **independently** through a position-wise sub-network (typically a two-layer MLP or gated linear unit):
+
+$$\text{FFN}(\mathbf{x}) = \mathbf{W}_2 \cdot \text{GELU}(\mathbf{W}_1 \mathbf{x} + \mathbf{b}_1) + \mathbf{b}_2$$
 
 Where:
-- `W_1`: `[d_model, d_ff]` (typically `d_ff = 4 * d_model`)
-- `W_2`: `[d_ff, d_model]`
-- `GELU`: Gaussian Error Linear Unit activation (smooth approximation of ReLU)
+- $\mathbf{W}_1$: `[d_model, d_ff]` (typically `d_ff = 4 * d_model`)
+- $\mathbf{W}_2$: `[d_ff, d_model]`
+- GELU: Gaussian Error Linear Unit activation (smooth approximation of ReLU)
 
-The feedforward network expands dimensionality to `d_ff` (creating a bottleneck), applies nonlinearity, then projects back to `d_model`. This per-token processing provides additional model capacity and nonlinearity beyond attention's linear transformations. The expansion factor of 4× is empirically validated across many transformer variants (GPT-2/3, LLaMA, etc.)—larger ratios improve quality but increase computation and memory costs.
+The feedforward network expands dimensionality to $d_{\text{ff}}$ (creating a bottleneck), applies nonlinearity, then projects back to $d_{\text{model}}$. This per-token processing provides additional model capacity and nonlinearity beyond attention's linear transformations.
+
+**Architecture Variants**. While the classical 4× expansion is standard (GPT-2/3), modern architectures use variations:
+
+- **GPT-2/3**: 4× expansion with GELU, includes bias terms
+- **LLaMA-2 70B**: 3.5× expansion (d_model=8192, d_ff=28672) with **SwiGLU** activation and **no bias terms** for improved training stability and hardware efficiency
+- **SwiGLU**: A gated linear unit using three weight matrices instead of two, achieving better performance
+
+Chapter 12 implements the classical two-layer MLP with GELU and 4× expansion, following GPT-2/3 architecture. The principles extend naturally to gated variants like SwiGLU.
 
 **Residual Connections**. Each sub-layer (attention, feedforward) wraps in a residual connection:
 
-```
-x = x + SubLayer(x)
-```
+$$\mathbf{x} = \mathbf{x} + \text{SubLayer}(\mathbf{x})$$
 
-Residuals enable gradient flow in deep networks: gradients can bypass sub-layers through the identity path, preventing vanishing gradients. This technique, borrowed from ResNet (2015), is essential for training transformers with dozens or hundreds of layers. Without residuals, deep transformer training fails—gradients vanish, and the model doesn't learn.
+Residuals enable gradient flow in deep networks: gradients can bypass sub-layers through the identity path, preventing vanishing gradients. This technique, borrowed from ResNet (2015), is essential for training transformers with dozens or hundreds of layers. Without residuals, deep transformer training fails—gradients vanish, and the model doesn't learn. The residual allows the model to learn **incremental updates** to embeddings rather than completely reinventing representations at each layer.
 
-**Why This Architecture Works**. The transformer block design balances several goals:
-
-1. **Information Mixing**: Attention mixes information across tokens (global context); feedforward processes tokens independently (local refinement)
-2. **Stable Training**: Layer normalization stabilizes activations; residuals ensure gradient flow
-3. **Scalability**: The architecture scales to billions of parameters (GPT-3: 96 layers × 96 attention heads) and long sequences (context lengths up to 128k tokens)
-4. **Flexibility**: Components compose cleanly—swap attention mechanisms (grouped-query, flash attention), change feedforward activations (SwiGLU instead of GELU), adjust normalization (RMSNorm instead of LayerNorm)
-
-Production transformers stack dozens of these blocks: GPT-2 small uses 12 blocks, GPT-3 uses 96 blocks, LLaMA-2 70B uses 80 blocks. Each block performs the same computation (modulo learned parameters), demonstrating the architecture's modularity.
-
-**Chapter 12's Implementation Scope**. We'll implement:
-
-- **Layer normalization**: Mean/variance computation, learned gamma/beta parameters
-- **Feedforward network**: Linear projections with GELU activation
-- **Multi-head attention**: Building on Chapter 11's single-head implementation
-- **Residual connections**: Element-wise addition wrapping sub-layers
-- **Complete transformer block**: Composing all components with proper ordering
-
-We'll **defer** to Chapter 13:
-- **Causal masking**: Preventing attention to future tokens (autoregressive generation)
-- **Positional embeddings**: Encoding token positions (RoPE, learned embeddings)
-- **KV caching**: Optimizing inference for autoregressive models
+Production transformers stack many blocks: GPT-2 small uses 12 blocks, GPT-3 (175B) uses 96 blocks, LLaMA-2 70B uses 80 blocks. Each block performs the same computation (modulo learned parameters), demonstrating the architecture's modularity.
 
 Chapter 12 focuses on the core transformer block structure, establishing patterns that Chapter 13 will extend for GPT-style autoregressive language modeling.
 
@@ -134,51 +114,9 @@ x_normalized = (x - mean) / sqrt(variance + epsilon)
 output = gamma * x_normalized + beta
 ```
 
-For batched input with shape `[seq_len, d_model]`, we compute `seq_len` independent normalizations—one per token. Each token's `d_model` features are normalized independently of other tokens' features. This per-token independence contrasts with batch normalization (which normalizes across the batch dimension), making layer norm suitable for variable-length sequences.
+For batched input with shape `[seq_len, d_model]`, we compute `seq_len` independent normalizations—one per token. Each token's `d_model` features are normalized independently of other tokens' features.
 
-**Why Normalization Helps**. Deep neural networks suffer from **internal covariate shift**: as lower layers update during training, their outputs' distributions change, forcing higher layers to continuously adapt. This instability slows training and can prevent convergence. Normalization addresses this by ensuring layer inputs maintain consistent statistics (zero mean, unit variance), stabilizing gradients and accelerating training.
-
-Layer normalization also provides implicit **gradient scaling**: without normalization, gradients' magnitudes depend on activation scales, causing some parameters to update much faster than others. Normalization equalizes gradient scales, enabling uniform learning rates across all parameters. This is especially important in transformers where attention scores (pre-softmax) can have widely varying magnitudes.
-
-**Numerical Stability Considerations**. Naive variance computation can suffer from catastrophic cancellation:
-
-```python
-# Numerically unstable (two-pass)
-mean = sum(x) / n
-variance = sum((x - mean)^2) / n  # If x values are similar, (x - mean) loses precision
-```
-
-For large `d_model` and values clustered near the mean, subtracting `mean` from `x` can lose significant digits. A more stable approach uses a **single-pass algorithm**:
-
-```python
-# Numerically stable (single-pass, not for parallel computation)
-sum_x = 0
-sum_x2 = 0
-for xi in x:
-    sum_x += xi
-    sum_x2 += xi * xi
-
-mean = sum_x / n
-variance = (sum_x2 / n) - (mean * mean)  # More stable for well-conditioned data
-```
-
-However, even this can fail if `sum_x2` is very large compared to `mean^2`. Production implementations often use **Welford's online algorithm** (updating running mean and variance incrementally), but for simplicity, Chapter 12 uses the straightforward two-pass approach with added epsilon to prevent division by zero:
-
-```
-variance = sum((x - mean)^2) / d_model + epsilon
-```
-
-The epsilon (typically 1e-5) ensures `sqrt(variance + epsilon)` never divides by zero, even if all inputs are identical. This prevents NaN (Not-a-Number) results that would propagate through the network.
-
-**Learned Parameters**. After normalization, layer norm applies learned affine transformation:
-
-```
-output = gamma * x_normalized + beta
-```
-
-Where `gamma` and `beta` are trainable parameters with shape `[d_model]`. Why learn these parameters if we just normalized to zero mean and unit variance? Because strict normalization might be too restrictive—some layers might benefit from different scales or shifts. The learned parameters give the network flexibility to adjust normalization strength per feature dimension.
-
-In practice, `gamma` typically initializes to all 1s (identity scale) and `beta` to all 0s (zero shift), starting from standard normalization and adapting during training.
+**Why Normalization Helps**. Normalization stabilizes training by maintaining consistent input statistics (zero mean, unit variance) and equalizing gradient scales across parameters. The learned parameters $\boldsymbol{\gamma}$ and $\boldsymbol{\beta}$ (shape `[d_model]`) provide flexibility—the network can adjust normalization strength per feature dimension if strict normalization is too restrictive. The epsilon term (typically $10^{-5}$) prevents division by zero when all inputs are identical.
 
 **Operation Definition in Transformer Dialect**. We extend the Transformer dialect with a layer norm operation:
 
@@ -215,7 +153,7 @@ def Transformer_LayerNormOp : Transformer_Op<"layer_norm"> {
 
 The operation takes input tensor, gamma/beta parameters, and returns normalized output with the same shape as input.
 
-**Lowering to Linalg**. Layer normalization lowers to a sequence of Linalg operations combining reductions and element-wise computations:
+**Lowering to Linalg**. Layer normalization lowers to a sequence of Linalg operations combining reductions and element-wise computations. The lowering follows four stages:
 
 ```cpp
 // src/TransformerPasses.cpp
@@ -229,140 +167,102 @@ struct LayerNormOpLowering : public OpRewritePattern<LayerNormOp> {
     Value beta = op.getBeta();
     float epsilon = 1e-5f;
 
-    // Get result type
     auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
     ArrayRef<int64_t> shape = resultType.getShape();  // [seq_len, d_model]
     int rank = shape.size();
 
-    // Create reduced shape for mean and variance
+    // Create reduced shape for mean and variance: [seq_len]
     SmallVector<int64_t> reducedShape(shape.begin(), shape.end() - 1);
     auto reducedType = RankedTensorType::get(reducedShape, rewriter.getF32Type());
+```
 
-    // Extract dynamic dimensions
-    SmallVector<Value> reducedDynamicDims;
-    for (int i = 0; i < rank - 1; ++i) {
-      if (resultType.isDynamicDim(i)) {
-        Value dim = rewriter.create<tensor::DimOp>(loc, input, i);
-        reducedDynamicDims.push_back(dim);
-      }
-    }
+**Stage 1: Compute Mean via Two-Stage Reduction**. First `linalg.reduce` computes sums along the $d_{\text{model}}$ dimension, then `linalg.generic` normalizes—this two-stage approach enables fusion opportunities:
 
-    // Step 1: Compute mean using linalg.reduce along last dimension
+```cpp
+    // Sum reduction along last dimension
     Value zero = createConstantFloat(rewriter, loc, 0.0f);
-    Value meanBufferEmpty = rewriter.create<tensor::EmptyOp>(loc, reducedType, reducedDynamicDims);
-    Value meanBuffer = rewriter.create<linalg::FillOp>(loc, zero, meanBufferEmpty).getResult(0);
+    Value meanBuffer = rewriter.create<linalg::FillOp>(loc, zero, 
+                         rewriter.create<tensor::EmptyOp>(loc, reducedType, ...)).getResult(0);
 
     Value meanSum = rewriter.create<linalg::ReduceOp>(
-        loc,
-        ValueRange{input},
-        ValueRange{meanBuffer},
-        SmallVector<int64_t>{rank - 1},  // reduce along d_model dimension
+        loc, ValueRange{input}, ValueRange{meanBuffer},
+        SmallVector<int64_t>{rank - 1},  // reduce along d_model
         [](OpBuilder &b, Location loc, ValueRange args) {
           Value sum = b.create<arith::AddFOp>(loc, args[0], args[1]);
           b.create<linalg::YieldOp>(loc, sum);
-        }
-    ).getResult(0);
+        }).getResult(0);
 
-    // Normalize mean: divide by d_model
+    // Normalize: mean = sum / d_model
     Value dModel = createConstantFloat(rewriter, loc, static_cast<float>(shape[rank - 1]));
     Value meanResult = rewriter.create<linalg::GenericOp>(
-        loc,
-        reducedType,
-        ValueRange{meanSum},
-        ValueRange{meanBufferEmpty},
-        meanNormalizeMaps,
-        reducedIteratorTypes,
+        loc, reducedType, ValueRange{meanSum}, ValueRange{...},
+        meanNormalizeMaps, reducedIteratorTypes,
         [dModel](OpBuilder &b, Location loc, ValueRange args) {
           Value normalized = b.create<arith::DivFOp>(loc, args[0], dModel);
           b.create<linalg::YieldOp>(loc, normalized);
-        }
-    ).getResult(0);
+        }).getResult(0);
+```
 
-    // Step 2: Compute centered values (input - mean) with broadcasting
-    SmallVector<Value> dynamicDims;
-    for (int i = 0; i < rank; ++i) {
-      if (resultType.isDynamicDim(i)) {
-        Value dim = rewriter.create<tensor::DimOp>(loc, input, i);
-        dynamicDims.push_back(dim);
-      }
-    }
+**Stage 2: Broadcast Semantics with Affine Maps**. Affine maps explicitly encode how 1D statistics (mean, variance) broadcast across 2D tensors—no manual index arithmetic required:
 
-    Value centeredBufferEmpty = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
+```cpp
+    // Compute centered = input - mean (with broadcasting)
     Value centeredBuffer = rewriter.create<linalg::GenericOp>(
-        loc,
-        resultType,
+        loc, resultType,
         ValueRange{input, meanResult},
-        ValueRange{centeredBufferEmpty},
-        centeringMaps,  // Broadcasting affine map
+        ValueRange{rewriter.create<tensor::EmptyOp>(loc, resultType, ...)},
+        centeringMaps,  // Affine map broadcasts mean from [seq_len] to [seq_len, d_model]
         iteratorTypes,
         [](OpBuilder &b, Location loc, ValueRange args) {
           Value centered = b.create<arith::SubFOp>(loc, args[0], args[1]);
           b.create<linalg::YieldOp>(loc, centered);
-        }
-    ).getResult(0);
+        }).getResult(0);
 
-    // Step 3: Compute variance = sum(centered^2) / d_model
-    Value varianceBufferEmpty = rewriter.create<tensor::EmptyOp>(loc, reducedType, reducedDynamicDims);
-    Value varianceBuffer = rewriter.create<linalg::FillOp>(loc, zero, varianceBufferEmpty).getResult(0);
-
+    // Compute variance via reduction and normalization
     Value varianceSum = rewriter.create<linalg::ReduceOp>(
-        loc,
-        ValueRange{centeredBuffer},
-        ValueRange{varianceBuffer},
+        loc, ValueRange{centeredBuffer}, ValueRange{...},
         SmallVector<int64_t>{rank - 1},
         [](OpBuilder &b, Location loc, ValueRange args) {
           Value squared = b.create<arith::MulFOp>(loc, args[0], args[0]);
           Value sum = b.create<arith::AddFOp>(loc, squared, args[1]);
           b.create<linalg::YieldOp>(loc, sum);
-        }
-    ).getResult(0);
+        }).getResult(0);
 
-    // Compute invStd = rsqrt(variance/d_model + epsilon)
     Value epsilonVal = createConstantFloat(rewriter, loc, epsilon);
     Value invStdResult = rewriter.create<linalg::GenericOp>(
-        loc,
-        reducedType,
-        ValueRange{varianceSum},
-        ValueRange{invStdBufferEmpty},
-        meanNormalizeMaps,
-        reducedIteratorTypes,
+        loc, reducedType, ValueRange{varianceSum}, ValueRange{...},
+        meanNormalizeMaps, reducedIteratorTypes,
         [dModel, epsilonVal](OpBuilder &b, Location loc, ValueRange args) {
           Value variance = b.create<arith::DivFOp>(loc, args[0], dModel);
           Value variancePlusEps = b.create<arith::AddFOp>(loc, variance, epsilonVal);
-          Value invStd = b.create<math::RsqrtOp>(loc, variancePlusEps);
+          Value invStd = b.create<math::RsqrtOp>(loc, variancePlusEps);  // 1/sqrt(variance + epsilon)
           b.create<linalg::YieldOp>(loc, invStd);
-        }
-    ).getResult(0);
+        }).getResult(0);
+```
 
-    // Step 4: Normalize and apply scale/shift
-    Value resultEmpty = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
+**Stage 3: Apply Scale and Shift**. Temporary buffers for intermediate results enable in-place updates and memory reuse after deallocation:
+
+```cpp
+    // Final normalization: gamma * (centered * invStd) + beta
     Value result = rewriter.create<linalg::GenericOp>(
-        loc,
-        resultType,
+        loc, resultType,
         ValueRange{centeredBuffer, invStdResult, gamma, beta},
-        ValueRange{resultEmpty},
+        ValueRange{rewriter.create<tensor::EmptyOp>(loc, resultType, ...)},
         normalizeMaps,  // Broadcasting maps for invStd, gamma, beta
         iteratorTypes,
         [](OpBuilder &b, Location loc, ValueRange args) {
-          // args[0]=centered, args[1]=invStd, args[2]=gamma, args[3]=beta
+          // args: centered, invStd, gamma, beta
           Value normalized = b.create<arith::MulFOp>(loc, args[0], args[1]);
           Value scaled = b.create<arith::MulFOp>(loc, normalized, args[2]);
           Value finalResult = b.create<arith::AddFOp>(loc, scaled, args[3]);
           b.create<linalg::YieldOp>(loc, finalResult);
-        }
-    ).getResult(0);
+        }).getResult(0);
 
     rewriter.replaceOp(op, result);
     return success();
   }
 };
 ```
-
-This lowering demonstrates structured reduction patterns that enable MLIR's optimization and bufferization:
-
-1. **Two-stage reductions**: First `linalg.reduce` computes sums, then `linalg.generic` normalizes—this enables fusion opportunities
-2. **Broadcast semantics**: Affine maps explicitly encode how 1D statistics (mean, variance) broadcast across 2D tensors—no manual index arithmetic
-3. **Buffer allocation**: Temporary buffers for intermediate results enable in-place updates and memory reuse after deallocation
 
 The pattern mirrors Chapter 11's softmax lowering: reduce to compute statistics, then element-wise operations with broadcasting. MLIR's Linalg dialect provides the abstraction layer—operations describe *what* to compute (reductions, element-wise ops), enabling subsequent passes to determine *how* (loop tiling, vectorization, parallelization).
 
@@ -403,7 +303,7 @@ Layer normalization establishes the pattern for subsequent operations: define hi
 
 ## 12.3 Feedforward Networks: Per-Token MLPs
 
-After attention mixes information across sequence positions, the transformer block applies a feedforward network to each token independently. This two-layer MLP (Multi-Layer Perceptron) provides additional representational capacity and nonlinearity, transforming each token's embedding through an expanded intermediate dimension before projecting back to the model dimension. This section implements feedforward networks with GELU activation, explores why the 4× expansion is standard, and demonstrates how MLIR optimizes these dense computations.
+After attention mixes information across sequence positions, the transformer block applies a feedforward network to each token independently. This two-layer MLP (Multi-Layer Perceptron) provides additional representational capacity and nonlinearity, transforming each token's embedding through an expanded intermediate dimension before projecting back to the model dimension. This section implements feedforward networks with GELU activation, and demonstrates how MLIR optimizes these dense computations.
 
 **The Feedforward Architecture**. A standard transformer feedforward network consists of two linear layers with nonlinear activation between them:
 
@@ -416,11 +316,15 @@ Where:
   Linear_2: x @ W_2 + b_2    # [d_ff] → [d_model]
 ```
 
-The first linear layer expands dimensionality from `d_model` to `d_ff` (typically `d_ff = 4 * d_model`), creating an intermediate representation with higher capacity. The second layer projects back to `d_model`, matching the residual connection's expected shape. This bottleneck architecture (expand → activate → project) is a common pattern in neural networks, balancing model capacity with computational cost.
+The first linear layer expands dimensionality from `d_model` to `d_ff`, creating an intermediate representation with higher capacity. The second layer projects back to `d_model`, matching the residual connection's expected shape. This bottleneck architecture (expand → activate → project) is a common pattern in neural networks.
 
-**Why 4× Expansion?** The `d_ff = 4 * d_model` ratio comes from empirical tuning in early transformer papers. The original "Attention is All You Need" used this ratio, and subsequent work (GPT-2, GPT-3, BERT) validated it across diverse tasks. Larger ratios (6×, 8×) can improve model quality but increase computation and memory proportionally. Smaller ratios (2×, 3×) reduce cost but may limit representational capacity.
+**Architecture Choices**. The expansion ratio varies by model family:
 
-Modern variants explore different architectures: **Mixture-of-Experts (MoE)** expands `d_ff` dramatically but routes each token to only a subset of parameters, reducing per-token computation while increasing total parameters. **SwiGLU** replaces GELU with a gated linear unit, requiring an expanded intermediate dimension but providing better performance. Chapter 12 implements the standard 4× GELU feedforward, establishing the foundation for exploring variants in future work.
+- **GPT-2/3**: Use `d_ff = 4 * d_model` with GELU activation
+- **LLaMA-2**: Uses `d_ff = 3.5 * d_model` with SwiGLU (a gated linear unit requiring three weight matrices)
+- **Mixture-of-Experts (MoE)**: Expands `d_ff` dramatically but routes each token to only a subset of parameters
+
+Chapter 12 implements a standard two-layer MLP with GELU and 4× expansion (GPT-2/3 style), providing a solid foundation that extends naturally to modern variants.
 
 **Implementation Note**: The feedforward network is implemented as a **Python API function** (`ffn`) that composes primitive operations (`linear`, `gelu`) rather than a single dialect operation. This compositional approach enables operation reuse and independent optimization of each component.
 
@@ -443,7 +347,7 @@ def gelu_approx(x):
     return 0.5 * x * (1.0 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
 ```
 
-This approximation, proposed in the original GELU paper, provides excellent accuracy while using only multiplication, addition, and tanh (which hardware and libraries optimize heavily). MLIR's Math dialect includes `math.erf` and `math.tanh`, allowing us to choose between exact and approximate implementations.
+This approximation, provides excellent accuracy while using only multiplication, addition, and tanh (which hardware and libraries optimize heavily). MLIR's Math dialect includes `math.erf` and `math.tanh`, allowing us to choose between exact and approximate implementations.
 
 **Primitive Operations**. Rather than defining a monolithic FFN dialect operation, Chapter 12 provides primitive operations that compose to implement feedforward networks:
 
@@ -477,80 +381,77 @@ def ffn(input, w1, b1, w2, b2):
 
 This compositional design enables operation reuse—`LinearOp` is used in both FFN layers and in attention projections.
 
-**Lowering to Linalg**. Each primitive operation lowers independently. The `LinearOp` that encapsulates `input @ weight^T + bias` lowers to Linalg operations:
+**Lowering to Linalg**. Each primitive operation lowers independently to structured Linalg operations. The lowering follows three stages for `LinearOp` and one stage for `GeluOp`.
+
+**Stage 1: Weight Transpose**. The `LinearOp` performs `input @ weight^T + bias`, requiring weight transposition from `[out_features, in_features]` to `[in_features, out_features]` for matmul compatibility:
 
 ```cpp
-// src/TransformerPasses.cpp
+// src/TransformerPasses.cpp - LinearOpLowering
 struct LinearOpLowering : public OpRewritePattern<LinearOp> {
-  using OpRewritePattern::OpRewritePattern;
-
   LogicalResult matchAndRewrite(LinearOp op, PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
-    Value input = op.getInput();   // [seq_len, in_features] - tensor
-    Value weight = op.getWeight(); // [out_features, in_features] - tensor
-    Value bias = op.getBias();     // [out_features] - tensor
+    Value input = op.getInput();   // [seq_len, in_features]
+    Value weight = op.getWeight(); // [out_features, in_features]
+    Value bias = op.getBias();     // [out_features]
 
-    // Get result type
-    auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
-
-    // Step 1: Transpose weight for matmul compatibility
-    // Need (in_features, out_features) for input @ weight
-    SmallVector<int64_t> transposedShape = {inFeatures, outFeatures};
-    auto transposedType = RankedTensorType::get(transposedShape, rewriter.getF32Type());
-    Value transposedWeightEmpty = rewriter.create<tensor::EmptyOp>(loc, transposedType, transposedDynamicDims);
+    // Transpose weight: [out_features, in_features] → [in_features, out_features]
+    auto transposedType = RankedTensorType::get({inFeatures, outFeatures}, rewriter.getF32Type());
     Value transposedWeight = rewriter.create<linalg::TransposeOp>(
-        loc,
-        weight,
-        transposedWeightEmpty,
+        loc, weight,
+        rewriter.create<tensor::EmptyOp>(loc, transposedType, ...),
         SmallVector<int64_t>{1, 0}  // swap dimensions
     ).getResult()[0];
+```
 
-    // Step 2: Perform matmul with zero initialization
+**Stage 2: Matrix Multiplication**. Perform `input @ transposed_weight` using `linalg.matmul` with zero-initialized output:
+
+```cpp
+    // Matmul with zero initialization
     Value zero = createConstantFloat(rewriter, loc, 0.0f);
-    Value emptyTensor = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
-    Value filledTensor = rewriter.create<linalg::FillOp>(loc, zero, emptyTensor).getResult(0);
+    Value filledTensor = rewriter.create<linalg::FillOp>(loc, zero,
+                           rewriter.create<tensor::EmptyOp>(loc, resultType, ...)).getResult(0);
 
     Value matmulResult = rewriter.create<linalg::MatmulOp>(
         loc,
         ValueRange{input, transposedWeight},
         ValueRange{filledTensor}
-    ).getResult(0);
+    ).getResult(0);  // [seq_len, out_features]
+```
 
-    // Step 3: Add bias with broadcasting (bias broadcasts across seq_len)
+**Stage 3: Bias Addition with Broadcasting**. Add bias using `linalg.generic` with affine maps that broadcast `[out_features]` across `seq_len`:
+
+```cpp
+    // Bias broadcasts from [out_features] to [seq_len, out_features]
     auto identityMap = AffineMap::getMultiDimIdentityMap(2, rewriter.getContext());
     auto biasBroadcastMap = AffineMap::get(2, 0,
         {rewriter.getAffineDimExpr(1)},  // only second dimension
         rewriter.getContext());
 
-    Value resultEmpty = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
     Value result = rewriter.create<linalg::GenericOp>(
-        loc,
-        resultType,
+        loc, resultType,
         ValueRange{matmulResult, bias},
-        ValueRange{resultEmpty},
+        ValueRange{rewriter.create<tensor::EmptyOp>(loc, resultType, ...)},
         SmallVector<AffineMap>{identityMap, biasBroadcastMap, identityMap},
         SmallVector<utils::IteratorType>(2, utils::IteratorType::parallel),
         [](OpBuilder &b, Location loc, ValueRange args) {
           Value sum = b.create<arith::AddFOp>(loc, args[0], args[1]);
           b.create<linalg::YieldOp>(loc, sum);
-        }
-    ).getResult(0);
+        }).getResult(0);
 
     rewriter.replaceOp(op, result);
     return success();
   }
 };
+```
 
+**GELU Lowering**. The `GeluOp` lowers to element-wise computation using the standard approximation $\text{GELU}(x) \approx 0.5 \cdot x \cdot (1 + \tanh(\sqrt{2/\pi} \cdot (x + 0.044715 \cdot x^3)))$:
+
+```cpp
 struct GeluOpLowering : public OpRewritePattern<GeluOp> {
-  using OpRewritePattern::OpRewritePattern;
-
   LogicalResult matchAndRewrite(GeluOp op, PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     Value input = op.getInput();
-
-    // Get result type
     auto resultType = mlir::cast<RankedTensorType>(op.getResult().getType());
-    int rank = resultType.getRank();
 
     // GELU approximation constants
     Value c0_5 = createConstantFloat(rewriter, loc, 0.5f);
@@ -558,30 +459,15 @@ struct GeluOpLowering : public OpRewritePattern<GeluOp> {
     Value cSqrt2OverPi = createConstantFloat(rewriter, loc, 0.7978845608f);
     Value c0_044715 = createConstantFloat(rewriter, loc, 0.044715f);
 
-    // Extract dynamic dimensions
-    SmallVector<Value> dynamicDims;
-    for (int i = 0; i < rank; ++i) {
-      if (resultType.isDynamicDim(i)) {
-        Value dim = rewriter.create<tensor::DimOp>(loc, input, i);
-        dynamicDims.push_back(dim);
-      }
-    }
-
     // Element-wise GELU using linalg.generic
-    auto identityMap = AffineMap::getMultiDimIdentityMap(rank, rewriter.getContext());
-    Value emptyTensor = rewriter.create<tensor::EmptyOp>(loc, resultType, dynamicDims);
-
     Value result = rewriter.create<linalg::GenericOp>(
-        loc,
-        resultType,
+        loc, resultType,
         ValueRange{input},
-        ValueRange{emptyTensor},
-        SmallVector<AffineMap>{identityMap, identityMap},
-        SmallVector<utils::IteratorType>(rank, utils::IteratorType::parallel),
+        ValueRange{rewriter.create<tensor::EmptyOp>(loc, resultType, ...)},
+        ...,  // Identity maps, parallel iterators
         [c0_5, c1, cSqrt2OverPi, c0_044715](OpBuilder &b, Location loc, ValueRange args) {
           Value x = args[0];
-
-          // GELU(x) ≈ 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x^3)))
+          // GELU(x) ≈ 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x³)))
           Value x2 = b.create<arith::MulFOp>(loc, x, x);
           Value x3 = b.create<arith::MulFOp>(loc, x2, x);
           Value term = b.create<arith::MulFOp>(loc, c0_044715, x3);
@@ -591,10 +477,8 @@ struct GeluOpLowering : public OpRewritePattern<GeluOp> {
           Value onePlusTanh = b.create<arith::AddFOp>(loc, c1, tanhVal);
           Value halfX = b.create<arith::MulFOp>(loc, c0_5, x);
           Value geluResult = b.create<arith::MulFOp>(loc, halfX, onePlusTanh);
-
           b.create<linalg::YieldOp>(loc, geluResult);
-        }
-    ).getResult(0);
+        }).getResult(0);
 
     rewriter.replaceOp(op, result);
     return success();
@@ -624,537 +508,188 @@ output = transformer.linear(activated, W2, b2)  # → linalg ops
 
 The Linalg-based implementation enables Chapter 14's production optimizations: `linalg.matmul` tiles efficiently for cache locality, `linalg.generic` vectorizes GELU computation, and fusion passes combine operations to reduce memory traffic.
 
-**Performance Analysis**. Feedforward networks dominate transformer computation—they account for approximately **2/3 of total FLOPs** in standard architectures. For input `[seq_len, d_model]`:
+**Performance Analysis**. Feedforward networks dominate transformer computation for typical sequence lengths—they account for approximately **2/3 of total FLOPs** in standard architectures at common context lengths. For input `[seq_len, d_model]` with `d_ff = 4 × d_model`, counting Multiply-Accumulate (MAC) operations as 2 FLOPs each:
 
-- **Linear_1 FLOPs**: `seq_len × d_model × d_ff = seq_len × d_model × 4*d_model = 4 × seq_len × d_model²`
-- **GELU FLOPs**: `seq_len × d_ff = 4 × seq_len × d_model` (negligible compared to matmuls)
-- **Linear_2 FLOPs**: `seq_len × d_ff × d_model = 4 × seq_len × d_model²`
-- **Total FFN FLOPs**: `8 × seq_len × d_model²`
+- **Linear_1 FLOPs**: `2 × seq_len × d_model × d_ff = 2 × seq_len × d_model × (4 × d_model) = 8 × seq_len × d_model²`
+- **GELU FLOPs**: `seq_len × d_ff = 4 × seq_len × d_model` (negligible: ~0.05% of FFN compute)
+- **Linear_2 FLOPs**: `2 × seq_len × d_ff × d_model = 2 × seq_len × (4 × d_model) × d_model = 8 × seq_len × d_model²`
+- **Total FFN FLOPs**: `16 × seq_len × d_model²`
 
-Compare to attention (Chapter 11): `4 × seq_len² × d_k + 4 × seq_len² × d_v ≈ 8 × seq_len² × d_model / num_heads`. For `seq_len ≤ d_model` (common in practice: GPT-2 has `d_model = 768` and context length 1024), feedforward dominates. For very long sequences (`seq_len >> d_model`), attention becomes the bottleneck.
+Compare to attention: Q/K/V/O projections contribute `8 × seq_len × d_model²`, while the attention computation itself (QK^T scores and attention@V) adds `4 × seq_len² × d_model`, totaling roughly `8 × seq_len × d_model² + 4 × seq_len² × d_model`. The crossover point occurs around `seq_len ≈ 2 × d_model`. For GPT-2 (`d_model = 768`, context length 1024), FFN accounts for ~65% of compute. For very long sequences (`seq_len >> d_model`), the quadratic attention term dominates.
 
-This complexity analysis guides optimization priorities: Chapter 14's production optimizations focus heavily on feedforward network efficiency (batching matrix multiplications, fusing GELU with linear layers, quantization for reduced memory bandwidth).
+**Why Fusion Matters**. In production, FFNs are often **memory-bound** rather than compute-bound—memory bandwidth (reading weights, writing activations) limits throughput more than arithmetic units. Fusing GELU with the preceding matmul eliminates an intermediate buffer, reducing memory traffic by ~25% for that operation. This is why Chapter 14's production optimizations focus on operator fusion (computing GELU inline as matmul writes outputs) and quantization (reducing memory bandwidth via INT8/FP16 weights) rather than just arithmetic optimization.
 
-**Testing Feedforward Networks**. Numerical validation against PyTorch:
+**Testing Feedforward Networks**. Numerical validation against NumPy reference implementation:
 
 ```python
-import torch
-import torch.nn as nn
+# test_jit.py - Test 5: FFN
+d_model, d_ff = 4, 8
+x = np.random.randn(2, d_model).astype(np.float32)
+w1 = np.random.randn(d_ff, d_model).astype(np.float32)
+b1 = np.random.randn(d_ff).astype(np.float32)
+w2 = np.random.randn(d_model, d_ff).astype(np.float32)
+b2 = np.random.randn(d_model).astype(np.float32)
 
-# PyTorch reference
-class FeedForward(nn.Module):
-    def __init__(self, d_model, d_ff):
-        super().__init__()
-        self.linear1 = nn.Linear(d_model, d_ff)
-        self.linear2 = nn.Linear(d_ff, d_model)
+# MLIR implementation
+x_tensor = ch12.Tensor(x)
+output = ch12.ffn(x_tensor, w1, b1, w2, b2)
+result = ch12.forward(output)
 
-    def forward(self, x):
-        x = self.linear1(x)
-        x = torch.nn.functional.gelu(x, approximate='tanh')
-        x = self.linear2(x)
-        return x
+# NumPy reference: FFN(x) = Linear(GELU(Linear(x)))
+def gelu_ref(x):
+    return 0.5 * x * (1 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * x**3)))
 
-# Create model and extract weights
-model = FeedForward(512, 2048)
-x = torch.randn(4, 512)  # [seq_len=4, d_model=512]
+hidden = x @ w1.T + b1
+activated = gelu_ref(hidden)
+expected = activated @ w2.T + b2
 
-# Run PyTorch
-output_torch = model(x).detach().numpy()
-
-# Run MLIR (using extracted weights)
-output_mlir = compiler.ffn(
-    x.numpy(),
-    model.linear1.weight.T.detach().numpy(),  # Transpose for column-major
-    model.linear1.bias.detach().numpy(),
-    model.linear2.weight.T.detach().numpy(),
-    model.linear2.bias.detach().numpy()
-)
-
-# Verify
-np.testing.assert_allclose(output_mlir, output_torch, rtol=1e-3, atol=1e-5)
+np.testing.assert_allclose(result, expected, rtol=1e-4)
+print("✓ FFN test PASSED!")
 ```
 
-The tolerance is slightly relaxed (1e-3 relative) compared to simpler operations because GELU's approximation and accumulated floating-point errors across two matrix multiplications introduce small differences.
+The test validates the complete FFN pipeline: both linear layers with bias addition and GELU activation. The tolerance (1e-4 relative) accounts for floating-point accumulated errors across two matrix multiplications and the GELU approximation. Chapter 12 tests all components individually (linear, GELU, layer_norm) before testing composite operations (FFN, attention, transformer_block).
 
-**Fusion Opportunities**. Feedforward networks present excellent fusion opportunities:
+**Fusion Opportunities**. Feedforward networks present excellent fusion opportunities, and Chapter 12 applies the optimization techniques learned in Chapter 10:
 
 1. **Bias addition fusion**: Merge bias addition into matmul (common in BLAS libraries)
 2. **GELU fusion**: Compute GELU inline during matmul output (eliminates intermediate buffer)
-3. **Layer norm fusion**: Combine pre-norm with first linear layer (Chapter 12.4)
+3. **Layer norm fusion**: Combine adjacent element-wise operations
 
-MLIR's Linalg fusion pass (Chapter 10.3) automatically applies these optimizations when legal. For example, fusing bias addition into matmul:
+Chapter 12's compilation pipeline includes Linalg fusion passes (from Chapter 10) that automatically merge adjacent operations:
+
+```cpp
+// Optimization pipeline (bindings.cpp)
+pm.addPass(createLinalgGeneralizeNamedOpsPass());    // Convert to generic form
+pm.addPass(createCanonicalizerPass());               // Cleanup
+pm.addPass(createLinalgElementwiseOpFusionPass());   // Fuse adjacent operations
+pm.addPass(createCanonicalizerPass());               // Cleanup again
+// ... bufferization ...
+pm.addPass(createLoopInvariantCodeMotionPass());     // Hoist constants
+```
+
+For example, fusion combines bias addition with matmul:
 
 ```mlir
 // Before fusion
 %hidden = linalg.matmul ins(%input, %w1) outs(%init)
-%biased = linalg.generic ... ins(%hidden, %b1) ...  // Add bias
+%biased = linalg.generic ... ins(%hidden, %b1) ...  // Separate bias addition
 
 // After fusion
 %biased = linalg.generic {
-  // Combined matmul + bias addition in single loop nest
+  // Combined matmul + bias in single loop nest
 } ins(%input, %w1, %b1) outs(%init)
 ```
 
-This fusion eliminates one memory operation (reading/writing `%hidden`), improving performance. Chapter 14 explores more aggressive fusion patterns for production serving.
+This fusion eliminates intermediate buffer traffic (`%hidden`), improving memory locality. The optimization passes also apply loop invariant code motion (hoisting constants like epsilon, sqrt(d_k) outside loops) and common subexpression elimination. These optimizations happen automatically without changing the high-level Python API—users call `transformer_block()`, and MLIR applies Chapter 10's optimizations transparently. Chapter 14 will add production-grade optimizations (FlashAttention fusion, operator quantization, KV caching) building on these foundations.
 
 Feedforward networks complete the second major component of transformer blocks. Combined with layer normalization (Section 12.2) and attention (Chapter 11), we're ready to compose these pieces into the full transformer block architecture (next section).
 
 ## 12.4 Composing the Transformer Block
 
-With layer normalization, attention, and feedforward networks implemented individually, we now compose them into a complete transformer block. This section demonstrates how residual connections integrate the components, explores parameter management (weight initialization and shapes), and shows how MLIR's optimization passes work transparently across the composed operations.
+With layer normalization, attention, and feedforward networks implemented individually, we now compose them into a complete transformer block. This section demonstrates how residual connections integrate the components, explores parameter management and testing strategies, and shows how MLIR's optimization passes work transparently across the composed operations.
 
 **The Full Composition**. A transformer block combines all components with specific ordering:
 
 ```python
 def transformer_block(x, params):
-    """
-    Complete pre-norm transformer block.
-
-    Args:
-        x: Input tensor [seq_len, d_model]
-        params: Dictionary containing:
-            - ln1_gamma, ln1_beta: Layer norm 1 parameters [d_model]
-            - attn_wq, attn_wk, attn_wv, attn_wo: Attention weights [d_model, d_model]
-            - ln2_gamma, ln2_beta: Layer norm 2 parameters [d_model]
-            - ffn_w1, ffn_b1: FFN first layer [d_model, d_ff], [d_ff]
-            - ffn_w2, ffn_b2: FFN second layer [d_ff, d_model], [d_model]
-
-    Returns:
-        Output tensor [seq_len, d_model]
-    """
     # Sub-layer 1: Multi-head attention with residual
     normed1 = layernorm(x, params['ln1_gamma'], params['ln1_beta'])
-    attn_out = multi_head_attention(
-        normed1,
-        params['attn_wq'], params['attn_wk'],
-        params['attn_wv'], params['attn_wo']
-    )
+    attn_out = multi_head_attention(normed1, params['attn_w*'])
     x = x + attn_out  # Residual connection
 
     # Sub-layer 2: Feedforward with residual
     normed2 = layernorm(x, params['ln2_gamma'], params['ln2_beta'])
-    ffn_out = feedforward(
-        normed2,
-        params['ffn_w1'], params['ffn_b1'],
-        params['ffn_w2'], params['ffn_b2']
-    )
+    ffn_out = feedforward(normed2, params['ffn_w*'])
     x = x + ffn_out  # Residual connection
 
     return x
 ```
 
-This structure follows the pre-normalization pattern: normalize before each sub-layer, then add the sub-layer output to the original input via residual connection. The ordering is critical—post-norm (normalizing after residual addition) has different training dynamics and is less stable for deep networks.
+This follows the pre-normalization pattern: normalize before each sub-layer, then add the sub-layer output via residual connection. The ordering is critical—post-norm (normalizing after residual addition) has different training dynamics and is less stable for deep networks.
 
-**Implementation Details**. The `transformer_block()` function builds a computation graph from primitive operations. During JIT compilation, this graph is traversed to generate MLIR IR, with each Python operation (layer_norm, attention, etc.) emitting corresponding dialect operations. The compilation happens once; subsequent forward passes reuse the compiled code.
-
-**Parameter Dimensions**. For a transformer block with:
-- `d_model = 512` (embedding dimension)
-- `d_ff = 2048` (feedforward expansion, 4× d_model)
-- `num_heads = 8` (multi-head attention)
-
-Total parameters:
+**Parameter Dimensions**. For a transformer block with `d_model = 512`, `d_ff = 2048` (4× expansion), `num_heads = 8`:
 
 ```
 Layer Norm 1:  gamma [512] + beta [512]                      = 1,024
-Attention:     W_q [512, 512] + W_k [512, 512] +            = 1,048,576
-               W_v [512, 512] + W_o [512, 512]
+Attention:     W_q/k/v/o [512, 512] × 4                      = 1,048,576
+               (Note: biases omitted per Chapter 11 design)
 Layer Norm 2:  gamma [512] + beta [512]                      = 1,024
-Feedforward:   W_1 [512, 2048] + b_1 [2048] +               = 2,099,200
-               W_2 [2048, 512] + b_2 [512]
+Feedforward:   W_1 [512, 2048] = 1,048,576                   = 2,099,712
+               b_1 [2048] = 2,048
+               W_2 [2048, 512] = 1,048,576
+               b_2 [512] = 512
 ──────────────────────────────────────────────────────────────────────
-Total:                                                         3,149,824
+Total:                                                         3,150,336
 ```
 
-Approximately **3.1 million parameters per transformer block**. GPT-2 small (12 blocks) has ~37 million parameters in transformer blocks alone (plus embeddings). GPT-3 (96 blocks, larger dimensions) has billions.
+Approximately **3.15 million parameters per transformer block**. GPT-2 small (12 blocks) has ~38 million parameters in transformer blocks alone (plus embeddings).
 
-**Implementing Multi-Head Attention**. Chapter 11 implemented single-head attention. Multi-head extends this by splitting Q, K, V into multiple heads:
+**Residual Connections and Gradient Flow**. Residuals provide direct gradient paths during training:
 
-```python
-def multi_head_attention(x, W_q, W_k, W_v, W_o, num_heads=8):
-    """Multi-head self-attention."""
-    seq_len, d_model = x.shape
-    d_k = d_model // num_heads
+$$\frac{\partial \text{Loss}}{\partial x} = \frac{\partial \text{Loss}}{\partial \text{output}} \times \left(1 + \frac{\partial \text{sub\_layer}}{\partial x}\right)$$
 
-    # Project to Q, K, V
-    Q = x @ W_q  # [seq_len, d_model]
-    K = x @ W_k
-    V = x @ W_v
+The `+1` term is the identity path—even if gradients vanish through the sub-layer, they remain non-zero via the residual. This prevents the vanishing gradient problem in deep networks. Residuals require matching shapes: attention and feedforward both map `[seq_len, d_model] → [seq_len, d_model]`.
 
-    # Reshape to separate heads: [seq_len, num_heads, d_k]
-    Q = Q.reshape(seq_len, num_heads, d_k)
-    K = K.reshape(seq_len, num_heads, d_k)
-    V = V.reshape(seq_len, num_heads, d_k)
+**Composable Design Philosophy**. Rather than monolithic `Transformer_BlockOp` and `Transformer_FFNOp` dialect operations, Chapter 12 composes primitive operations (`layer_norm`, `linear`, `gelu`, `add`, `attention`). Benefits:
 
-    # Compute attention per head (in parallel)
-    # For each head h: attention(Q[:, h, :], K[:, h, :], V[:, h, :])
-    head_outputs = []
-    for h in range(num_heads):
-        head_output = scaled_dot_product_attention(
-            Q[:, h, :],  # [seq_len, d_k]
-            K[:, h, :],
-            V[:, h, :]
-        )
-        head_outputs.append(head_output)
-
-    # Concatenate heads: [seq_len, num_heads * d_k] = [seq_len, d_model]
-    concat = concatenate(head_outputs, axis=1)
-
-    # Output projection
-    output = concat @ W_o
-
-    return output
-```
-
-In practice, we implement head splitting via tensor reshaping and strided memory access rather than explicit loops. MLIR's `tensor.reshape` and `memref.reinterpret_cast` operations enable efficient head manipulation without data copying.
-
-**Residual Connections**. The residual addition `x = x + sub_layer(x)` uses element-wise addition:
-
-```cpp
-// In Python API - operations return tensors
-Value residual = add(x, subLayerOutput);  // Returns new tensor
-
-// Lowers to linalg.generic
-Value result = rewriter.create<linalg::GenericOp>(
-  loc, resultType,
-  ValueRange{x, subLayerOutput},
-  ValueRange{emptyTensor},
-  ...
-).getResult(0);
-```
-
-Residuals require that the sub-layer output has the same shape as the input—this is why attention and feedforward both map `[seq_len, d_model] → [seq_len, d_model]`. If shapes mismatch, residuals can't add, and the model breaks.
-
-**Gradient Flow Through Residuals**. During training (not covered in detail until Chapter 14), residuals provide direct paths for gradients:
-
-```
-∂Loss/∂x = ∂Loss/∂output × (1 + ∂sub_layer/∂x)
-```
-
-The `+1` term is the identity path—even if `∂sub_layer/∂x` vanishes (gradients become very small), `∂Loss/∂x` remains non-zero due to the residual connection. This prevents the **vanishing gradient problem** that plagued pre-ResNet deep networks. In 100-layer transformers, residuals are essential; without them, gradients would shrink exponentially through layers.
-
-**Putting It All Together**. The complete transformer block is implemented as a **Python API function** that composes primitive operations:
-
-```python
-# Python API (bindings.cpp)
-def transformer_block(input, 
-                      w_q, b_q, w_k, b_k, w_v, b_v, w_o, b_o,  # Attention
-                      ln1_gamma, ln1_beta,                     # LayerNorm 1
-                      w1, b1, w2, b2,                          # FFN
-                      ln2_gamma, ln2_beta):                    # LayerNorm 2
-    """Complete transformer block with pre-normalization.
-    
-    Composes:
-      attn_out = attention(layer_norm(x, ln1_gamma, ln1_beta), ...)
-      x = x + attn_out
-      ffn_out = ffn(layer_norm(x, ln2_gamma, ln2_beta), ...)
-      x = x + ffn_out
-    """
-    # Sub-layer 1: Attention with pre-norm and residual
-    normed1 = layer_norm(input, ln1_gamma, ln1_beta)
-    attn_out = attention(normed1, w_q, b_q, w_k, b_k, w_v, b_v, w_o, b_o)
-    residual1 = input + attn_out
-    
-    # Sub-layer 2: FFN with pre-norm and residual
-    normed2 = layer_norm(residual1, ln2_gamma, ln2_beta)
-    ffn_out = ffn(normed2, w1, b1, w2, b2)
-    output = residual1 + ffn_out
-    
-    return output
-```
-
-**Why Composable Functions Instead of Dialect Operations?** Rather than creating monolithic `Transformer_BlockOp` and `Transformer_FFNOp` dialect operations, Chapter 12's design composes primitive operations (`layer_norm`, `linear`, `gelu`, `add`, `attention`). This approach provides:
-
-1. **Reusability**: `linear` is used in FFN, attention projections, and output layers
-2. **Independent optimization**: Each primitive can be optimized separately before composition-level optimizations
-3. **Flexibility**: Easy to experiment with variants (SwiGLU instead of GELU, RMSNorm instead of LayerNorm) by swapping components
+1. **Reusability**: `linear` used in FFN, attention projections, and output layers
+2. **Independent optimization**: Each primitive optimized separately before composition-level optimizations
+3. **Flexibility**: Easy to swap components (SwiGLU vs GELU, RMSNorm vs LayerNorm)
 4. **Maintainability**: Single source of truth for each operation type
 
-The dialect provides the **building blocks** (8 operations: layer_norm, linear, gelu, matmul, transpose, softmax, scale, add), and the Python API provides **compositions** (ffn, attention, transformer_block).
+The dialect provides **building blocks** (8 primitive operations), and the Python API provides **compositions** (ffn, attention, transformer_block).
 
-**Optimization Across Components**. MLIR's optimization passes (Chapter 10) work transparently across transformer block components:
+**Applied Optimizations**. MLIR's passes from Chapter 10 work transparently across transformer blocks:
 
-1. **Linalg Fusion**: Fuses adjacent operations (e.g., layer norm's variance computation with normalization)
-2. **Loop Invariant Code Motion**: Hoists constants like `epsilon`, `sqrt(d_k)` out of loops
-3. **Vectorization**: Converts element-wise operations to SIMD instructions
-4. **Dead Code Elimination**: Removes unused intermediate values
+- **Linalg Fusion**: Fuses adjacent operations (layer norm's variance computation with normalization, scaling with QK^T)
+- **Loop Invariant Code Motion**: Hoists constants (`epsilon`, `sqrt(d_k)`) outside loops
+- **Common Subexpression Elimination**: Removes redundant computations
 
-These optimizations apply automatically—we don't write transformer-specific optimization passes. MLIR's composable pass infrastructure optimizes the lowered IR regardless of its high-level origin.
+These apply automatically—no transformer-specific optimization passes needed. The composable pass infrastructure optimizes lowered IR regardless of high-level origin.
 
-**Testing the Complete Block**. End-to-end validation:
-
-```python
-# Initialize parameters (random for testing)
-params = {
-    'ln1_gamma': np.ones(d_model, dtype=np.float32),
-    'ln1_beta': np.zeros(d_model, dtype=np.float32),
-    'attn_wq': np.random.randn(d_model, d_model).astype(np.float32) * 0.02,
-    'attn_wk': np.random.randn(d_model, d_model).astype(np.float32) * 0.02,
-    'attn_wv': np.random.randn(d_model, d_model).astype(np.float32) * 0.02,
-    'attn_wo': np.random.randn(d_model, d_model).astype(np.float32) * 0.02,
-    'ln2_gamma': np.ones(d_model, dtype=np.float32),
-    'ln2_beta': np.zeros(d_model, dtype=np.float32),
-    'ffn_w1': np.random.randn(d_model, d_ff).astype(np.float32) * 0.02,
-    'ffn_b1': np.zeros(d_ff, dtype=np.float32),
-    'ffn_w2': np.random.randn(d_ff, d_model).astype(np.float32) * 0.02,
-    'ffn_b2': np.zeros(d_model, dtype=np.float32),
-}
-
-# Input
-x = np.random.randn(seq_len, d_model).astype(np.float32)
-
-# MLIR transformer block
-output_mlir = compiler.transformer_block(x, params)
-
-# PyTorch reference
-output_torch = pytorch_transformer_block(torch.from_numpy(x), params).numpy()
-
-# Verify
-np.testing.assert_allclose(output_mlir, output_torch, rtol=1e-3, atol=1e-5)
-```
-
-Successful validation confirms that all components integrate correctly and produce expected results.
-
-**Performance Characteristics**. The complete transformer block:
-
-- **Attention**: O(seq_len² × d_model / num_heads) FLOPs, memory-bound for short sequences
-- **Feedforward**: O(seq_len × d_model²) FLOPs, compute-bound, dominates for seq_len < d_model
-- **Layer Norms**: O(seq_len × d_model) FLOPs, negligible compared to attention/feedforward
-- **Residuals**: O(seq_len × d_model) FLOPs, negligible
-
-For typical configurations (seq_len=512, d_model=768), feedforward accounts for ~65% of FLOPs, attention ~30%, layer norm and residuals ~5%.
-
-The transformer block is now complete. Chapter 13 will stack multiple blocks, add positional embeddings and output layers, and implement GPT-style autoregressive generation. Chapter 14 will optimize block execution with techniques like FlashAttention fusion and operator quantization.
-
-## 12.5 Implementation Details and Testing
-
-This section covers practical implementation aspects: managing the computation graph for complex operations, debugging numerical issues, integrating with the Tensor API, and comprehensive testing strategies. Building a transformer block in MLIR involves more than defining operations—we must ensure correct parameter passing, memory management, and numerical stability.
-
-**Computation Graph for Transformer Block**. The Tensor API (Chapter 11.4) builds computation graphs from Python operations. For a transformer block with ~13 parameters (gamma/beta for 2 layer norms, 4 attention matrices, 2 FFN weight matrices and 2 bias vectors), the graph structure becomes substantial:
+**Testing and Validation**. Chapter 12's test suite ([test_jit.py](ch.12.Transformer/test_jit.py)) validates each component individually before testing composition:
 
 ```python
-class TransformerBlock:
-    def __init__(self, d_model, d_ff, num_heads):
-        self.d_model = d_model
-        self.d_ff = d_ff
-        self.num_heads = num_heads
+# Test 2: LayerNorm
+x = np.array([[1.0, 2.0, 3.0, 4.0]], dtype=np.float32)
+gamma = np.ones(4, dtype=np.float32)
+beta = np.zeros(4, dtype=np.float32)
 
-        # Initialize parameters (normally loaded from trained model)
-        self.ln1_gamma = Tensor.parameter([d_model])
-        self.ln1_beta = Tensor.parameter([d_model])
-        self.attn_wq = Tensor.parameter([d_model, d_model])
-        self.attn_wk = Tensor.parameter([d_model, d_model])
-        self.attn_wv = Tensor.parameter([d_model, d_model])
-        self.attn_wo = Tensor.parameter([d_model, d_model])
-        self.ln2_gamma = Tensor.parameter([d_model])
-        self.ln2_beta = Tensor.parameter([d_model])
-        self.ffn_w1 = Tensor.parameter([d_model, d_ff])
-        self.ffn_b1 = Tensor.parameter([d_ff])
-        self.ffn_w2 = Tensor.parameter([d_ff, d_model])
-        self.ffn_b2 = Tensor.parameter([d_model])
+output = ch12.layer_norm(ch12.Tensor(x), gamma, beta)
+result = ch12.forward(output)
 
-    def forward(self, x):
-        # Sub-layer 1: Attention with residual
-        normed1 = layernorm(x, self.ln1_gamma, self.ln1_beta)
-        attn_out = multi_head_attention(
-            normed1, self.attn_wq, self.attn_wk,
-            self.attn_wv, self.attn_wo, self.num_heads
-        )
-        x = x + attn_out
+# NumPy reference
+mean = np.mean(x, axis=1, keepdims=True)
+var = np.var(x, axis=1, keepdims=True)  # Biased variance (divide by N)
+expected = (x - mean) / np.sqrt(var + 1e-5)
 
-        # Sub-layer 2: FFN with residual
-        normed2 = layernorm(x, self.ln2_gamma, self.ln2_beta)
-        ffn_out = feedforward(
-            normed2, self.ffn_w1, self.ffn_b1,
-            self.ffn_w2, self.ffn_b2
-        )
-        x = x + ffn_out
-
-        return x
+np.testing.assert_allclose(result, expected, atol=1e-5)
+print("✓ LayerNorm test PASSED!")
 ```
 
-This builds a computation graph with ~30 nodes (layer norms, matmuls, element-wise operations, residuals). The JIT compiler must traverse this graph topologically (Chapter 10.8), generate MLIR IR for each node, and compile to native code.
+**Note**: `np.var` uses biased variance by default (divides by N, not N-1), matching standard LayerNorm implementations.
 
-**Parameter Management**. Transformer models have millions of parameters. Efficient parameter passing requires careful memory management:
+Tests validate:
+- Individual operations (layernorm, linear, gelu, matmul, transpose, softmax, scale, add, attention)
+- Composite operations (ffn, transformer_block)
+- Multi-block stacking (verifying no NaN/inf propagation)
 
-```cpp
-// In JIT compilation (bindings.cpp)
-py::array_t<float> forward(const Tensor& output_tensor) {
-  // Collect all parameters from the graph
-  std::vector<Tensor*> parameters;
-  std::vector<Tensor*> inputs;
+**Common Debugging Issues**:
 
-  for (auto& node : graph.nodes) {
-    if (node.op_type == OpType::Parameter) {
-      parameters.push_back(&node);
-    } else if (node.op_type == OpType::Input) {
-      inputs.push_back(&node);
-    }
-  }
+1. **NaN Propagation**: Layer norm with zero variance → divide-by-zero → NaN. Fixed by epsilon term (1e-5).
+2. **Shape Mismatches**: Residual addition requires matching shapes. Ensure all operations preserve `[seq_len, d_model]`.
+3. **Parameter Initialization**: Large random values → exploding activations. Use scaled initialization (0.02 std dev).
 
-  // Build function signature: func.func @compute(inputs..., params..., output)
-  SmallVector<Type> inputTypes;
-  for (auto* input : inputs) {
-    inputTypes.push_back(getMemRefType(input->shape));
-  }
-  for (auto* param : parameters) {
-    inputTypes.push_back(getMemRefType(param->shape));
-  }
-  inputTypes.push_back(getMemRefType(output_tensor.shape));  // Output
+**Performance Characteristics**. For typical configurations (seq_len=512, d_model=768):
+- **Feedforward**: ~65% of FLOPs, compute-bound (16 × seq_len × d_model²)
+- **Attention**: ~30% of FLOPs, memory-bound due to softmax and attention score materialization (8 × seq_len × d_model² + 4 × seq_len² × d_model)
+- **Layer Norms**: ~5% of FLOPs, negligible
 
-  auto funcType = builder.getFunctionType(inputTypes, {});
-  auto func = builder.create<func::FuncOp>(loc, "compute", funcType);
+Attention is memory-bound because softmax and score computation require many memory reads/writes relative to arithmetic operations—Chapter 14's FlashAttention specifically addresses this bottleneck by fusing operations to keep intermediate values in fast memory.
 
-  // ... build IR ...
+The transformer block is now complete. Chapter 13 will stack multiple blocks, add positional embeddings and output layers, and implement GPT-style autoregressive generation. Chapter 14 will optimize with FlashAttention fusion, operator quantization, and KV caching for production serving.
 
-  // Prepare arguments for execution
-  std::vector<void*> args;
-  for (auto* input : inputs) {
-    args.push_back(prepareMemRefDescriptor(input->data));
-  }
-  for (auto* param : parameters) {
-    args.push_back(prepareMemRefDescriptor(param->data));
-  }
-  args.push_back(prepareMemRefDescriptor(output_data));
-
-  // Execute via libffi
-  executionEngine->invoke("compute", args);
-
-  return output;
-}
-```
-
-This approach passes parameters as function arguments, avoiding dynamic allocation inside MLIR IR. The compiled code receives pointers to parameter data (gamma, beta, weights, biases), accesses them as needed, and writes results to the output buffer.
-
-**Debugging Numerical Issues**. Complex operations like transformer blocks can exhibit subtle numerical bugs. Common issues and debugging strategies:
-
-1. **NaN Propagation**: A single NaN (from divide-by-zero, sqrt of negative, etc.) propagates through all subsequent operations.
-   - **Debug**: Test each operation individually with known inputs
-   - **Example**: Layer norm with zero variance → division by zero → NaN
-   - **Fix**: Add epsilon (1e-5) to variance before sqrt
-
-2. **Shape Mismatches**: Residual addition requires matching shapes.
-   - **Debug**: Print intermediate shapes during graph construction
-   - **Example**: Attention output `[seq_len, d_model]` vs input `[batch, seq_len, d_model]`
-   - **Fix**: Ensure all operations preserve batch/sequence dimensions correctly
-
-3. **Parameter Initialization**: Uninitialized or poorly initialized parameters cause training instability or garbage outputs.
-   - **Debug**: Initialize parameters to known values (ones, zeros) and verify expected outputs
-   - **Example**: Weight matrices initialized with large values → exploding activations
-   - **Fix**: Use standard initialization schemes (Xavier, Kaiming) with appropriate scaling
-
-4. **Gradient Accumulation**: For multi-layer models, gradients can vanish or explode.
-   - **Debug**: Monitor gradient norms at each layer
-   - **Fix**: Residual connections, layer normalization, gradient clipping
-
-**Comprehensive Testing Strategy**. Chapter 12's test suite validates:
-
-```python
-# test_jit.py
-
-def test_layernorm():
-    """Test layer normalization against NumPy reference."""
-    x = np.random.randn(4, 512).astype(np.float32)
-    gamma = np.ones(512, dtype=np.float32)
-    beta = np.zeros(512, dtype=np.float32)
-
-    output_mlir = compiler.layernorm(x, gamma, beta)
-    output_numpy = layernorm_reference(x, gamma, beta)
-
-    np.testing.assert_allclose(output_mlir, output_numpy, rtol=1e-4)
-    print("✓ LayerNorm test passed")
-
-def test_feedforward():
-    """Test FFN against PyTorch reference."""
-    x = np.random.randn(4, 512).astype(np.float32)
-    w1 = np.random.randn(512, 2048).astype(np.float32) * 0.02
-    b1 = np.zeros(2048, dtype=np.float32)
-    w2 = np.random.randn(2048, 512).astype(np.float32) * 0.02
-    b2 = np.zeros(512, dtype=np.float32)
-
-    output_mlir = compiler.ffn(x, w1, b1, w2, b2)
-    output_torch = ffn_reference(x, w1, b1, w2, b2)
-
-    np.testing.assert_allclose(output_mlir, output_torch, rtol=1e-3)
-    print("✓ FFN test passed")
-
-def test_transformer_block():
-    """Test complete transformer block end-to-end."""
-    x = np.random.randn(4, 512).astype(np.float32)
-    params = initialize_random_params(d_model=512, d_ff=2048, num_heads=8)
-
-    output_mlir = compiler.transformer_block(x, params)
-    output_torch = pytorch_transformer_block(x, params)
-
-    np.testing.assert_allclose(output_mlir, output_torch, rtol=1e-3)
-    print("✓ Transformer block test passed")
-
-def test_multi_block_stack():
-    """Test multiple transformer blocks in sequence."""
-    x = np.random.randn(4, 512).astype(np.float32)
-
-    # Stack 3 blocks
-    for block_params in all_block_params:
-        x = compiler.transformer_block(x, block_params)
-
-    # Verify output shape
-    assert x.shape == (4, 512)
-    assert not np.isnan(x).any()
-    assert not np.isinf(x).any()
-    print("✓ Multi-block stack test passed")
-```
-
-Each test isolates a specific component, validates against reference implementations, and checks for common failure modes (NaN, inf, wrong shapes).
-
-**Performance Benchmarking**. Beyond correctness, we measure performance:
-
-```python
-import time
-
-def benchmark_transformer_block(seq_len=512, d_model=768, d_ff=3072, num_trials=100):
-    """Measure transformer block latency."""
-    x = np.random.randn(seq_len, d_model).astype(np.float32)
-    params = initialize_random_params(d_model, d_ff, num_heads=12)
-
-    # Warmup
-    for _ in range(10):
-        _ = compiler.transformer_block(x, params)
-
-    # Timed runs
-    times = []
-    for _ in range(num_trials):
-        start = time.perf_counter()
-        _ = compiler.transformer_block(x, params)
-        elapsed = time.perf_counter() - start
-        times.append(elapsed)
-
-    print(f"Mean latency: {np.mean(times)*1000:.2f} ms")
-    print(f"Std dev: {np.std(times)*1000:.2f} ms")
-    print(f"Min: {np.min(times)*1000:.2f} ms")
-    print(f"Max: {np.max(times)*1000:.2f} ms")
-```
-
-Typical results (Intel i7, AVX2, optimized compilation):
-
-```
-Transformer block (seq_len=512, d_model=768):
-  Mean latency: 3.45 ms
-  Std dev: 0.18 ms
-  Min: 3.21 ms
-  Max: 4.12 ms
-```
-
-This baseline helps evaluate Chapter 14's production optimizations (targeting sub-millisecond latency through FlashAttention, quantization, and kernel fusion).
-
-**Integration with Existing Code**. Chapter 12's transformer block builds on previous chapters without breaking compatibility:
-
-- **Chapter 9's dialect**: Reused for base operations (matmul, element-wise ops)
-- **Chapter 10's optimizations**: Applied automatically via the optimization pipeline
-- **Chapter 11's attention**: Extended to multi-head attention
-- **Tensor API**: Maintained for user-facing interface
-
-This compositional approach mirrors production AI compilers: stable foundations, incremental improvements, backward compatibility.
-
-## 12.6 Summary
+## 12.5 Summary
 
 Chapter 12 assembled complete transformer blocks by composing layer normalization, multi-head attention, and feedforward networks with residual connections. We implemented primitive operations as Transformer dialect operations with memref-based semantics, defined lowering patterns to Linalg operations for optimization, and composed these primitives into higher-level functions at the Python API level.
 
