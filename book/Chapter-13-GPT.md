@@ -1,10 +1,10 @@
-# Chapter 13: GPT Architecture (Part 1)
+# Chapter 13: GPT Architecture
 
-Chapter 12 built complete transformer blocks—self-attention, feedforward networks, layer normalization, and residual connections composed into reusable units. A single transformer block processes sequences while maintaining structure, but modern language models like GPT-2, GPT-3, and LLaMA require dozens of these blocks stacked sequentially, plus input/output layers for token processing. This chapter constructs complete GPT (Generative Pre-trained Transformer) architecture by stacking transformer blocks, adding token embeddings, implementing causal masking for autoregressive generation, and connecting all components into an end-to-end model.
+Chapter 12 built complete transformer blocks—self-attention, feedforward networks, layer normalization, and residual connections composed into reusable units. A single transformer block processes sequences while maintaining structure, but modern language models like GPT-2, GPT-3, and LLaMA require dozens of these blocks stacked sequentially, plus input/output layers for token processing. This chapter constructs complete GPT (Generative Pre-trained Transformer) architecture by stacking transformer blocks, adding token embeddings, implementing causal masking for autoregressive generation, Rotary Position Embeddings (RoPE), and connecting all components into an end-to-end text generation system.
 
-GPT's architecture follows a straightforward pattern: convert input tokens to embeddings, process through stacked transformer blocks, and project hidden states back to vocabulary logits. The key innovation enabling autoregressive text generation is **causal masking**—preventing each token from attending to future tokens during self-attention. This constraint allows the model to generate text one token at a time, conditioning each new token only on previous context. Chapter 13 Part 1 focuses on this core architecture, establishing the foundation for text generation (Part 2 will cover Rotary Position Embeddings, sampling strategies, and generation pipelines).
+GPT's architecture follows a straightforward pattern: convert input tokens to embeddings, process through stacked transformer blocks with causal attention, and project hidden states back to vocabulary logits. The key innovation enabling autoregressive text generation is **causal masking**—preventing each token from attending to future tokens during self-attention. This constraint allows the model to generate text one token at a time, conditioning each new token only on previous context. RoPE enhances this by encoding relative positional information through geometric rotations, enabling better length extrapolation compared to earlier positional encoding methods.
 
-The chapter demonstrates MLIR's scalability: the same compilation techniques from Chapters 9-12 (dialect operations, progressive lowering, optimization passes) handle GPT's complexity without architectural changes. We'll see how token embeddings lower to memory lookups, how causal masks integrate into attention, and how parameter management scales to models with millions of parameters. By the end of Part 1, you'll have a complete GPT forward pass—ready to compute logits for any input sequence.
+The chapter demonstrates MLIR's scalability: the same compilation techniques from Chapters 9-12 (dialect operations, progressive lowering, optimization passes) handle GPT's complexity without architectural changes. We'll see how token embeddings lower to memory lookups, how causal masks integrate into attention, how RoPE applies trigonometric operations, and how parameter management scales to models with millions of parameters. By the end, you'll have a complete GPT implementation capable of generating text—small-scale but architecturally identical to production systems.
 
 ## 13.1 GPT Architecture Overview
 
@@ -14,10 +14,10 @@ GPT models predict the next token given previous context, stacking transformer b
 def gpt_forward(token_ids, weights):
     """Complete GPT forward pass: tokens → logits"""
     x = embedding_lookup(token_ids, weights['token_embedding'])  # [seq_len, d_model]
-    
+
     for block_weights in weights['transformer_blocks']:
         x = transformer_block(x, block_weights)  # Process through stacked blocks
-    
+
     x = layernorm(x, weights['final_gamma'], weights['final_beta'])
     logits = x @ weights['token_embedding'].T  # [seq_len, vocab_size]
     return logits
@@ -28,9 +28,8 @@ def gpt_forward(token_ids, weights):
 - **Token Embeddings**: Maps token IDs to vectors via table lookup `[vocab_size, d_model]`
 - **Transformer Blocks**: Stacked attention + FFN layers (12 blocks for GPT-2 small, 96 for GPT-3)
 - **Causal Masking**: Attention at position `i` only sees `[0..i]`, enabling autoregressive generation
+- **Rotary Position Embeddings (RoPE)**: Geometric rotations encoding relative positions for better length extrapolation
 - **Tied Embeddings**: Output projection reuses input embedding table to reduce parameters
-
-**Chapter 13 Part 1 Scope**: Token embedding lookup (13.2), causal masking (13.3), stacking transformer blocks (13.4), complete forward pass (13.5). Part 2 covers RoPE, sampling, and generation pipelines.
 
 **Implementation Architecture**. Chapter 13 inherits Chapter 12's linalg-based lowering patterns for the 8 common transformer operations (LayerNorm, Linear, GELU, Add, Matmul, Transpose, Softmax, Scale). Operations take tensor inputs and return tensor results (functional style), enabling automatic bufferization while maintaining clean, composable IR.
 
@@ -45,7 +44,7 @@ These operations lower to structured `linalg` dialect operations, enabling optim
 
 This approach provides the best of both worlds: clean tensor IR for operations and composition, efficient memref code for execution.
 
-The common operations work identically in Chapters 11, 12, 13, and 14, providing architectural consistency. Changes to these operations (e.g., adding tiling optimizations or vectorization) propagate automatically across all chapters. The GPT-specific operations remain independent, allowing Chapters 13-14 to implement unique functionality (integer token indexing, conditional masking, pairwise dimension rotation) without constraining Chapter 12's design. This design ensures that LayerNorm and Linear use linalg.ReduceOp, linalg.GenericOp, linalg.MatmulOp, and linalg.FillOp rather than manual SCF loops—providing Transform dialect hooks for advanced optimizations in Chapter 14.
+The common operations work identically in Chapters 11 to 14, providing architectural consistency. Changes to these operations (e.g., adding tiling optimizations or vectorization) propagate automatically across all chapters. The GPT-specific operations remain independent, allowing Chapters 13-14 to implement unique functionality (integer token indexing, conditional masking, pairwise dimension rotation) without constraining Chapter 12's design. This design ensures that LayerNorm and Linear use linalg.ReduceOp, linalg.GenericOp, linalg.MatmulOp, and linalg.FillOp rather than manual SCF loops—providing Transform dialect hooks for advanced optimizations in Chapter 14.
 
 ## 13.2 Token Embeddings: From IDs to Vectors
 
@@ -67,34 +66,34 @@ def Transformer_EmbeddingOp : Transformer_Op<"embedding"> {
   let summary = "Token embedding lookup";
   let description = [{
     Performs embedding lookup for token IDs.
-    
+
     For each token ID in the input sequence, retrieves the corresponding
     embedding vector from the embedding table.
-    
+
     Example:
     ```mlir
     %result = transformer.embedding %indices, %table
       : tensor<?xi32>, tensor<?x?xf32> -> tensor<?x?xf32>
     ```
-    
+
     Indices shape: [seq_len] (int32)
     Table shape: [vocab_size, d_model] (float32)
     Output shape: [seq_len, d_model] (float32)
-    
+
     Equivalent to:
     for i in 0..seq_len:
       token_id = indices[i]
       for j in 0..d_model:
         output[i][j] = table[token_id][j]
   }];
-  
+
   let arguments = (ins 
     AnyTensor:$indices,  // Token IDs [seq_len]
     AnyTensor:$table     // Embedding table [vocab_size, d_model]
   );
-  
+
   let results = (outs AnyTensor:$result);  // Output embeddings [seq_len, d_model]
-  
+
   let assemblyFormat = [{
     $indices `,` $table
     attr-dict `:` type($indices) `,` type($table) `->` type($result)
@@ -163,11 +162,10 @@ The result is efficient memref code with nested loops and direct memory access, 
    - Assert valid indices (panic on violation)
    - Clamp indices to valid range (silent correction)
    - Return zero vectors for invalid indices (robustness)
-   
+
    Chapter 13's implementation assumes valid inputs (typical for trained models with proper tokenization).
 
 3. **Memory Layout**: The embedding table is row-major: embedding for token `t` occupies contiguous memory `E[t, 0], E[t, 1], ..., E[t, d_model-1]`. Accessing `E[t, :]` has good cache locality (sequential access), making embedding lookup memory-bound but efficient.
-
 
 ## 13.3 Causal Masking: Preventing Future Attention
 
@@ -188,10 +186,10 @@ q3 [w30 w31 w32 w33]           q3 [w30 w31 w32 w33]
 def causal_attention(Q, K, V):
     """Scaled dot-product attention with causal masking."""
     d_k = Q.shape[-1]
-    
+
     # Compute similarity scores
     scores = (Q @ K.T) / np.sqrt(d_k)  # [seq_len, seq_len]
-    
+
     # Create causal mask (upper triangle = -inf)
     seq_len = scores.shape[0]
     mask = np.triu(np.ones((seq_len, seq_len)), k=1) * -np.inf
@@ -199,16 +197,16 @@ def causal_attention(Q, K, V):
     #         [0,   0,  -inf, -inf],
     #         [0,   0,    0,  -inf],
     #         [0,   0,    0,    0]]
-    
+
     # Apply mask: set future positions to -inf
     masked_scores = scores + mask
-    
+
     # Softmax converts -inf to 0
     attention_weights = softmax(masked_scores)  # Future positions have weight 0
-    
+
     # Weighted sum of values
     output = attention_weights @ V
-    
+
     return output
 ```
 
@@ -223,27 +221,27 @@ def Transformer_MaskedSoftmaxOp : Transformer_Op<"masked_softmax"> {
   let description = [{
     Applies softmax along the last dimension with an additive mask.
     The mask is added to logits before exponential:
-    
+
     masked_logits = logits + mask
     softmax(masked_logits)[i] = exp(masked_logits[i]) / sum(exp(masked_logits))
-    
+
     For causal attention:
     - mask[i][j] = 0.0 for allowed positions
     - mask[i][j] = -inf for masked positions
     - After softmax, masked positions have probability 0
-    
+
     Broadcasting: mask shape [seq_len, seq_len] broadcasts to logits [batch, seq_len, seq_len]
-    
+
     Example:
     ```mlir
     %result = transformer.masked_softmax %logits, %mask
       : tensor<2x4x4xf32>, tensor<4x4xf32> -> tensor<2x4x4xf32>
     ```
   }];
-  
+
   let arguments = (ins AnyTensor:$input, AnyTensor:$mask);
   let results = (outs AnyTensor:$result);
-  
+
   let assemblyFormat = [{
     $input `,` $mask
     attr-dict `:` type($input) `,` type($mask) `->` type($result)
@@ -311,13 +309,13 @@ def multi_head_causal_attention(x, W_q, W_k, W_v, W_o, num_heads):
     Q = split_heads(x @ W_q, num_heads)  # [num_heads, seq_len, d_k]
     K = split_heads(x @ W_k, num_heads)
     V = split_heads(x @ W_v, num_heads)
-    
+
     # Apply causal attention to each head
     head_outputs = []
     for h in range(num_heads):
         head_out = causal_attention(Q[h], K[h], V[h])  # Mask applied here
         head_outputs.append(head_out)
-    
+
     # Concatenate and project
     output = concatenate(head_outputs) @ W_o
     return output
@@ -337,20 +335,20 @@ GPT's depth comes from stacking multiple transformer blocks sequentially. Each b
 def gpt_forward(embeddings, block_weights, num_blocks):
     """
     Process embeddings through stacked transformer blocks.
-    
+
     Args:
         embeddings: [seq_len, d_model] token embeddings
         block_weights: list of length num_blocks, each containing block parameters
         num_blocks: number of transformer blocks
-    
+
     Returns:
         hidden_states: [seq_len, d_model] after all blocks
     """
     x = embeddings
-    
+
     for i in range(num_blocks):
         x = transformer_block(x, block_weights[i])
-    
+
     return x
 ```
 
@@ -394,12 +392,12 @@ Tensor gpt_forward(py::array_t<int32_t> indices,
   if (all_weights.size() % 16 != 0) {
     throw std::runtime_error("Expected 16 weights per layer");
   }
-  
+
   int num_layers = all_weights.size() / 16;
-  
+
   // Token embeddings
   Tensor hidden = embedding(indices, embedding_table);
-  
+
   // Apply transformer blocks
   for (int layer = 0; layer < num_layers; layer++) {
     int base = layer * 16;
@@ -415,7 +413,7 @@ Tensor gpt_forward(py::array_t<int32_t> indices,
         all_weights[base + 14], all_weights[base + 15]   // LN2 gamma, beta
     );
   }
-  
+
   // Final layer norm
   return layer_norm(hidden, final_gamma, final_beta);
 }
@@ -430,7 +428,6 @@ Tensor gpt_forward(py::array_t<int32_t> indices,
 3. **Optimization**: MLIR's optimizer sees the expanded graph of primitive operations, enabling cross-operation optimization
 
 The `gpt_forward()` function builds a computation graph by calling primitive operations (`embedding`, `gpt_block`, `layer_norm`), then compiles and executes the entire graph as a single MLIR module.
-
 
 **Memory Consumption**. During forward pass, we must store activations for each block (needed for gradient computation during training). For a model with:
 - Batch size: 8
@@ -450,9 +447,158 @@ Total for 12 blocks: ~1.9 GB
 
 This explains why large-batch training requires substantial GPU memory. Techniques like gradient checkpointing trade computation for memory by recomputing activations during backward pass rather than storing them.
 
-## 13.5 Complete GPT Forward Pass
+## 13.5 Rotary Position Embeddings (RoPE)
 
-With all components implemented (embeddings, causal masking, transformer blocks), we now assemble the complete GPT forward pass. This section demonstrates end-to-end inference: from input token IDs to output vocabulary logits, ready for next-token prediction or generation.
+**Rotary Position Embeddings (RoPE)** encode positions by rotating query and key vectors before attention. For position `m` at dimension pair `(2d, 2d+1)`, RoPE applies rotation:
+
+```
+θ_d = 10000^(-2d/d_model)
+angle = m · θ_d
+
+rotated[2d]   = cos(angle) · x[2d] - sin(angle) · x[2d+1]
+rotated[2d+1] = sin(angle) · x[2d] + cos(angle) · x[2d+1]
+```
+
+**Key property**: After rotation, `Q[m]^T @ K[n] = Q[m]^T @ R_{n-m} @ K[n]`, making attention scores depend on **relative position** `n-m` rather than absolute positions. This enables better length extrapolation compared to learned or sinusoidal embeddings.
+
+**MLIR Operation Definition**. We define a RoPE operation in the Transformer dialect:
+
+```tablegen
+// inc/TransformerOps.td
+def Transformer_RoPEOp : Transformer_Op<"rope"> {
+  let summary = "Rotary position embedding";
+  let description = [{
+    Applies rotary position embeddings to query or key vectors.
+    Positions are implicit: 0, 1, 2, ..., seq_len-1.
+
+    For each position i and dimension pair (2j, 2j+1):
+      θ_j = 10000^(-2j/d_model)
+      angle = i * θ_j
+
+      output[i, 2j]   = cos(angle) * input[i, 2j] - sin(angle) * input[i, 2j+1]
+      output[i, 2j+1] = sin(angle) * input[i, 2j] + cos(angle) * input[i, 2j+1]
+
+    This encodes relative positional information into attention scores.
+
+    Example:
+    ```mlir
+    %result = transformer.rope %input : tensor<32x64xf32> -> tensor<32x64xf32>
+    ```
+
+    References:
+    - RoFormer: Enhanced Transformer with Rotary Position Embedding (Su et al., 2021)
+    - Used in LLaMA, GPT-NeoX, and other modern LLMs
+  }];
+
+  let arguments = (ins AnyTensor:$input);
+  let results = (outs AnyTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
+}
+```
+
+**Lowering RoPE to Standard Dialects**. The lowering generates tensor operations with nested SCF loops computing rotations in four stages:
+
+**Step 1: Set up outer loop over sequence positions**
+```cpp
+// Outer loop: iterate positions 0..seq_len-1 (pos = implicit position)
+Value result = rewriter.create<scf::ForOp>(
+  loc, zeroIdx, seqLenVal, oneIdx, ValueRange{empty},
+  [&](OpBuilder &b, Location loc, Value pos, ValueRange iterArgs) {
+    Value posFloat = b.create<arith::SIToFPOp>(loc, b.getF32Type(), 
+                       b.create<arith::IndexCastOp>(loc, b.getI64Type(), pos));
+```
+
+**Step 2: Inner loop processes dimension pairs with stride 2**
+```cpp
+    // Process pairs: (0,1), (2,3), (4,5), ...
+    Value updatedTensor = b.create<scf::ForOp>(
+      loc, zeroIdx, dModelVal, twoIdx, ValueRange{currentTensor},
+      [&](OpBuilder &b2, Location loc, Value dimIdx, ValueRange args2) {
+        // dimIdx steps by 2, processing consecutive pairs
+```
+
+**Step 3: Compute rotation angle θ and trigonometric values**
+```cpp
+        // θ_j = 10000^(-2j/d_model) where j = dimIdx / 2
+        Value j_i64 = b2.create<arith::DivSIOp>(loc, dimIdxI64, two_i64);  // Integer division!
+        Value j_float = b2.create<arith::SIToFPOp>(loc, b2.getF32Type(), j_i64);
+
+        Value twoJ = b2.create<arith::MulFOp>(loc, two_f32, j_float);
+        Value ratio = b2.create<arith::DivFOp>(loc, twoJ, dModelFloat);
+
+        // base^(-ratio) = exp(-ratio * log(base))
+        Value theta = b2.create<math::ExpOp>(loc, 
+          b2.create<arith::MulFOp>(loc, 
+            b2.create<arith::NegFOp>(loc, ratio), 
+            b2.create<math::LogOp>(loc, base)));
+
+        Value angle = b2.create<arith::MulFOp>(loc, posFloat, theta);
+        Value cosAngle = b2.create<math::CosOp>(loc, angle);
+        Value sinAngle = b2.create<math::SinOp>(loc, angle);
+```
+
+**Step 4: Apply 2D rotation to dimension pair**
+```cpp
+        // Extract pair (x0, x1) from input
+        Value x0 = b2.create<tensor::ExtractOp>(loc, input, ValueRange{pos, dimIdx});
+        Value x1 = b2.create<tensor::ExtractOp>(loc, input, ValueRange{pos, dimIdxPlus1});
+
+        // Rotation: [cos -sin] [x0]   [x0*cos - x1*sin]
+        //           [sin  cos] [x1] = [x0*sin + x1*cos]
+        Value out0 = b2.create<arith::SubFOp>(loc, 
+          b2.create<arith::MulFOp>(loc, x0, cosAngle),
+          b2.create<arith::MulFOp>(loc, x1, sinAngle));
+
+        Value out1 = b2.create<arith::AddFOp>(loc,
+          b2.create<arith::MulFOp>(loc, x0, sinAngle),
+          b2.create<arith::MulFOp>(loc, x1, cosAngle));
+
+        // Insert rotated pair back into output tensor
+        Value tensor1 = b2.create<tensor::InsertOp>(loc, out0, tensor, ValueRange{pos, dimIdx});
+        Value tensor2 = b2.create<tensor::InsertOp>(loc, out1, tensor1, ValueRange{pos, dimIdxPlus1});
+```
+
+**Critical Implementation Detail**: Computing pair index `j = dimIdx / 2` requires **integer division** (`arith::DivSIOp`), ensuring dims (0,1) get j=0, dims (2,3) get j=1, etc. Using floating-point division would cause numerical errors in theta computation. Trigonometric functions (`cos`, `sin`, `exp`, `log`) compile to LLVM intrinsics mapping to hardware instructions.
+
+**Bufferization Transform**. After lowering, the bufferization pipeline converts `tensor.extract/insert` to `memref.load/store`, `tensor.empty` to `memref.alloc`, and tensor loop-carried values to memref in-place updates. The result is efficient memref code with nested loops and direct memory access.
+
+**Integrating RoPE into Attention**. RoPE modifies the attention computation:
+
+```python
+def rope_attention(Q, K, V):
+    """
+    Attention with rotary position embeddings.
+    Positions are implicit: 0, 1, 2, ..., seq_len-1
+
+    Args:
+        Q, K, V: [seq_len, d_model] query, key, value matrices
+
+    Returns:
+        output: [seq_len, d_model] attention output
+    """
+    # Apply RoPE to queries and keys (not values!)
+    Q_rot = apply_rope_batch(Q)
+    K_rot = apply_rope_batch(K)
+
+    # Standard scaled dot-product attention
+    d_k = Q.shape[-1]
+    scores = (Q_rot @ K_rot.T) / np.sqrt(d_k)
+
+    # Causal mask
+    mask = np.triu(np.ones_like(scores), k=1) * -np.inf
+    masked_scores = scores + mask
+
+    attention_weights = softmax(masked_scores)
+    output = attention_weights @ V  # V is NOT rotated
+
+    return output
+```
+
+RoPE only modifies Q and K, leaving V unchanged. This asymmetry is intentional: position information affects attention scores (which positions to attend to) but not value aggregation (what information to extract).
+
+## 13.6 Complete GPT Forward Pass
+
+With all components implemented (embeddings, causal masking, RoPE, transformer blocks), we now assemble the complete GPT forward pass. This section demonstrates end-to-end inference: from input token IDs to output vocabulary logits, ready for next-token prediction or generation.
 
 **Implementation as Composition Function**. The complete forward pass is implemented in the C++ bindings as a composition function that builds a computation graph from primitive operations:
 
@@ -461,13 +607,13 @@ With all components implemented (embeddings, causal masking, transformer blocks)
 Tensor gpt_forward(...) {
   // Create computation graph nodes
   Tensor hidden = embedding(indices, embedding_table);  // Graph node 1
-  
+
   for (int layer = 0; layer < num_layers; layer++) {
     hidden = gpt_block(hidden, layer_weights);  // Graph nodes 2, 3, ...
   }
-  
+
   hidden = layer_norm(hidden, final_gamma, final_beta);  // Final graph node
-  
+
   // Graph is compiled when forward() is called
   return hidden;  // Returns Tensor handle containing the graph
 }
@@ -501,9 +647,106 @@ next_token_id = np.argmax(probs)  # Greedy decoding
 
 For random weights, predictions are meaningless. For trained models (GPT-2, GPT-3), the model completes sequences sensibly: "Hello Wo" → "rld".
 
-**Performance Characteristics**. For minimal configuration (seq_len=8, d_model=64, num_blocks=2), total latency is ~1 ms. For production scale (seq_len=2048, d_model=12288, num_blocks=96), latency exceeds seconds without optimization. Chapter 14 addresses this through KV caching, operator fusion, and quantization.
+## 13.7 Autoregressive Text Generation
 
-## 13.6 Testing and Validation
+With the forward pass complete, we implement **generation**—producing text one token at a time by iteratively sampling from the model's output distribution.
+
+**The Generation Loop**. Starting from a prompt, generate tokens iteratively:
+
+```python
+def generate(prompt_tokens, model_weights, max_new_tokens=50):
+    tokens = list(prompt_tokens)
+    for _ in range(max_new_tokens):
+        logits = gpt_forward(np.array(tokens), model_weights)  # [current_len, vocab_size]
+        next_token = sample(logits[-1, :])  # Sample from last position
+        tokens.append(next_token)
+    return np.array(tokens, dtype=np.int32)
+```
+
+Each iteration runs a forward pass on the full sequence (prompt + generated tokens), extracts logits for the last position, and samples the next token. This reprocessing is inefficient—Chapter 14 optimizes with **KV caching**.
+
+**Sampling Strategies**. Control output diversity through different sampling methods:
+
+**Greedy Decoding**: Always pick the most probable token (`np.argmax(logits)`). Deterministic but repetitive.
+
+**Temperature Scaling**: Scale logits before sampling to control randomness:
+```python
+scaled_logits = logits / temperature  # temperature < 1.0: more confident, > 1.0: more random
+probs = softmax(scaled_logits)
+next_token = np.random.choice(len(probs), p=probs)
+```
+Low temperature (0.5-0.8) produces coherent text, high temperature (1.2-1.5) produces creative but sometimes incoherent text.
+
+**Top-k Sampling**: Restrict sampling to k most probable tokens:
+```python
+top_k_indices = np.argsort(logits)[-k:]  # Get top k
+top_k_probs = softmax(logits[top_k_indices])
+sampled_idx = np.random.choice(k, p=top_k_probs)
+return top_k_indices[sampled_idx]
+```
+Prevents sampling very low-probability nonsensical tokens. Typical: k=40-50.
+
+**Nucleus (Top-p) Sampling**: Sample from smallest set with cumulative probability ≥ p:
+```python
+sorted_probs = np.sort(softmax(logits))[::-1]
+cumsum = np.cumsum(sorted_probs)
+cutoff = np.argmax(cumsum >= p) + 1  # Find nucleus
+# Sample from top cutoff tokens
+```
+Adapts to model confidence: small nucleus when confident, large when uncertain. Typical: p=0.9-0.95.
+
+**Combined Sampling**: Production systems combine temperature + top-k + nucleus for fine-grained control over output diversity and quality.
+
+## 13.8 End-to-End Text Generation Demo
+
+This section demonstrates complete text generation with a minimal GPT using byte-level tokenization (256 vocab size). While using random weights, the architecture and generation process are identical to production systems.
+
+**Model Initialization**. Create a minimal GPT (vocab_size=256, d_model=64, num_blocks=2, ~50K parameters):
+
+```python
+# Initialize embedding table and transformer blocks with random weights
+embedding_table = np.random.randn(vocab_size, d_model).astype(np.float32) * 0.02
+block_weights = [initialize_block(d_model, d_ff) for _ in range(num_blocks)]
+final_gamma = np.ones(d_model, dtype=np.float32)
+final_beta = np.zeros(d_model, dtype=np.float32)
+```
+
+**Text Generation with Different Strategies**:
+
+```python
+# Byte-level tokenization
+prompt = "The quick brown fox"
+prompt_tokens = np.array([ord(c) for c in prompt], dtype=np.int32)
+
+# Greedy decoding (deterministic)
+generated = generate(prompt_tokens, embedding_table, block_weights, 
+                     final_gamma, final_beta, max_new_tokens=30, temperature=0.1)
+
+# Creative sampling (high temperature)
+generated = generate(prompt_tokens, ..., temperature=1.5)
+
+# Nucleus sampling (adaptive)
+generated = generate(prompt_tokens, ..., temperature=0.8, top_p=0.9)
+```
+
+**Comparing Strategies**. Generate with multiple configurations to observe how hyperparameters affect output:
+
+```python
+strategies = [
+    ("Greedy", {"temperature": 0.1}),
+    ("Top-k=50", {"temperature": 0.8, "top_k": 50}),
+    ("Nucleus p=0.9", {"temperature": 0.8, "top_p": 0.9}),
+]
+
+for name, kwargs in strategies:
+    generated = generate(prompt_tokens, embedding_table, block_weights, 
+                         final_gamma, final_beta, max_new_tokens=20, **kwargs)
+    print(f"{name}: {tokens_to_text(generated)}")
+```
+
+Random weights produce gibberish since the model hasn't learned language patterns. With trained weights (e.g., loaded from GPT-2), outputs would be coherent continuations. The generation mechanism handles all prompt types identically—factual, creative, code—though trained models condition strongly on prompt style.
+
+## 13.9 Testing and Validation
 
 Building complex systems like GPT requires testing at three levels: **unit tests** (individual operations like embeddings, masking), **integration tests** (composed sub-systems like attention, transformer blocks), and **system tests** (complete forward pass). Each level catches different bug classes: arithmetic errors, composition issues, and emergent problems respectively.
 
@@ -531,23 +774,21 @@ def test_gpt_forward():
 
 **Debugging Strategy**. When tests fail: (1) isolate the failure by running unit tests first, (2) simplify inputs (seq_len=2, d_model=4) for human-readable outputs, (3) compare against reference implementations at each step, (4) check common issues (NaN/inf from divide-by-zero, shape mismatches from broadcasting, index out-of-bounds). Systematic debugging with data beats guessing.
 
-## 13.7 Summary
+## 13.10 Summary
 
-Chapter 13 Part 1 constructed complete GPT architecture by composing token embeddings, causal masking, and stacked transformer blocks. We implemented the full forward pass—from input token IDs to output vocabulary logits—demonstrating how MLIR handles models with millions of parameters and complex data flow.
+Chapter 13 constructed complete GPT architecture: token embeddings, causal masking, stacked transformer blocks, RoPE, and autoregressive text generation. We implemented the full forward pass—from input token IDs to output vocabulary logits—and demonstrated iterative generation with multiple sampling strategies.
 
-Key insights:
+Key achievements:
 
 - **Token Embeddings**: Lookup tables mapping discrete tokens to continuous vectors for neural network processing
 - **Causal Masking**: Prevents future attention, enabling autoregressive text generation
 - **Sequential Composition**: Stacked transformer blocks with residual connections enable deep representations
-- **Tied Embeddings**: Reusing input embeddings for output projection reduces parameters
+- **Rotary Position Embeddings**: Geometric rotations encoding relative positions for better length extrapolation
+- **Autoregressive Generation**: Iterative token production with various sampling strategies (temperature, top-k, nucleus)
+- **Complete Implementation**: Small-scale GPT architecturally identical to production systems (GPT-2, GPT-3, LLaMA)
 
-The model can now compute next-token predictions for any input sequence. Chapter 13 Part 2 covers autoregressive generation (sampling strategies, managing context) and modern positional encodings (RoPE).
+The implementation demonstrates MLIR's scalability: token embeddings lower to memory lookups, RoPE to trigonometric operations, generation composes forward passes with sampling—all compiled to efficient native code.
 
-**Looking Ahead**. Chapter 13 Part 2 implements:
-- **Rotary Position Embeddings (RoPE)**: Modern positional encoding enabling better length extrapolation
-- **Autoregressive Generation**: Sampling strategies (greedy, temperature, top-k) for text generation
-- **Generation Pipeline**: Iteratively generating tokens one at a time
-- **Text Generation Demo**: Complete end-to-end example generating text from prompts
+**Current Limitations**: Each generation step reprocesses the entire sequence (O(n²) cost), no batching, full O(seq_len²) attention, CPU-only execution.
 
-Together, Parts 1 and 2 deliver a fully functional GPT implementation—small-scale but architecturally identical to production models like GPT-2, GPT-3, and LLaMA. Chapter 14 will then explore production optimization techniques like operator fusion and tiling. Chapter 16 demonstrates KV caching and other serving optimizations required for production deployment.
+**Looking Ahead**: Chapter 14 optimizes this working implementation for production through KV caching (O(n²)→O(n)), Transform dialect optimizations, and declarative rewrite rules. Chapter 15 adds GPU acceleration. The architecture remains unchanged—optimizations happen transparently through MLIR's compilation pipeline.

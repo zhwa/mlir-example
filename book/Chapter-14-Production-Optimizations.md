@@ -118,37 +118,37 @@ Chapters 11-13 already use the Linalg dialect as an intermediate representation:
 // src/TransformerPasses.cpp
 struct MatMulOpLowering : public OpRewritePattern<transformer::MatMulOp> {
   using OpRewritePattern::OpRewritePattern;
-  
+
   LogicalResult matchAndRewrite(transformer::MatMulOp op,
                                 PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     Value lhs = op.getLhs();    // [M, K] tensor
     Value rhs = op.getRhs();    // [K, N] tensor
-    
+
     auto lhsType = cast<RankedTensorType>(lhs.getType());
     auto rhsType = cast<RankedTensorType>(rhs.getType());
-    
+
     // Determine output shape
     int64_t M = lhsType.getShape()[0];
     int64_t N = rhsType.getShape()[1];
     auto resultType = RankedTensorType::get({M, N}, lhsType.getElementType());
-    
+
     // Create empty output tensor
     Value empty = rewriter.create<tensor::EmptyOp>(loc, resultType.getShape(), resultType.getElementType());
-    
+
     // Fill with zeros
     Value zero = rewriter.create<arith::ConstantOp>(
       loc, rewriter.getFloatAttr(resultType.getElementType(), 0.0)
     );
     Value filled = rewriter.create<linalg::FillOp>(loc, zero, empty).getResult(0);
-    
+
     // Create Linalg matmul operation (functional style - returns result)
     Value result = rewriter.create<linalg::MatmulOp>(
       loc, 
       ValueRange{lhs, rhs},        // Tensor inputs
       ValueRange{filled}           // Init tensor (result accumulates into it)
     ).getResult(0);
-    
+
     rewriter.replaceOp(op, result);
     return success();
   }
@@ -163,32 +163,32 @@ The `linalg.matmul` operation is **structured**: it has well-defined semantics (
 // GELU activation: y = x * 0.5 * (1 + tanh(√(2/π) * (x + 0.044715 * x³)))
 struct GELUOpLowering : public OpRewritePattern<transformer::GELUOp> {
   using OpRewritePattern::OpRewritePattern;
-  
+
   LogicalResult matchAndRewrite(transformer::GELUOp op,
                                 PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     Value input = op.getInput();
     auto inputType = cast<RankedTensorType>(input.getType());
-    
+
     // Create empty output tensor
     Value empty = rewriter.create<tensor::EmptyOp>(loc, inputType.getShape(), inputType.getElementType());
-    
+
     // Constants
     Value half = createF32Constant(rewriter, loc, 0.5);
     Value one = createF32Constant(rewriter, loc, 1.0);
     Value coeff = createF32Constant(rewriter, loc, 0.044715);
     Value sqrtTwoPi = createF32Constant(rewriter, loc, 0.7978845608);  // √(2/π)
-    
+
     // Create generic operation
     SmallVector<AffineMap> indexingMaps = {
       AffineMap::getMultiDimIdentityMap(inputType.getRank(), rewriter.getContext()),
       AffineMap::getMultiDimIdentityMap(inputType.getRank(), rewriter.getContext())
     };
-    
+
     SmallVector<utils::IteratorType> iteratorTypes(
       inputType.getRank(), utils::IteratorType::parallel
     );
-    
+
     Value result = rewriter.create<linalg::GenericOp>(
       loc, 
       ValueRange{empty}.getTypes(),  // Result types
@@ -197,7 +197,7 @@ struct GELUOpLowering : public OpRewritePattern<transformer::GELUOp> {
       indexingMaps, iteratorTypes,
       [&](OpBuilder &b, Location loc, ValueRange args) {
         Value x = args[0];
-        
+
         // Compute GELU: x * 0.5 * (1 + tanh(√(2/π) * (x + 0.044715 * x³)))
         Value x2 = b.create<arith::MulFOp>(loc, x, x);
         Value x3 = b.create<arith::MulFOp>(loc, x2, x);
@@ -208,11 +208,11 @@ struct GELUOpLowering : public OpRewritePattern<transformer::GELUOp> {
         Value onePlusTanh = b.create<arith::AddFOp>(loc, one, tanhVal);
         Value halfTerm = b.create<arith::MulFOp>(loc, half, onePlusTanh);
         Value geluResult = b.create<arith::MulFOp>(loc, x, halfTerm);
-        
+
         b.create<linalg::YieldOp>(loc, geluResult);
       }
     ).getResult(0);
-    
+
     rewriter.replaceOp(op, result);
     return success();
   }
@@ -248,14 +248,14 @@ Chapter 9 introduced TableGen for defining operations but deferred **Declarative
 // C++ pattern: ~30 lines per transformation
 struct SimplifyDoubleTranspose : public OpRewritePattern<TransposeOp> {
   using OpRewritePattern::OpRewritePattern;
-  
+
   LogicalResult matchAndRewrite(TransposeOp op,
                                 PatternRewriter &rewriter) const override {
     // Match: transpose(transpose(x))
     auto innerTranspose = op.getInput().getDefiningOp<TransposeOp>();
     if (!innerTranspose)
       return failure();
-    
+
     // Rewrite: replace with x
     rewriter.replaceOp(op, innerTranspose.getInput());
     return success();
@@ -362,13 +362,13 @@ def TransposeAnyShape : Pat<
 
 struct TransformerCanonicalizerPass
     : public PassWrapper<TransformerCanonicalizerPass, OperationPass<func::FuncOp>> {
-  
+
   void runOnOperation() override {
     RewritePatternSet patterns(&getContext());
-    
+
     // Populate with DRR-generated patterns
     populateWithGenerated(patterns);
-    
+
     // Apply patterns greedily
     if (failed(applyPatternsAndFoldGreedily(getOperation(), std::move(patterns)))) {
       signalPassFailure();
@@ -418,7 +418,7 @@ def Transformer_AddOp : Transformer_Op<"add", [Pure, Commutative]> {
   let summary = "Element-wise addition";
   let arguments = (ins AnyRankedTensor:$lhs, AnyRankedTensor:$rhs);
   let results = (outs AnyRankedTensor:$result);
-  
+
   // Canonicalization patterns (DRR)
   let hasCanonicalizer = 1;
 }
@@ -467,7 +467,7 @@ The `AddConstants` helper is defined in C++:
 Attribute AddConstants(Attribute a, Attribute b) {
   auto aFloat = a.cast<FloatAttr>();
   auto bFloat = b.cast<FloatAttr>();
-  
+
   double result = aFloat.getValueAsDouble() + bFloat.getValueAsDouble();
   return FloatAttr::get(aFloat.getType(), result);
 }
@@ -547,7 +547,7 @@ def ShapeInferenceOpInterface : OpInterface<"ShapeInferenceOpInterface"> {
   let description = [{
     Interface for operations that can infer their result shapes from input shapes.
   }];
-  
+
   let methods = [
     InterfaceMethod<
       /*description=*/"Infer output shape from input shapes",
@@ -601,13 +601,13 @@ def Transformer_AddOp : Transformer_Op<"add", [
 SmallVector<int64_t> MatMulOp::inferOutputShape(
     ArrayRef<SmallVector<int64_t>> inputShapes) {
   assert(inputShapes.size() == 2 && "MatMul expects 2 inputs");
-  
+
   auto lhsShape = inputShapes[0];  // [M, K]
   auto rhsShape = inputShapes[1];  // [K, N]
-  
+
   assert(lhsShape.size() == 2 && rhsShape.size() == 2 && "MatMul expects 2D tensors");
   assert(lhsShape[1] == rhsShape[0] && "MatMul dimension mismatch");
-  
+
   return {lhsShape[0], rhsShape[1]};  // [M, N]
 }
 
@@ -615,14 +615,14 @@ SmallVector<int64_t> MatMulOp::inferOutputShape(
 SmallVector<int64_t> AddOp::inferOutputShape(
     ArrayRef<SmallVector<int64_t>> inputShapes) {
   assert(inputShapes.size() == 2 && "Add expects 2 inputs");
-  
+
   // Simple broadcasting: assume same shape or one is scalar
   auto lhsShape = inputShapes[0];
   auto rhsShape = inputShapes[1];
-  
+
   if (lhsShape == rhsShape)
     return lhsShape;
-  
+
   // Handle broadcasting (simplified)
   return lhsShape.size() >= rhsShape.size() ? lhsShape : rhsShape;
 }
@@ -652,10 +652,10 @@ struct ShapeInferencePass : public PassWrapper<ShapeInferencePass, OperationPass
           auto tensorType = operand.getType().cast<RankedTensorType>();
           inputShapes.push_back(llvm::to_vector(tensorType.getShape()));
         }
-        
+
         // Call interface method (polymorphic!)
         SmallVector<int64_t> outputShape = shapeOp.inferOutputShape(inputShapes);
-        
+
         // Update result type
         auto resultType = op->getResult(0).getType().cast<RankedTensorType>();
         auto newType = RankedTensorType::get(outputShape, resultType.getElementType());
@@ -706,14 +706,14 @@ transform.sequence failures(propagate) {
   // Match operations
   %matmul = transform.structured.match ops{["linalg.matmul"]} in %module
     : (!transform.any_op) -> !transform.any_op
-  
+
   // Tile for cache locality (L1: 32 KB)
   %tiled, %loops = transform.structured.tile_using_for %matmul [32, 32, 32]
     : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-  
+
   // Vectorize (AVX2: 8-wide float32)
   transform.structured.vectorize %tiled : !transform.any_op
-  
+
   // Cleanup
   %func = transform.structured.match ops{["func.func"]} in %module
     : (!transform.any_op) -> !transform.any_op
@@ -770,21 +770,21 @@ for pos, token in enumerate(prompt_tokens):
 for step in range(max_new_tokens):
     # Only compute Q/K/V for NEW token
     new_token_embedding = embedding_table[tokens[current_pos]]
-    
+
     for layer in range(num_layers):
         q = compute_query(new_token_embedding, layer)
         k = compute_key(new_token_embedding, layer)
         v = compute_value(new_token_embedding, layer)
-        
+
         # Cache K/V for future iterations
         k_caches[layer][current_pos] = k
         v_caches[layer][current_pos] = v
-        
+
         # Attention using cached keys/values
         scores = q @ k_caches[layer][:current_pos+1].T
         weights = softmax(scores)
         output = weights @ v_caches[layer][:current_pos+1]
-    
+
     current_pos += 1
 ```
 
@@ -797,7 +797,6 @@ Chapter 14's compiler infrastructure includes API hooks for KV-cached forward pa
 ## 14.8 Summary
 
 Chapter 14 introduced production-grade optimization techniques spanning declarative transformations (DRR, Transform dialect), advanced dialect features (interfaces, canonicalization), and compiler support for stateful inference patterns. These techniques represent modern MLIR practice—the same approaches used in production compilers at Google, Meta, and NVIDIA.
-
 
 **Looking Ahead**. Chapter 15 introduces GPU concepts: CUDA programming model, memory hierarchy (global, shared, registers), kernel programming, and MLIR's GPU dialect. Chapter 16 completes the book with production serving: KV cache management, continuous batching, radix cache for prefix sharing, and chunked prefill. These chapters build on Chapter 14's optimization foundation to achieve true production-scale performance.
 
