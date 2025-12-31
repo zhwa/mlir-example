@@ -37,31 +37,23 @@ The optimization techniques in this chapter are production-tested but require pr
 
 **Problem 1: Limited Optimization Transformations**. Chapters 11-14 all use Linalg operations for structured computation—LayerNorm uses `linalg.reduce` and `linalg.generic`, Linear uses `linalg.matmul` and `linalg.transpose`, and element-wise operations lower to `linalg.generic`. After IR is generated, the bufferization pipeline automatically converts to efficient memref code. This consistency ensures that all chapters benefit from the same high-level IR and optimization infrastructure. The implementations are identical across chapters for common operations, with only the GPT-specific operations (Embedding, MaskedSoftmax, RoPE) using manual lowering for specialized logic.
 
-Chapters 11-14 apply **basic compiler optimizations** from Chapter 10: Linalg elementwise operation fusion (merging adjacent operations like add+multiply), loop invariant code motion (LICM, hoisting invariant computations out of loops), and common subexpression elimination (CSE, eliminating redundant calculations). These optimizations provide moderate speedups (10-30% on production-scale models) by reducing memory traffic and redundant computation.
+Chapters 11-14 apply **basic compiler optimizations** from Chapter 10: Linalg elementwise operation fusion (merging adjacent element-wise operations like add+multiply), loop invariant code motion (LICM, hoisting invariant computations out of loops), and common subexpression elimination (CSE, eliminating redundant calculations). These optimizations provide moderate speedups (10-30% on production-scale models) by reducing memory traffic and redundant computation.
 
-However, Chapters 11-13 don't yet apply **aggressive loop transformations** that Chapter 14 introduces:
-
-However, Chapters 11-13 don't yet apply **aggressive loop transformations** that Chapter 14 introduces:
+However, Chapters 11-13 stop at basic optimizations. After Linalg fusion and bufferization, `createConvertLinalgToLoopsPass()` generates naive nested loops without further transformation:
 
 ```cpp
-// Chapters 11-13: Basic optimizations applied
-// - Linalg elementwise fusion: merges adjacent element-wise ops
-// - LICM: hoists loop-invariant code
-// - CSE: eliminates redundant expressions
-//
-// After fusion + createConvertLinalgToLoopsPass():
-// Still generates naive nested loops (no tiling, no vectorization)
+// After basic optimizations, loops are still naive:
 auto iLoop = rewriter.create<scf::ForOp>(loc, zero, M, one);
   auto jLoop = rewriter.create<scf::ForOp>(loc, zero, N, one);
     auto kLoop = rewriter.create<scf::ForOp>(loc, zero, K, one);
-      // Scalar operations...
+      // Scalar operations (no SIMD vectorization)
 ```
 
-The basic optimizations reduce overhead but don't address fundamental performance issues. Chapter 14's aggressive transformations provide much larger gains (3-5× for production models):
+Chapter 14 adds **aggressive loop transformations** that provide much larger gains (3-5× for production models):
 
-- **No tiling**: Default lowering generates monolithic loops without cache-friendly blocking
-- **No vectorization**: Loops lower to scalar operations (one float32 per cycle instead of 8-16 with SIMD)
-- **No fusion**: Each Linalg operation lowers independently, preventing producer-consumer fusion
+- **Tiling**: Break loops into cache-friendly blocks (32×32 tiles fit L1 cache)
+- **Vectorization**: Exploit SIMD units (8× float32 with AVX2, 16× with AVX-512)
+- **Advanced Fusion**: Use Transform Dialect to fuse operations across entire subgraphs
 
 **Problem 2: Sequential Operations Waste Memory Bandwidth**. Operations execute independently:
 
@@ -93,10 +85,10 @@ At token 20, the model recomputes attention for tokens 0-19 despite their keys a
 
 **Hardware Underutilization**. Modern CPUs have powerful SIMD units:
 
-- AVX2 (2013+): 256-bit registers, 8× float32 operations per cycle
-- AVX-512 (2017+): 512-bit registers, 16× float32 operations per cycle
+- **AVX2** (2013+): 256-bit registers, 8 float32 values per register
+- **AVX-512** (2017+): 512-bit registers, 16 float32 values per register
 
-Scalar code uses ~6-12% of CPU compute capability. The gap is wasted potential—especially for production-scale models where compute matters.
+Scalar code processes one float32 per instruction, using only 1/8th (AVX2) or 1/16th (AVX-512) of available vector width—approximately 6-12% of CPU compute capability. The remaining 88-94% sits idle. For production-scale models where compute matters, this underutilization is a critical bottleneck.
 
 ## 14.2 High-Level IR with Linalg
 
