@@ -144,8 +144,6 @@ def Transformer_RoPEOp : Transformer_Op<"rope"> {
 }
 ```
 
-**Tensor-First Design**. Like other Chapter 13 operations, RoPE uses functional tensor style: takes a tensor input and returns a tensor result. Positions are implicit (0..seq_len-1) rather than explicit—simpler for the common case of sequential positions. After lowering to tensor operations (using `tensor::EmptyOp`, `tensor::ExtractOp`, `tensor::InsertOp`), the bufferization pipeline automatically converts to efficient memref code.
-
 **Lowering RoPE to Standard Dialects**. The lowering generates tensor operations with nested SCF loops computing rotations:
 
 ```cpp
@@ -252,7 +250,7 @@ The outer loop iterates over positions (0..seq_len-1), using the loop index `pos
 
 **Key Implementation Detail**: The pair index `j = dimIdx / 2` uses **integer division** (`arith::DivSIOp`), not floating-point division. This ensures dims 0,1 get j=0, dims 2,3 get j=1 (not j=1.5!). This was a critical bug fix—using float division caused numerical errors in theta computation.
 
-**Bufferization Transform**. After tensor-based lowering, the bufferization pipeline converts `tensor.extract/insert` to `memref.load/store`, `tensor.empty` to `memref.alloc`, and tensor loop-carried values to memref in-place updates. The result is efficient memref code with nested loops and direct memory access.
+**Bufferization Transform**. After lowering, the bufferization pipeline converts `tensor.extract/insert` to `memref.load/store`, `tensor.empty` to `memref.alloc`, and tensor loop-carried values to memref in-place updates. The result is efficient memref code with nested loops and direct memory access.
 
 **Integrating RoPE into Attention**. RoPE modifies the attention computation:
 

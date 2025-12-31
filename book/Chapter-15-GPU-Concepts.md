@@ -1,6 +1,6 @@
 # Chapter 15: GPU Programming Concepts
 
-Chapters 1-14 built a complete GPT architecture using MLIR's high-level abstractions—Chapters 11-14 used the **Transformer dialect with tensor-first operations** that automatically bufferize to efficient code, while Chapter 14 added **Transform Dialect optimizations** (tiling, fusion, vectorization) for production-grade performance. The implementations are functionally correct and optimized for CPU, but modern LLM serving requires GPU acceleration—thousands of parallel threads, high memory bandwidth, specialized tensor cores. Chapter 15 introduces GPU programming fundamentals through MLIR, teaching the **low-level concepts** underlying production GPU code generation.
+Chapters 1-14 built a complete GPT architecture using MLIR's high-level abstractions—Chapters 11-14 used the **Transformer dialect** with operations that automatically bufferize to efficient code, while Chapter 14 added **Transform Dialect optimizations** (tiling, fusion, vectorization) for production-grade performance. The implementations are functionally correct and optimized for CPU, but modern LLM serving requires GPU acceleration—thousands of parallel threads, high memory bandwidth, specialized tensor cores. Chapter 15 introduces GPU programming fundamentals through MLIR, teaching the **low-level concepts** underlying production GPU code generation.
 
 **Two Levels of GPU Programming**. This chapter takes a unique pedagogical approach distinct from Chapters 11-14:
 

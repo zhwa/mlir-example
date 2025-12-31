@@ -224,7 +224,7 @@ def Transformer_SoftmaxOp : Transformer_Op<"softmax"> {
 }
 ```
 
-The description specifies **numerically stable** softmax—max subtraction prevents overflow. This is crucial: without it, exp(large_number) produces infinity, breaking attention. The implementation (Section 11.3) shows the four-pass tensor-based algorithm.
+The description specifies **numerically stable** softmax—max subtraction prevents overflow. This is crucial: without it, exp(large_number) produces infinity, breaking attention. The implementation (Section 11.3) shows the four-pass algorithm.
 
 ### 11.2.4 Element-Wise Operations
 
@@ -261,11 +261,11 @@ Addition handles residual connections (Chapter 12). Multiplication enables eleme
 
 ## 11.3 Lowering Patterns
 
-Operations defined, we now implement lowering—converting high-level `transformer.*` operations to MLIR's **Linalg dialect** using tensor operations. The transformer dialect provides domain-specific names (`transformer.matmul` is clearer than `linalg.matmul` in attention code) that immediately lower to linalg for optimization. The bufferization pipeline (Section 11.5) later converts these pure tensor operations to efficient memref-based execution code.
+Operations defined, we now implement lowering—converting high-level `transformer.*` operations to MLIR's **Linalg dialect**. The transformer dialect provides domain-specific names (`transformer.matmul` is clearer than `linalg.matmul` in attention code) that immediately lower to linalg for optimization. The bufferization pipeline (Section 11.5) later converts these tensor operations to efficient execution code.
 
 ### 11.3.1 Matrix Multiplication Lowering
 
-Matrix multiplication C = A @ B lowers to tensor-based linalg operations:
+Matrix multiplication C = A @ B lowers to linalg operations:
 
 ```mlir
 %empty = tensor.empty(%M, %N) : tensor<?x?xf32>
@@ -534,25 +534,25 @@ Multiplication follows identically, replacing `arith.AddFOp` with `arith.MulFOp`
 
 ### 11.3.5 From Tensors to Executable Code: The Pass Pipeline
 
-Our transformer operations lower to tensor-based linalg operations, which then go through bufferization and loop generation. The complete pass pipeline:
+Our transformer operations lower to linalg operations, which then go through bufferization and loop generation. The complete pass pipeline:
 
 ```cpp
-pm.addPass(createLowerTransformerToStandardPass());  // transformer -> linalg (tensors)
-// Optimization passes work on linalg tensor operations here
+pm.addPass(createLowerTransformerToStandardPass());  // transformer -> linalg
+// Optimization passes work on linalg operations here
 pm.addPass(createBufferizePass());                   // tensors -> memrefs
 pm.addPass(createConvertLinalgToLoopsPass());        // linalg -> scf.for
 pm.addPass(createSCFToControlFlowPass());            // scf -> control flow
 // ... remaining passes to LLVM IR
 ```
 
-**The Tensor-First Advantage**: Our lowering produces tensor-based linalg operations (`linalg.matmul` on tensors, `linalg.generic` with tensor inputs/outputs). This enables optimization passes that work on the tensor level:
+**Optimization Opportunities**: Our lowering produces linalg operations that enable optimization passes:
 
 - **Tiling**: Break operations into cache-friendly blocks
 - **Fusion**: Merge producer-consumer operations, eliminating intermediate tensors
 - **Vectorization**: Generate SIMD instructions (AVX, NEON)
 - **Parallelization**: Distribute across threads
 
-After optimizations, bufferization converts tensors to memrefs, and loop lowering generates actual control flow. This staged approach—high-level tensor operations → optimizations → bufferization → loops—gives us the best of both worlds: composable functional-style IR and efficient imperative execution.
+After optimizations, bufferization converts tensors to memrefs, and loop lowering generates actual control flow. This staged approach gives us composable functional-style IR and efficient imperative execution.
 
 **Registering the Linalg Dialect**. From [src/bindings.cpp](ch.11.Attention/src/bindings.cpp):
 
@@ -618,7 +618,7 @@ py::array_t<float> forward(const Tensor& input) {
 
 Four stages: graph → MLIR, MLIR → LLVM, LLVM → native, native → execution. Let's examine each.
 
-**Stage 1: Graph to MLIR**. The `buildGraphFunction()` traverses the graph, emitting tensor-based MLIR operations:
+**Stage 1: Graph to MLIR**. The `buildGraphFunction()` traverses the graph, emitting MLIR operations:
 
 ```cpp
 void buildGraphFunction(OpBuilder& builder, ModuleOp module,
@@ -728,7 +728,7 @@ func.func @graph_func(%Q: tensor<?x?xf32>, %K: tensor<?x?xf32>,
 }
 ```
 
-Pure functional operations, tensor types throughout, no explicit allocations. This high-level tensor-based IR is ready for lowering and bufferization.
+Pure functional operations, tensor types throughout, no explicit allocations. This high-level IR is ready for lowering and bufferization.
 
 **Stage 2: Lowering to Linalg and Bufferization**. The compiler applies passes from Section 11.3, followed by a critical three-pass bufferization pipeline:
 
@@ -736,7 +736,7 @@ Pure functional operations, tensor types throughout, no explicit allocations. Th
 bool TransformerCompiler::lowerToLLVM(ModuleOp module) {
   PassManager pm(&context_);
 
-  // Step 1: Lower transformer dialect to tensor-based linalg
+  // Step 1: Lower transformer dialect to linalg
   pm.addNestedPass<func::FuncOp>(createLowerTransformerToStandardPass());
   pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
   pm.addNestedPass<func::FuncOp>(createCSEPass());
@@ -810,7 +810,7 @@ After these three passes, all tensor operations are gone—the IR is fully memre
 
 Trying to do all three in one pass would be extremely complex. The modular approach keeps each pass focused and maintainable.
 
-First, transformer ops → tensor-based linalg (Section 11.3's patterns). Then, bufferization converts tensors → memrefs. Then, linalg → scf.for loops (via `createConvertLinalgToLoopsPass()`). Finally, loops → LLVM IR (standard MLIR passes). Canonicalization and CSE (common subexpression elimination) clean up between major transformations. After this pipeline, the module contains only LLVM dialect operations—pointers, branches, arithmetic instructions.
+First, transformer ops → linalg (Section 11.3's patterns). Then, bufferization converts tensors → memrefs. Then, linalg → scf.for loops (via `createConvertLinalgToLoopsPass()`). Finally, loops → LLVM IR (standard MLIR passes). Canonicalization and CSE (common subexpression elimination) clean up between major transformations. After this pipeline, the module contains only LLVM dialect operations—pointers, branches, arithmetic instructions.
 
 **Stage 3: LLVM IR to Native Code**. MLIR's ExecutionEngine compiles LLVM dialect to machine code. The process: register LLVM dialect translations, invoke `ExecutionEngine::create()` which runs LLVM's JIT compiler (OrcJIT) at optimization level 3, generate machine code for the target architecture, and look up the compiled function's entry point address—a raw pointer to executable code in memory.
 
@@ -975,7 +975,7 @@ The test suite in [test_jit.py](ch.11.Attention/test_jit.py) validates all opera
 
 ## 11.8 Conclusion
 
-This chapter built a complete attention implementation in MLIR, from high-level operations to executable machine code. We defined a Transformer dialect with five operations (`matmul`, `add`, `mul`, `softmax`, `transpose`), wrote lowering patterns to tensor-based linalg operations, implemented a tensor abstraction for building computation graphs, and JIT-compiled graphs to native code via LLVM.
+This chapter built a complete attention implementation in MLIR, from high-level operations to executable machine code. We defined a Transformer dialect with five operations (`matmul`, `add`, `mul`, `softmax`, `transpose`), wrote lowering patterns to linalg operations, implemented a tensor abstraction for building computation graphs, and JIT-compiled graphs to native code via LLVM.
 
 **Key insights**: Domain-specific dialects capture attention semantics naturally. Multi-level IR (Python API → transformer dialect → linalg → loops → LLVM IR) enables optimization at each abstraction level. Lowering to linalg rather than raw loops unlocks MLIR's optimization passes (tiling, fusion, vectorization). Pattern rewriting keeps transformations modular—adding operations means adding patterns without changing existing code. Numerical correctness requires careful attention to stability (max subtraction in softmax) and initialization (zeroed accumulators).
 

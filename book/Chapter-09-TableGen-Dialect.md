@@ -368,7 +368,7 @@ The `[{...}]` syntax for multi-line strings is TableGen-specific. Inside these d
 - **`outs`** - Keyword indicating these are output results (values returned by the operation).
 - **`:$result`** - Names the result, generating a method `Value getResult()` in the operation class.
 
-Our add operation takes two tensor inputs and returns one tensor result. This functional style (returning values) matches modern MLIR conventions and enables optimizations. For operations that need to modify memory in-place, you can still use memref types, but tensor-based operations are preferred for their immutability and value semantics.
+Our add operation takes two tensor inputs and returns one tensor result. This functional style (returning values) matches modern MLIR conventions and enables optimizations.
 
 **Assembly Format Specification**. The `assemblyFormat` field defines how the operation appears in MLIR text. This format string generates both parser (text → IR) and printer (IR → text) code automatically. The syntax:
 
@@ -1266,7 +1266,7 @@ This C++ pattern rewriting approach—type-safe, composable, integrated with MLI
 
 ### 9.7.4 The Complete Compilation Pipeline with Bufferization
 
-After lowering our `nn` dialect operations to tensor-based `linalg` operations, we still need to convert those high-level tensor operations all the way down to LLVM IR for execution. This requires a multi-stage compilation pipeline that includes a critical step: **bufferization**—converting immutable tensors to mutable memrefs. Let's examine the complete pipeline in [src/bindings.cpp](../ch.9.TableGen-dialect/src/bindings.cpp).
+After lowering our `nn` dialect operations to `linalg` operations, we still need to convert those high-level operations all the way down to LLVM IR for execution. This requires a multi-stage compilation pipeline that includes a critical step: **bufferization**—converting immutable tensors to mutable memrefs. Let's examine the complete pipeline in [src/bindings.cpp](../ch.9.TableGen-dialect/src/bindings.cpp).
 
 **The Full Pipeline**:
 
@@ -1282,7 +1282,7 @@ bool lowerToLLVM(ModuleOp module) {
   bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(registry);
   context_.appendDialectRegistry(registry);
 
-  // 1. Lower NN dialect to linalg (tensor-based)
+  // 1. Lower NN dialect to linalg
   pm.addPass(createConvertNNToStandardPass());
   pm.addPass(mlir::createCanonicalizerPass());
 
@@ -1312,7 +1312,7 @@ bool lowerToLLVM(ModuleOp module) {
 
 **Pipeline Stages Explained**:
 
-**Stage 1: NN → Linalg (Tensor-based)**. Our custom `ConvertNNToStandardPass` lowers high-level operations like `nn.add` and `nn.matmul` to tensor-based `linalg.generic` and `linalg.matmul` operations. At this stage, we're still working with immutable tensors—functional style operations that return new values rather than modifying memory in-place.
+**Stage 1: NN → Linalg**. Our custom `ConvertNNToStandardPass` lowers high-level operations like `nn.add` and `nn.matmul` to `linalg.generic` and `linalg.matmul` operations. These operations work with immutable tensors—functional style operations that return new values.
 
 **Stage 2: Bufferization (Tensors → Memrefs)**. This is where the magic happens! The `OneShotBufferizePass` systematically converts:
 - `tensor<4xf32>` types → `memref<4xf32>` types
@@ -1350,7 +1350,7 @@ Each of these registrations tells OneShotBufferize how to handle specific operat
 // Start: High-level NN dialect
 %result = nn.add %a, %b : tensor<4xf32>
 
-// After NN lowering: Tensor-based linalg
+// After NN lowering
 %empty = tensor.empty() : tensor<4xf32>
 %result = linalg.generic {...} ins(%a, %b) outs(%empty) : tensor<4xf32>
 
@@ -1378,7 +1378,7 @@ scf.for %i = %c0 to %c4 step %c1 {
 4. SCF: Explicit control flow (ready for backend)
 5. LLVM: Machine-level operations (ready for execution)
 
-This staged lowering enables optimizations at each level. Tensor-based linalg enables fusion and tiling. Memref-based linalg enables buffer reuse and memory planning. SCF loops enable loop transformations. LLVM enables machine-specific optimizations.
+This staged lowering enables optimizations at each level. Linalg operations enable fusion and tiling. SCF loops enable loop transformations. LLVM enables machine-specific optimizations.
 
 **Comparison with Chapter 8**. Chapter 8 generated low-level MLIR text directly (linalg on memrefs). Chapter 9 starts higher (linalg on tensors) and uses MLIR's bufferization infrastructure to systematically lower. This approach is more modular, enables more optimizations, and matches production ML compilers like JAX (HLO → Linalg → Bufferize → LLVM) and Torch-MLIR (Torch → Linalg → Bufferize → LLVM).
 
@@ -1750,7 +1750,7 @@ py::array_t<float> forward(const Tensor& output_tensor) {
 **OpBuilder Methods**. Key OpBuilder APIs:
 
 ```cpp
-// Create operations (tensor-based)
+// Create operations
 Value result = builder.create<AddOp>(loc, resultType, lhs, rhs);
 
 // Get types

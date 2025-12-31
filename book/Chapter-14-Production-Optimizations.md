@@ -1,10 +1,10 @@
 # Chapter 14: Production-Grade Optimizations
 
-Chapter 13 built a complete GPT architecture—token embeddings, RoPE, attention, feedforward networks, and autoregressive generation—using a **tensor-first architecture** with functional-style operations and automatic bufferization. The implementation is correct but naive: full forward passes every generation step, no cache locality optimization, scalar operations instead of SIMD vectors, separate operations that could fuse. Production systems require orders-of-magnitude speedup for real-time serving. This chapter transforms Chapter 13's educational GPT into production-grade code using modern compiler techniques and advanced dialect features deferred from Chapter 9.
+Chapter 13 built a complete GPT architecture—token embeddings, RoPE, attention, feedforward networks, and autoregressive generation—with functional-style operations and automatic bufferization. The implementation is correct but naive: full forward passes every generation step, no cache locality optimization, scalar operations instead of SIMD vectors, separate operations that could fuse. Production systems require orders-of-magnitude speedup for real-time serving. This chapter transforms Chapter 13's educational GPT into production-grade code using modern compiler techniques and advanced dialect features deferred from Chapter 9.
 
 **Implementation Note**: Chapter 14 implements **Transform Dialect optimizations** (tiling, fusion, vectorization) in [src/bindings.cpp](../ch.14.GPT-Optimized/src/bindings.cpp) lines 98-287. These optimizations are production-tested techniques used by Google (IREE), Meta (Torch-MLIR), and NVIDIA compilers. For nano GPT (d_model=64), the optimizations don't show dramatic speedups because all data fits in L1 cache—but the implementation is correct and production-ready. When applied to real models (GPT-2: d_model=768, GPT-3: d_model=12288), these same techniques provide 3-5× speedups. The educational value is learning WHERE, WHY, and HOW to optimize for production serving.
 
-The optimization journey has four pillars: **high-level IR** (tensor operations with Linalg lowering enable pattern recognition), **declarative transformations** (Transform dialect and DRR provide composable optimization), **advanced dialect features** (interfaces, canonicalization patterns), and **algorithmic improvements** (KV caching eliminates redundant computation). Chapter 14 inherits Chapter 13's tensor-first architecture where operations work on immutable tensors at high level, then bufferize to efficient memref code for execution. Modern MLIR optimization goes beyond legacy passes to embrace declarative, transparent, and composable transformations—the approach used in production compilers at Google (IREE), Meta (Torch-MLIR), and NVIDIA.
+The optimization journey has four pillars: **high-level IR** (tensor operations with Linalg lowering enable pattern recognition), **declarative transformations** (Transform dialect and DRR provide composable optimization), **advanced dialect features** (interfaces, canonicalization patterns), and **algorithmic improvements** (KV caching eliminates redundant computation). Modern MLIR optimization goes beyond legacy passes to embrace declarative, transparent, and composable transformations—the approach used in production compilers at Google (IREE), Meta (Torch-MLIR), and NVIDIA.
 
 **A Note on Performance Numbers**. Throughout this chapter, we discuss theoretical speedups (3-5× for compiler optimizations, 10-100× for KV caching). These numbers represent what's achievable for **production-scale models** (GPT-2 with d_model=768, GPT-3 with d_model=12288). Our nano GPT implementation (d_model=64, 2 layers, vocab=256) is too small to demonstrate these gains—compiler optimizations become effective when operation sizes exceed cache capacities and memory bandwidth becomes the bottleneck. The techniques are correct and production-ready; the scale is educational. Think of this as learning race car driving with a go-kart: the principles are identical, but you won't hit 200 mph.
 
@@ -35,9 +35,9 @@ GPT-3 (d_model=12288, 96 layers):
 
 The optimization techniques in this chapter are production-tested but require production-scale problems to demonstrate their value. We implement them for completeness and to prepare for real deployments.
 
-**Problem 1: Untapped Optimization Opportunities**. Chapters 11-14 all use tensor-first architecture with Linalg operations for structured computation—LayerNorm uses `linalg.reduce` and `linalg.generic` on tensors, Linear uses `linalg.matmul` and `linalg.transpose` on tensors, and element-wise operations lower to `linalg.generic` on tensors. After tensor-based IR is generated, the bufferization pipeline automatically converts to efficient memref code. This consistency ensures that all chapters benefit from the same high-level IR and optimization infrastructure. The implementations are identical across chapters for common operations, with only the GPT-specific operations (Embedding, MaskedSoftmax, RoPE) using manual tensor lowering for specialized logic.
+**Problem 1: Untapped Optimization Opportunities**. Chapters 11-14 all use Linalg operations for structured computation—LayerNorm uses `linalg.reduce` and `linalg.generic`, Linear uses `linalg.matmul` and `linalg.transpose`, and element-wise operations lower to `linalg.generic`. After IR is generated, the bufferization pipeline automatically converts to efficient memref code. This consistency ensures that all chapters benefit from the same high-level IR and optimization infrastructure. The implementations are identical across chapters for common operations, with only the GPT-specific operations (Embedding, MaskedSoftmax, RoPE) using manual lowering for specialized logic.
 
-This high-level tensor IR provides semantic richness that enables optimization, but we haven't yet applied aggressive transformations in Chapters 11-13:
+This high-level IR provides semantic richness that enables optimization, but we haven't yet applied aggressive transformations in Chapters 11-13:
 
 ```cpp
 // Chapters 11-13: Linalg operations on tensors (high-level, structured, functional)
@@ -226,7 +226,7 @@ struct GELUOpLowering : public OpRewritePattern<transformer::GELUOp> {
   }
 };
 
-// After tensor-based lowering, bufferization automatically converts:
+// After lowering, bufferization automatically converts:
 // - tensor.empty → memref.alloc
 // - linalg.generic on tensors → linalg.generic on memrefs
 // - Functional results → out-parameters
@@ -242,13 +242,7 @@ The `iteratorTypes` attribute specifies `parallel`—all iterations are independ
 
 3. **Iterator Types**: `parallel` vs `reduction` semantics enable aggressive transformations (parallel iterations vectorize, reorder freely)
 
-**Tensor-First Benefits**: Working with Linalg on tensors (rather than memrefs) provides additional advantages:
-- Immutable semantics enable aggressive reordering and fusion
-- Functional style makes dataflow explicit for optimization passes
-- Bufferization happens late, after high-level optimizations complete
-- Standard pattern: all modern MLIR compilers (Torch-MLIR, IREE, StableHLO) use this approach
-
-Optimized Linalg IR on tensors (with tiling, vectorization, fusion) is **semantically equivalent** to Chapters 11-13's tensor-based lowering—same computation, but with transformations applied before bufferization and conversion to SCF. The educational value is learning these production-grade optimization techniques, not measuring speedup on nano GPT (which is too small to show significant gains).
+Optimized Linalg IR (with tiling, vectorization, fusion) is **semantically equivalent** to Chapters 11-13's lowering—same computation, but with transformations applied before bufferization and conversion to SCF. The educational value is learning these production-grade optimization techniques, not measuring speedup on nano GPT (which is too small to show significant gains).
 
 ## 14.3 Declarative Rewrite Rules (DRR)
 
@@ -489,10 +483,10 @@ Attribute AddConstants(Attribute a, Attribute b) {
 
 This performs arithmetic at **compile time**, producing a single constant instead of runtime computation.
 
-**Transformer Dialect Canonicalization**. For dialects using functional-style operations with results (tensor-based), canonicalization patterns can be defined:
+**Transformer Dialect Canonicalization**. For dialects using functional-style operations with results, canonicalization patterns can be defined:
 
 ```tablegen
-// Example patterns (for tensor-based dialects)
+// Example patterns
 def AddZero : Pat<(AddOp $x, (ConstantOp Zero)), (replaceWithValue $x)>;
 def MulOne : Pat<(MulOp $x, (ConstantOp One)), (replaceWithValue $x)>;
 def MulZero : Pat<(MulOp $x, (ConstantOp Zero)), (ConstantOp Zero)>;
@@ -518,8 +512,6 @@ def ReLUConstant : Pat<
 
 These patterns eliminate redundant operations, simplify IR, and enable subsequent optimizations to be more effective.
 
-**Chapter 14 Tensor-First Architecture**: Like Chapter 13, Chapter 14 uses tensor-based operations with functional results (e.g., `%result = transformer.add %lhs, %rhs`). Canonicalization patterns work naturally with this functional style, as immutable tensors make it easy to reason about when operations can be eliminated or simplified without side effects. The tensor operations lower to Linalg on tensors, where additional canonicalization and optimization occur before bufferization converts to efficient memref code.
-
 **Why Canonicalization Matters**. Three key benefits:
 
 1. **Optimization Enablement**: Simplified IR exposes optimization opportunities (fusion, constant propagation)
@@ -530,7 +522,7 @@ Canonicalization is **cheap** (pattern matching) and **high-value** (enables exp
 
 ## 14.5 Custom OpInterface
 
-**Note**: This section describes an important production technique that is **not yet fully implemented in ch.14.GPT-Optimized** but represents a natural extension of the tensor-first architecture. The current implementation inherits Chapter 13's tensor-based operations and relies primarily on Linalg dialect interfaces. Custom OpInterface is a powerful MLIR feature used extensively in production compilers for extensibility and polymorphism, and Chapter 14 demonstrates how to define and use them.
+**Note**: This section describes an important production technique that is **not yet fully implemented in ch.14.GPT-Optimized** but represents a natural extension of the architecture. The current implementation relies primarily on Linalg dialect interfaces. Custom OpInterface is a powerful MLIR feature used extensively in production compilers for extensibility and polymorphism, and Chapter 14 demonstrates how to define and use them.
 
 Chapter 9 briefly mentioned interfaces but focused on operation definition. **OpInterface** is MLIR's mechanism for polymorphism—defining generic algorithms that work across multiple operations without knowing their specific types. This section demonstrates defining and using custom interfaces.
 

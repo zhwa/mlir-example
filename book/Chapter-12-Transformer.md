@@ -4,7 +4,7 @@ Chapter 11 built scaled dot-product attention—the core mechanism enabling tran
 
 This chapter composes Chapter 11's attention with additional components to build complete transformer blocks. We'll implement **layer normalization** (normalizing activations across the embedding dimension for training stability), **feedforward networks** (two-layer MLPs with nonlinear activations providing per-position computation), and **residual connections** (skip connections enabling gradient flow in deep networks). The Python API remains simple—users call `transformer_block(x)` and get output—but underneath, MLIR orchestrates complex multi-operation pipelines with automatic optimization.
 
-Chapter 12's architecture follows established patterns: we extend the Transformer dialect (from Chapter 11's attention operations) with `transformer.layernorm`, `transformer.ffn`, and `transformer.residual` operations, implement lowering patterns to standard dialects, and maintain the Tensor-based computation graph API. The result is a reusable transformer block abstraction suitable for building larger models (Chapter 13's GPT) while demonstrating how MLIR's compositional design scales from individual operations to complex architectural components.
+Chapter 12's architecture follows established patterns: we extend the Transformer dialect (from Chapter 11's attention operations) with `transformer.layernorm`, `transformer.ffn`, and `transformer.residual` operations, implement lowering patterns to standard dialects, and maintain the computation graph API. The result is a reusable transformer block abstraction suitable for building larger models (Chapter 13's GPT) while demonstrating how MLIR's compositional design scales from individual operations to complex architectural components.
 
 The chapter progresses from understanding transformer block architecture (why each component matters), through implementing layer normalization (variance calculation and normalization), feedforward networks (linear layers with GELU activation), to composing everything with residual connections. We'll see how MLIR's optimization passes (Chapter 10's fusion and vectorization) automatically apply to these new operations without additional code. By the end, you'll have a complete transformer block implementation and understand how production transformers decompose into manageable, optimizable components.
 
@@ -196,8 +196,6 @@ def Transformer_LayerNormOp : Transformer_Op<"layer_norm"> {
 
     For input shape [seq_len, d_model], computes seq_len independent normalizations.
     Epsilon (1e-5) is hardcoded in the lowering pattern for numerical stability.
-
-    Follows tensor-first architecture: operations use AnyTensor types and return results.
   }];
 
   let arguments = (ins
@@ -215,9 +213,9 @@ def Transformer_LayerNormOp : Transformer_Op<"layer_norm"> {
 }
 ```
 
-The operation takes input tensor, gamma/beta parameters, and returns normalized output with the same shape as input. This follows Chapter 11's tensor-first architecture pattern.
+The operation takes input tensor, gamma/beta parameters, and returns normalized output with the same shape as input.
 
-**Lowering to Linalg**. Layer normalization lowers to a sequence of tensor-based Linalg operations combining reductions and element-wise computations:
+**Lowering to Linalg**. Layer normalization lowers to a sequence of Linalg operations combining reductions and element-wise computations:
 
 ```cpp
 // src/TransformerPasses.cpp
@@ -360,7 +358,7 @@ struct LayerNormOpLowering : public OpRewritePattern<LayerNormOp> {
 };
 ```
 
-This lowering demonstrates **tensor-first structured reduction patterns** that enable MLIR's optimization and bufferization:
+This lowering demonstrates structured reduction patterns that enable MLIR's optimization and bufferization:
 
 1. **Two-stage reductions**: First `linalg.reduce` computes sums, then `linalg.generic` normalizes—this enables fusion opportunities
 2. **Broadcast semantics**: Affine maps explicitly encode how 1D statistics (mean, variance) broadcast across 2D tensors—no manual index arithmetic
@@ -465,7 +463,7 @@ def Transformer_GeluOp : Transformer_Op<"gelu"> {
 }
 ```
 
-The Python API provides a composite `ffn()` function that works with the tensor-based operations:
+The Python API provides a composite `ffn()` function:
 
 ```python
 # Python API (bindings.cpp)
@@ -479,7 +477,7 @@ def ffn(input, w1, b1, w2, b2):
 
 This compositional design enables operation reuse—`LinearOp` is used in both FFN layers and in attention projections.
 
-**Lowering to Linalg**. Each primitive operation lowers independently using the tensor-first pattern. The `LinearOp` that encapsulates `input @ weight^T + bias` lowers to tensor-based Linalg operations:
+**Lowering to Linalg**. Each primitive operation lowers independently. The `LinearOp` that encapsulates `input @ weight^T + bias` lowers to Linalg operations:
 
 ```cpp
 // src/TransformerPasses.cpp
@@ -604,16 +602,16 @@ struct GeluOpLowering : public OpRewritePattern<GeluOp> {
 };
 ```
 
-The complete FFN operation composes these tensor-based building blocks:
+The complete FFN operation composes these building blocks:
 
 ```python
 # High-level FFN API
 ffn_out = transformer.ffn(input, W1, b1, W2, b2)
 
-# Lowers to tensor operations:
-hidden = transformer.linear(input, W1, b1)     # → tensor-based linalg ops
-activated = transformer.gelu(hidden)            # → tensor-based linalg.generic
-output = transformer.linear(activated, W2, b2)  # → tensor-based linalg ops
+# Lowers to:
+hidden = transformer.linear(input, W1, b1)     # → linalg ops
+activated = transformer.gelu(hidden)            # → linalg.generic
+output = transformer.linear(activated, W2, b2)  # → linalg ops
 
 # After bufferization pipeline, these become efficient memref operations
 ```
@@ -809,13 +807,13 @@ def multi_head_attention(x, W_q, W_k, W_v, W_o, num_heads=8):
 
 In practice, we implement head splitting via tensor reshaping and strided memory access rather than explicit loops. MLIR's `tensor.reshape` and `memref.reinterpret_cast` operations enable efficient head manipulation without data copying.
 
-**Residual Connections**. The residual addition `x = x + sub_layer(x)` uses tensor-based element-wise addition:
+**Residual Connections**. The residual addition `x = x + sub_layer(x)` uses element-wise addition:
 
 ```cpp
 // In Python API - operations return tensors
 Value residual = add(x, subLayerOutput);  // Returns new tensor
 
-// Lowers to linalg.generic returning a tensor
+// Lowers to linalg.generic
 Value result = rewriter.create<linalg::GenericOp>(
   loc, resultType,
   ValueRange{x, subLayerOutput},
@@ -1163,7 +1161,6 @@ Chapter 12 assembled complete transformer blocks by composing layer normalizatio
 Key insights:
 
 - **Compositional Design**: Transformer blocks compose from 8 primitive dialect operations (layer_norm, linear, gelu, matmul, transpose, softmax, scale, add), with higher-level abstractions (ffn, attention, transformer_block) implemented as Python API functions. Each primitive is optimizable separately yet works together efficiently.
-- **Tensor-First Architecture**: Operations use tensor types and return results (functional style), enabling MLIR's bufferization pipeline to make informed decisions about memory allocation. The 3-pass bufferization (OneShotBufferize → BufferResultsToOutParams → ConvertBufferizationToMemRef) converts high-level tensors to efficient memref execution.
 - **Pre-Normalization Architecture**: Modern transformers normalize before sub-layers (pre-norm) rather than after (post-norm), improving training stability for deep networks
 - **Residual Connections**: Skip connections enable gradient flow through deep architectures, preventing vanishing gradients that plagued earlier deep learning
 - **Linalg-Based Lowering**: All operations lower to structured Linalg operations (linalg.reduce, linalg.generic, linalg.matmul), enabling MLIR's optimization passes to apply fusion, vectorization, and loop tiling automatically

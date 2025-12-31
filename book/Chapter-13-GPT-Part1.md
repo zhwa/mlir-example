@@ -101,11 +101,11 @@ This roughly matches GPT-2 small's actual parameter count (~117M, which includes
 
 Part 2 will cover Rotary Position Embeddings (RoPE), autoregressive generation, sampling strategies, and text generation pipelines.
 
-**Implementation Architecture**. Chapter 13 inherits Chapter 12's linalg-based lowering patterns for the 8 common transformer operations (LayerNorm, Linear, GELU, Add, Matmul, Transpose, Softmax, Scale). However, Chapter 13 adopts a **tensor-first architecture** where operations take tensor inputs and return tensor results (functional style), rather than using memref out-parameters. This modern MLIR best practice enables automatic bufferization while maintaining clean, composable IR.
+**Implementation Architecture**. Chapter 13 inherits Chapter 12's linalg-based lowering patterns for the 8 common transformer operations (LayerNorm, Linear, GELU, Add, Matmul, Transpose, Softmax, Scale). Operations take tensor inputs and return tensor results (functional style), enabling automatic bufferization while maintaining clean, composable IR.
 
-These operations lower to structured `linalg` dialect operations, enabling optimization passes and portable compilation. Chapter 13 adds 4 GPT-specific operations (Embedding, CreateCausalMask, MaskedSoftmax, RoPE) that also use tensor-first style but lower directly to SCF loops for domain-specific logic not expressible in linalg's structured iteration model. This hybrid approach—linalg for regular computations, manual loops for specialized operations—balances optimization opportunities with implementation flexibility.
+These operations lower to structured `linalg` dialect operations, enabling optimization passes and portable compilation. Chapter 13 adds 4 GPT-specific operations (Embedding, CreateCausalMask, MaskedSoftmax, RoPE) that lower directly to SCF loops for domain-specific logic not expressible in linalg's structured iteration model. This hybrid approach—linalg for regular computations, manual loops for specialized operations—balances optimization opportunities with implementation flexibility.
 
-**Bufferization Pipeline**. After tensor-based IR is generated, the bufferization pipeline automatically converts functional tensor operations to efficient memref code:
+**Bufferization Pipeline**. After IR is generated, the bufferization pipeline automatically converts functional tensor operations to efficient memref code:
 
 1. **OneShotBufferize**: Converts tensor operations to bufferization dialect
 2. **BufferResultsToOutParams**: Transforms function signatures from `(tensor) -> tensor` to `(memref, memref) -> ()`
@@ -171,8 +171,6 @@ def Transformer_EmbeddingOp : Transformer_Op<"embedding"> {
 }
 ```
 
-**Tensor-First Architecture**. Chapter 13 adopts a tensor-first design with functional-style operations: operations take tensor inputs and return tensor results, rather than using out-parameter memrefs. This matches modern MLIR best practices and enables automatic bufferization. Input indices are `int32`, table and output are `float32`.
-
 **Lowering to Standard Dialects**. Embedding lookup first lowers to tensor operations, then bufferization converts to memrefs with nested SCF loops:
 
 ```cpp
@@ -237,7 +235,7 @@ struct EmbeddingOpLowering : public OpRewritePattern<EmbeddingOp> {
 
 This lowering generates nested SCF loops operating on tensors: the outer loop iterates over sequence positions, the inner loop copies each embedding dimension using `tensor.extract` and `tensor.insert`. The implementation uses tensor operations rather than structured linalg operations, since embedding lookup is random-access (indexed by token ID) rather than strided iteration.
 
-**Bufferization Pipeline**. After tensor-based lowering, the bufferization pipeline automatically converts tensor operations to efficient memref code:
+**Bufferization Pipeline**. After lowering, the bufferization pipeline automatically converts tensor operations to efficient memref code:
 
 ```cpp
 // bindings.cpp - Bufferization pipeline

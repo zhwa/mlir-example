@@ -182,7 +182,7 @@ This multi-level approach provides excellent separation of concerns: at the grap
 
 ## 7.8 Recursive IR Generation from Graph Structure
 
-The `generateMLIR()` method transforms our symbolic graph into concrete MLIR operations through depth-first traversal with memoization. The generated IR follows the **tensor-first** pattern: operations work on immutable tensor values, with bufferization handled by later passes.
+The `generateMLIR()` method transforms our symbolic graph into concrete MLIR operations through depth-first traversal with memoization. The generated IR uses tensor operations, with bufferization handled by later passes.
 
 **Step 1: Identify Variables**
 
@@ -335,7 +335,7 @@ Compared to manual SCF loops, `linalg.generic`:
 
 ## 7.10 Matrix Multiplication with C++ APIs
 
-Matrix multiplication demonstrates using Linalg dialect operations from C++, showing how high-level structured operations work with tensor types. Let's walk through the complete implementation using the tensor-based approach.
+Matrix multiplication demonstrates using Linalg dialect operations from C++, showing how high-level structured operations work with tensor types.
 
 **Function Signature**
 
@@ -400,7 +400,7 @@ If inputs have dynamic dimensions (e.g., `tensor<?x3xf32>`), we propagate that: 
 
 **Lowering Path**
 
-After graph generation, the tensor-based IR goes through bufferization:
+After graph generation, the IR goes through bufferization:
 
 1. **OneShotBufferize**: Converts tensors to memrefs, inserting allocations and copies as needed
 2. **BufferResultsToOutParams**: Transforms return values into output parameters
