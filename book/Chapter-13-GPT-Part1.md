@@ -1121,7 +1121,7 @@ Chapter 13 Part 1 established the complete GPT forward pass. The model can now c
 **Looking Ahead**. Chapter 13 Part 2 will implement:
 - **Rotary Position Embeddings (RoPE)**: Modern positional encoding enabling better length extrapolation
 - **Autoregressive Generation**: Sampling strategies (greedy, temperature, top-k) for text generation
-- **Generation Pipeline**: Iteratively generating tokens, managing KV cache (preview of Chapter 14's optimization)
+- **Generation Pipeline**: Iteratively generating tokens one at a time
 - **Text Generation Demo**: Complete end-to-end example generating text from prompts
 
-Together, Parts 1 and 2 deliver a fully functional GPT implementation—small-scale but architecturally identical to production models like GPT-2, GPT-3, and LLaMA. Chapter 14 will then optimize this architecture for production serving with FlashAttention, quantization, and batching.
+Together, Parts 1 and 2 deliver a fully functional GPT implementation—small-scale but architecturally identical to production models like GPT-2, GPT-3, and LLaMA. Chapter 14 will then explore production optimization techniques like operator fusion and tiling. Chapter 16 demonstrates KV caching and other serving optimizations required for production deployment.

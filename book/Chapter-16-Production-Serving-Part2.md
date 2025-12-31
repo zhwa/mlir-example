@@ -47,6 +47,8 @@ class Request:
     cached_len: int = 0              # Tokens with KV cache
     output_tokens: List[int] = []
     kv_pages: List[int] = []         # Physical pages allocated
+    k_caches: List[np.ndarray] = None  # Actual K tensors per layer
+    v_caches: List[np.ndarray] = None  # Actual V tensors per layer
     
     @property
     def extend_len(self) -> int:

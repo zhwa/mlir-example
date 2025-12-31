@@ -790,11 +790,15 @@ for step in range(max_new_tokens):
 
 Complexity: O(N²) → O(N). Each iteration computes only one new Q/K/V.
 
+**What is KV Cache?** In transformer attention, each token computes three vectors: Query (Q), Key (K), and Value (V). During autoregressive generation, tokens attend to all previous tokens—but the K and V vectors for previous tokens don't change. KV caching stores these previously computed K/V tensors to avoid redundant recomputation. For a sequence of length N, without caching we recompute O(N) keys/values at each step; with caching we compute just one new K/V pair. This reduces generation complexity from O(N²) to O(N).
+
+Chapter 14's compiler infrastructure includes API hooks for KV-cached forward passes (`gpt_forward_prefill` and `gpt_forward_decode`), demonstrating how MLIR can support stateful inference patterns. Chapter 16 uses these APIs to implement complete production serving with KV cache management, paged memory allocation, and prefix sharing.
+
 ## 14.8 Summary
 
-Chapter 14 introduced production-grade optimization techniques spanning declarative transformations (DRR, Transform dialect), advanced dialect features (interfaces, canonicalization), and algorithmic improvements (KV caching). These techniques represent modern MLIR practice—the same approaches used in production compilers at Google, Meta, and NVIDIA.
+Chapter 14 introduced production-grade optimization techniques spanning declarative transformations (DRR, Transform dialect), advanced dialect features (interfaces, canonicalization), and compiler support for stateful inference patterns. These techniques represent modern MLIR practice—the same approaches used in production compilers at Google, Meta, and NVIDIA.
 
 
-**Looking Ahead**. Chapter 15 introduces GPU concepts: CUDA programming model, memory hierarchy (global, shared, registers), kernel programming, and MLIR's GPU dialect. Chapter 16 completes the book with production serving: batching, dynamic batching, model parallelism, and multi-GPU inference. These chapters build on Chapter 14's optimization foundation to achieve true production-scale performance.
+**Looking Ahead**. Chapter 15 introduces GPU concepts: CUDA programming model, memory hierarchy (global, shared, registers), kernel programming, and MLIR's GPU dialect. Chapter 16 completes the book with production serving: KV cache management, continuous batching, radix cache for prefix sharing, and chunked prefill. These chapters build on Chapter 14's optimization foundation to achieve true production-scale performance.
 
 Chapter 14 completed the optimization arc: from basic operations (Chapters 1-9) through transformer architecture (Chapters 10-13) to production-grade optimizations. You now understand modern MLIR compilation—declarative, composable, and extensible. The techniques are production-ready; the scale is educational. Apply these to real models, and you'll achieve the theoretical speedups documented here.

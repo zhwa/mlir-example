@@ -94,7 +94,8 @@ class ContinuousBatcher:
 
         # Step 2: Try to schedule prefill (if space available)
         # Move waiting requests to prefill manager
-        # TODO: Integrate radix cache into prefill allocation
+        # Note: Radix cache lookup integration would occur here in production.
+        # Since KV caching requires ch14 modifications, we demonstrate the pattern without it.
         for req in list(self.request_pool.waiting):
             self.prefill_mgr.add_request(req)
             self.request_pool.waiting.remove(req)

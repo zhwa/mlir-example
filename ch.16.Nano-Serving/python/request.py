@@ -5,7 +5,8 @@ A Request represents a single generation task with its state.
 """
 
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
+import numpy as np
 
 @dataclass
 class Request:
@@ -22,8 +23,12 @@ class Request:
     output_tokens: List[int] = field(default_factory=list)
     is_finished: bool = False
 
-    # KV cache management
+    # KV cache management (Phase 1: Page-based allocation)
     kv_pages: List[int] = field(default_factory=list)  # Physical pages allocated
+    
+    # KV cache data (Chapter 16: Actual K/V tensors per layer)
+    k_caches: Optional[List[np.ndarray]] = None  # List of K tensors, one per layer
+    v_caches: Optional[List[np.ndarray]] = None  # List of V tensors, one per layer
 
     @property
     def total_len(self) -> int:

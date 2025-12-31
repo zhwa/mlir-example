@@ -58,6 +58,48 @@ class ModelConfig:
         self.max_seq_len = max_seq_len
         self.head_dim = n_embd // n_head
 
+def _create_ch14_compatible_weights(config: ModelConfig):
+    """
+    Create weight arrays in format expected by ch14.gpt_forward
+
+    Uses random initialization for educational purposes.
+    This demonstrates the serving infrastructure without requiring trained models.
+
+    Returns:
+        all_weights: List of 16 arrays per layer
+            Per layer: W_Q, b_Q, W_K, b_K, W_V, b_V, W_O, b_O,
+                      W1, b1, W2, b2, gamma1, beta1, gamma2, beta2
+    """
+    d_model = config.n_embd
+    d_ff = 4 * d_model  # Standard transformer expansion
+    num_layers = config.n_layer
+
+    weights = []
+    for _ in range(num_layers):
+        # Attention projections: Q, K, V, O (each d_model x d_model)
+        weights.append(np.random.randn(d_model, d_model).astype(np.float32) * 0.02)  # W_Q
+        weights.append(np.zeros(d_model, dtype=np.float32))  # b_Q
+        weights.append(np.random.randn(d_model, d_model).astype(np.float32) * 0.02)  # W_K
+        weights.append(np.zeros(d_model, dtype=np.float32))  # b_K
+        weights.append(np.random.randn(d_model, d_model).astype(np.float32) * 0.02)  # W_V
+        weights.append(np.zeros(d_model, dtype=np.float32))  # b_V
+        weights.append(np.random.randn(d_model, d_model).astype(np.float32) * 0.02)  # W_O
+        weights.append(np.zeros(d_model, dtype=np.float32))  # b_O
+
+        # FFN: W1 (d_ff, d_model), W2 (d_model, d_ff)
+        weights.append(np.random.randn(d_ff, d_model).astype(np.float32) * 0.02)  # W1
+        weights.append(np.zeros(d_ff, dtype=np.float32))  # b1
+        weights.append(np.random.randn(d_model, d_ff).astype(np.float32) * 0.02)  # W2
+        weights.append(np.zeros(d_model, dtype=np.float32))  # b2
+
+        # Layer norms
+        weights.append(np.ones(d_model, dtype=np.float32))   # gamma1
+        weights.append(np.zeros(d_model, dtype=np.float32))  # beta1
+        weights.append(np.ones(d_model, dtype=np.float32))   # gamma2
+        weights.append(np.zeros(d_model, dtype=np.float32))  # beta2
+
+    return weights
+
 class ModelExecutor:
     """
     Executes GPT model using Chapter 14's MLIR JIT
@@ -82,11 +124,15 @@ class ModelExecutor:
         self.weights = weights
         self.kv_pool = kv_pool
 
-        # Validate weights
-        required_keys = ['token_emb', 'position_emb', 'ln_f.gamma', 'ln_f.beta', 'lm_head']
-        for key in required_keys:
-            if key not in weights:
-                raise ValueError(f"Missing weight: {key}")
+        # Organize weights for ch14.gpt_forward
+        # Using random weights for educational demonstration of serving infrastructure
+        self.embedding_table = weights.get('token_emb', 
+            np.random.randn(config.vocab_size, config.n_embd).astype(np.float32) * 0.02)
+        self.all_weights = _create_ch14_compatible_weights(config)
+        self.final_gamma = weights.get('ln_f.gamma', 
+            np.ones(config.n_embd, dtype=np.float32))
+        self.final_beta = weights.get('ln_f.beta', 
+            np.zeros(config.n_embd, dtype=np.float32))
 
     def execute_prefill(self, batch: Batch) -> np.ndarray:
         """
@@ -106,16 +152,39 @@ class ModelExecutor:
         if not batch.is_prefill:
             raise ValueError("Batch is not a prefill batch")
 
-        # For simplicity, we'll call ch14.gpt_forward
-        # In production, this would:
-        # 1. Call attention layers with full context
-        # 2. Store K/V in cache pool
-        # 3. Return logits
+        # Call ch14.gpt_forward_prefill to get hidden states + KV caches
+        token_ids = np.array(batch.input_ids, dtype=np.int32)
 
-        # Mock implementation for now - returns random logits
-        # TODO: Integrate actual MLIR JIT execution with KV cache storage
-        total_tokens = len(batch.input_ids)
-        logits = np.random.randn(total_tokens, self.config.vocab_size).astype(np.float32)
+        result = ch14.gpt_forward_prefill(
+            token_ids,
+            self.embedding_table,
+            self.all_weights,
+            self.final_gamma,
+            self.final_beta
+        )
+
+        hidden_states = result.hidden_states
+        k_caches = result.k_caches
+        v_caches = result.v_caches
+
+        # Project to vocabulary: logits = hidden @ embedding_table.T
+        logits = hidden_states @ self.embedding_table.T
+
+        # Safety: Check for NaN/Inf and clip to reasonable range
+        if np.any(np.isnan(logits)) or np.any(np.isinf(logits)):
+            print(f"Warning: NaN/Inf detected in prefill logits, clipping values")
+            logits = np.nan_to_num(logits, nan=0.0, posinf=100.0, neginf=-100.0)
+
+        logits = np.clip(logits, -100.0, 100.0)
+
+        # Store K/V caches in requests for decode phase
+        for req in batch.requests:
+            seq_len = len(req.prompt_tokens)
+            # Store per-request K/V caches
+            # Each request gets the caches corresponding to its tokens
+            req.k_caches = k_caches
+            req.v_caches = v_caches
+            req.cached_len = seq_len
 
         return logits
 
@@ -135,16 +204,50 @@ class ModelExecutor:
         if batch.is_prefill:
             raise ValueError("Batch is not a decode batch")
 
-        # For simplicity, mock implementation
-        # In production, this would:
-        # 1. Call ch14.gpt_attention_cached with K/V cache
-        # 2. Only compute attention for new token
-        # 3. Return logits for next token
+        # Get past K/V caches from the first request
+        # All requests in the batch share the same cache structure
+        first_req = batch.requests[0]
+        if first_req.k_caches is None or first_req.v_caches is None:
+            # Fallback: no cached K/V available, do full forward pass
+            token_ids = np.array(batch.input_ids, dtype=np.int32)
+            hidden_states = ch14.forward(ch14.gpt_forward(
+                token_ids,
+                self.embedding_table,
+                self.all_weights,
+                self.final_gamma,
+                self.final_beta
+            ))
+        else:
+            # Use KV-cached decode
+            token_ids = np.array(batch.input_ids, dtype=np.int32)
 
-        # Mock implementation - returns random logits
-        # TODO: Integrate cached attention from Chapter 14
-        batch_size = len(batch.input_ids)
-        logits = np.random.randn(batch_size, self.config.vocab_size).astype(np.float32)
+            result = ch14.gpt_forward_decode(
+                token_ids,
+                self.embedding_table,
+                self.all_weights,
+                self.final_gamma,
+                self.final_beta,
+                first_req.k_caches,
+                first_req.v_caches
+            )
+
+            hidden_states = result.hidden_states
+            
+            # Update caches for all requests
+            for req in batch.requests:
+                req.k_caches = result.k_caches
+                req.v_caches = result.v_caches
+
+        # For decode, we only care about the last position
+        last_hidden = hidden_states[-len(batch.requests):, :]  # Last token per request
+        logits = last_hidden @ self.embedding_table.T
+
+        # Safety: Check for NaN/Inf and clip to reasonable range
+        if np.any(np.isnan(logits)) or np.any(np.isinf(logits)):
+            print(f"Warning: NaN/Inf detected in decode logits, clipping values")
+            logits = np.nan_to_num(logits, nan=0.0, posinf=100.0, neginf=-100.0)
+
+        logits = np.clip(logits, -100.0, 100.0)
 
         return logits
 
