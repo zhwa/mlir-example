@@ -98,6 +98,12 @@ public:
     pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
     pm.addNestedPass<func::FuncOp>(createCSEPass());
 
+    // Linalg optimizations (on tensors before bufferization)
+    pm.addPass(createLinalgGeneralizeNamedOpsPass());
+    pm.addPass(createCanonicalizerPass());
+    pm.addPass(createLinalgElementwiseOpFusionPass());
+    pm.addPass(createCanonicalizerPass());
+
     // Bufferization: tensor → memref
     DialectRegistry registry;
     arith::registerBufferizableOpInterfaceExternalModels(registry);
@@ -116,6 +122,12 @@ public:
     // Lower linalg operations to loops
     pm.addNestedPass<func::FuncOp>(createConvertLinalgToLoopsPass());
     pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
+    
+    // SCF optimizations (loop invariant code motion)
+    pm.addPass(createLoopInvariantCodeMotionPass());
+    pm.addPass(createCanonicalizerPass());
+    
+    pm.addNestedPass<func::FuncOp>(createCSEPass());
 
     // Lower to LLVM
     pm.addPass(createConvertMathToLLVMPass());
