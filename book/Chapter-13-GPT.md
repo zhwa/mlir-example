@@ -697,54 +697,61 @@ Adapts to model confidence: small nucleus when confident, large when uncertain. 
 
 **Combined Sampling**: Production systems combine temperature + top-k + nucleus for fine-grained control over output diversity and quality.
 
-## 13.8 End-to-End Text Generation Demo
+## 13.8 Testing Text Generation
 
-This section demonstrates complete text generation with a minimal GPT using byte-level tokenization (256 vocab size). While using random weights, the architecture and generation process are identical to production systems.
+The test suite in `test.py` verifies text generation functionality through greedy decoding and sampling. While using random weights (so outputs are random), these tests validate the generation mechanism that production systems use.
 
-**Model Initialization**. Create a minimal GPT (vocab_size=256, d_model=64, num_blocks=2, ~50K parameters):
-
-```python
-# Initialize embedding table and transformer blocks with random weights
-embedding_table = np.random.randn(vocab_size, d_model).astype(np.float32) * 0.02
-block_weights = [initialize_block(d_model, d_ff) for _ in range(num_blocks)]
-final_gamma = np.ones(d_model, dtype=np.float32)
-final_beta = np.zeros(d_model, dtype=np.float32)
-```
-
-**Text Generation with Different Strategies**:
+**Greedy Generation**. The core generation loop appends tokens autoregressively:
 
 ```python
-# Byte-level tokenization
-prompt = "The quick brown fox"
-prompt_tokens = np.array([ord(c) for c in prompt], dtype=np.int32)
-
-# Greedy decoding (deterministic)
-generated = generate(prompt_tokens, embedding_table, block_weights, 
-                     final_gamma, final_beta, max_new_tokens=30, temperature=0.1)
-
-# Creative sampling (high temperature)
-generated = generate(prompt_tokens, ..., temperature=1.5)
-
-# Nucleus sampling (adaptive)
-generated = generate(prompt_tokens, ..., temperature=0.8, top_p=0.9)
+def generate_greedy(prompt_tokens, embedding_table, all_weights, 
+                    final_gamma, final_beta, max_new_tokens=20):
+    tokens = list(prompt_tokens)
+    for _ in range(max_new_tokens):
+        current_tokens = np.array(tokens, dtype=np.int32)
+        hidden = ch13.forward(ch13.gpt_forward(
+            current_tokens, embedding_table, all_weights, final_gamma, final_beta
+        ))
+        logits = hidden[-1, :] @ embedding_table.T
+        next_token = sample(logits / 1e-8, top_k=None)  # Very low temp = greedy
+        tokens.append(next_token)
+    return np.array(tokens, dtype=np.int32)
 ```
 
-**Comparing Strategies**. Generate with multiple configurations to observe how hyperparameters affect output:
+The test verifies: (1) correct number of tokens generated, (2) prompt preserved in output, (3) deterministic behavior with same seed, and (4) different prompts produce different outputs.
+
+**Sampling Implementation**. The `sample()` function implements softmax with optional top-k filtering:
 
 ```python
-strategies = [
-    ("Greedy", {"temperature": 0.1}),
-    ("Top-k=50", {"temperature": 0.8, "top_k": 50}),
-    ("Nucleus p=0.9", {"temperature": 0.8, "top_p": 0.9}),
-]
-
-for name, kwargs in strategies:
-    generated = generate(prompt_tokens, embedding_table, block_weights, 
-                         final_gamma, final_beta, max_new_tokens=20, **kwargs)
-    print(f"{name}: {tokens_to_text(generated)}")
+def sample(logits, top_k=None):
+    if top_k is not None:
+        indices = np.argpartition(logits, -top_k)[-top_k:]
+        top_logits = logits[indices]
+        exp_logits = np.exp(top_logits - np.max(top_logits))
+    else:
+        exp_logits = np.exp(logits - np.max(logits))
+    
+    probs = exp_logits / np.sum(exp_logits)
+    return int(np.random.choice(len(probs), p=probs))
 ```
 
-Random weights produce gibberish since the model hasn't learned language patterns. With trained weights (e.g., loaded from GPT-2), outputs would be coherent continuations. The generation mechanism handles all prompt types identically—factual, creative, code—though trained models condition strongly on prompt style.
+Tests validate that sampling produces multiple distinct tokens (not just argmax) and that distributions are correctly normalized.
+
+**Running Generation Tests**. The test suite executes with minimal models for speed:
+
+```bash
+python test.py
+# Output shows:
+# Test 1: Greedy generation
+#   ✓ Generated correct number of tokens
+#   ✓ Prompt tokens preserved in output
+# Test 2: Greedy generation is deterministic
+#   ✓ Greedy generation is deterministic
+# Test 4: Sampling with softmax
+#   ✓ Sampling produces diverse tokens
+```
+
+These tests use byte-level tokenization (vocab_size=256) and minimal architectures (d_model=32, num_layers=1) for fast validation. For a production demonstration with all serving optimizations (continuous batching, KV caching, chunked prefill), see Chapter 16's `demo.py`.
 
 ## 13.9 Testing and Validation
 

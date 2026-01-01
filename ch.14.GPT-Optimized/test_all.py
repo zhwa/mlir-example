@@ -1,15 +1,6 @@
 #!/usr/bin/env python3
 """
 Chapter 14: Optimized GPT - Test Suite & Benchmarks
-
-Tests GPT components incrementally (same as Chapter 13):
-- Phase 2: Embedding layer
-- Phase 3: Causal masking
-- Phase 4: RoPE
-- Phase 5: Full GPT model
-- Phase 6: Generation
-
-ALSO includes performance benchmarks vs Chapter 13 baseline.
 """
 
 import sys
@@ -38,8 +29,6 @@ else:
 
 try:
     import ch14
-    # Alias for easier porting from ch14 tests
-    ch14 = ch14
 except ImportError as e:
     print(f"Error: Could not import ch14 module: {e}")
     print("Please build Chapter 14 first:")
@@ -592,8 +581,36 @@ print()
 
 print("### Phase 6: Autoregressive Generation ###")
 
-# Import generation utilities
-from generation import generate_greedy, sample
+# Inline generation utilities
+def sample(logits, top_k=None):
+    """Sample a token from logits"""
+    if top_k is not None:
+        top_indices = np.argpartition(logits, -top_k)[-top_k:]
+        masked_logits = np.full_like(logits, -np.inf)
+        masked_logits[top_indices] = logits[top_indices]
+        logits = masked_logits
+    
+    exp_logits = np.exp(logits - np.max(logits))
+    probs = exp_logits / np.sum(exp_logits)
+    token = np.random.choice(len(probs), p=probs)
+    return int(token)
+
+def generate_greedy(prompt_tokens, embedding_table, all_weights, final_gamma, final_beta, max_new_tokens=20):
+    """Generate text greedily (always pick most likely token)"""
+    tokens = list(prompt_tokens)
+    
+    for _ in range(max_new_tokens):
+        current_tokens = np.array(tokens, dtype=np.int32)
+        hidden = ch14.forward(ch14.gpt_forward(
+            current_tokens, embedding_table, all_weights, final_gamma, final_beta
+        ))
+        last_hidden = hidden[-1, :]
+        logits = last_hidden @ embedding_table.T
+        logits = logits / 1e-8  # Very low temp = greedy
+        next_token = sample(logits, top_k=None)
+        tokens.append(next_token)
+    
+    return np.array(tokens, dtype=np.int32)
 
 # Test 1: Basic generation (greedy)
 print("\nTest 1: Greedy generation")

@@ -8,12 +8,11 @@
 # Build
 cmake --build build/x64-release --target ch13
 
-# Test
+# Test (comprehensive test suite)
 cd ch.13.GPT
 python3 test.py
 
-# Generate text
-python3 demo.py
+# For interactive text generation demo, see Chapter 16 (Nano-Serving)
 ```
 
 ## Model Architecture

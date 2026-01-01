@@ -9,9 +9,9 @@ Tests all 6 phases of the Nano-Serving implementation:
 - Phase 3: Chunked Prefill (11 tests)
 - Phase 4: Radix Cache (13 tests)
 - Phase 5: Continuous Batching (7 tests)
-- Phase 6: Integration (8 tests)
+- Phase 6: Integration (9 tests)
 
-Total: 67 comprehensive tests
+Total: 68 comprehensive tests
 """
 
 import sys
@@ -576,6 +576,56 @@ def phase6_test_statistics():
 
     print(f"  ✓ Requests served: {stats['total_requests_served']}")
 
+def phase6_test_kv_caching_integration():
+    """Test KV-caching integration (prefill creates, decode reuses)"""
+    print("Phase 6.6: KV-caching integration...")
+
+    # Setup minimal model
+    config = ModelConfig(vocab_size=50257, n_layer=2, n_head=4, n_embd=128)
+    weights = {'token_emb': np.random.randn(config.vocab_size, config.n_embd).astype(np.float32) * 0.02}
+    kv_pool = KVCachePool(
+        num_pages=100,
+        page_size=16,
+        num_layers=config.n_layer,
+        num_heads=config.n_head,
+        head_dim=config.head_dim
+    )
+    executor = ModelExecutor(config, weights, kv_pool)
+
+    # Create test request
+    req = Request(
+        req_id=1,
+        prompt_tokens=[1, 2, 3, 4, 5],
+        max_tokens=3
+    )
+
+    # Prefill phase - creates K/V caches
+    prefill_batch = Batch.from_prefill([req])
+    prefill_logits = executor.execute_prefill(prefill_batch)
+
+    # Verify K/V caches were created
+    assert req.k_caches is not None, "K caches should be created"
+    assert req.v_caches is not None, "V caches should be created"
+    assert len(req.k_caches) == config.n_layer, f"Should have {config.n_layer} K caches"
+    
+    initial_cache_len = req.k_caches[0].shape[0]
+    assert initial_cache_len == len(req.prompt_tokens), "Cache should match prompt length"
+
+    # Decode phase - reuses and grows caches
+    for step in range(3):
+        new_token = 10 + step
+        req.output_tokens.append(new_token)
+        
+        prev_cache_len = req.k_caches[0].shape[0]
+        
+        decode_batch = Batch.from_decode([req])
+        decode_logits = executor.execute_decode(decode_batch)
+        
+        new_cache_len = req.k_caches[0].shape[0]
+        assert new_cache_len == prev_cache_len + 1, "Cache should grow by 1 token per decode"
+
+    print(f"  ✓ KV caches: created in prefill, reused and grew in decode ({initial_cache_len} → {new_cache_len} tokens)")
+
 # =============================================================================
 # MAIN TEST RUNNER
 # =============================================================================
@@ -687,12 +737,13 @@ def main():
             lambda: print("  ✓ Throughput measurement"),
             lambda: print("  ✓ Empty pool"),
         ]),
-        ("PHASE 6: Complete Integration (8 tests)", [
+        ("PHASE 6: Complete Integration (9 tests)", [
             phase6_test_engine_creation,
             phase6_test_simple_generation,
             phase6_test_batch_generation,
             phase6_test_long_context,
             phase6_test_statistics,
+            phase6_test_kv_caching_integration,
             lambda: print("  ✓ Radix cache components"),
             lambda: print("  ✓ Throughput benchmark"),
             lambda: print("  ✓ Realistic workload"),

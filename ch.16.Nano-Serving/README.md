@@ -17,9 +17,12 @@
 cmake --preset x64-release
 cmake --build build/x64-release --target ch16
 
-# Run all tests (67 comprehensive tests across 6 phases)
+# Run all tests (68 comprehensive tests across 6 phases)
 cd ch.16.Nano-Serving
 python3 test_all.py
+
+# Interactive demo (shows complete serving pipeline)
+python3 demo.py
 
 # Individual phase breakdown:
 # - Phase 0: Request & Batch Abstraction (9 tests)
@@ -28,7 +31,7 @@ python3 test_all.py
 # - Phase 3: Chunked Prefill (11 tests)
 # - Phase 4: Radix Cache (13 tests)
 # - Phase 5: Continuous Batching (7 tests)
-# - Phase 6: Integration (8 tests)
+# - Phase 6: Integration (9 tests)
 ```
 
 ## What You'll Learn

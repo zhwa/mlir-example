@@ -11,9 +11,8 @@ cmake --build ../build/x64-release --target ch14
 # Test (22 tests)
 python3 test_all.py
 
-# Demo
-python3 demo.py
-
-# Benchmark
+# Benchmark optimizations
 python3 benchmark.py
+
+# For interactive text generation demo, see Chapter 16 (Nano-Serving)
 ```
