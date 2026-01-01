@@ -42,4 +42,5 @@ ch16 = import_cpp_module('ch16', 'ch.16.Nano-Serving')
 # Export commonly used classes
 KVCachePool = ch14.KVCachePool
 RadixCache = ch16.RadixCache
-RadixNode = ch16.RadixNode
+# Note: RadixNode no longer exposed - nodes are accessed via cache.get_node(node_id)
+INVALID_NODE = ch16.INVALID_NODE

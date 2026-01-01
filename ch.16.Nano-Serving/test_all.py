@@ -333,16 +333,16 @@ def phase3_test_chunked_manager():
 # =============================================================================
 
 def phase4_test_radix_node():
-    """Test radix nodes"""
+    """Test radix nodes (now accessed via cache.get_node)"""
     print("Phase 4.1: RadixNode...")
 
-    root = ch16.RadixNode(-1)  # -1 for root token
-    assert root.is_root()
+    cache = ch16.RadixCache()
+    root_id = cache.get_root_id()
+    root = cache.get_node(root_id)
+    assert root["is_root"]
+    assert root["token"] == -1
 
-    child = root.add_child(10)
-    assert root.get_child(10) == child
-
-    print(f"  ✓ Radix nodes working")
+    print(f"  ✓ Radix nodes working (pointer-free!)")
 
 def phase4_test_radix_cache():
     """Test radix cache"""
@@ -355,9 +355,10 @@ def phase4_test_radix_cache():
     pages1 = list(range(5))
     cache.insert(tokens1, pages1)
 
-    assert cache.get_num_nodes() == 5
+    # get_num_nodes counts non-root nodes only
+    assert cache.get_num_nodes() == 5  # 5 inserted tokens
 
-    matched_len, node = cache.match_prefix(tokens1)
+    matched_len, node_id = cache.match_prefix(tokens1)
     assert matched_len == 5
 
     print(f"  ✓ Cache has {cache.get_num_nodes()} nodes")
@@ -375,7 +376,8 @@ def phase4_test_shared_prefix():
     tokens2 = [10, 20, 30, 40, 60]
     cache.insert(tokens2, list(range(5, 10)))
 
-    assert cache.get_num_nodes() == 6  # Shared prefix + 2 branches
+    # get_num_nodes counts non-root nodes: 4 shared (10,20,30,40) + 2 branches (50,60) = 6
+    assert cache.get_num_nodes() == 6
 
     print(f"  ✓ Shared prefix detected")
 
@@ -388,13 +390,14 @@ def phase4_test_cache_manager():
 
     tokens1 = [10, 20, 30, 40]
     cached_len1, new_pages1 = mgr.get_or_allocate(tokens1)
-    assert cached_len1 == 0
+    assert cached_len1 == 0  # Nothing cached yet
     assert len(new_pages1) == 4
 
     tokens2 = [10, 20, 30, 50]
     cached_len2, new_pages2 = mgr.get_or_allocate(tokens2)
-    assert cached_len2 == 3
-    assert len(new_pages2) == 1
+    # First 3 tokens [10,20,30] are cached from tokens1
+    assert cached_len2 == 3  
+    assert len(new_pages2) == 1  # Only need 1 new page for token 50
 
     print(f"  ✓ Hit rate: {mgr.cache_hit_rate:.1%}")
 

@@ -4,45 +4,50 @@
  * Implements a radix tree (prefix tree) to automatically detect and reuse
  * shared prefixes across requests, enabling efficient KV cache sharing.
  *
- * Uses std::shared_ptr for automatic lifetime management (RAII).
+ * Uses integer node IDs instead of pointers for safer memory management.
  */
 
 #pragma once
 
 #include <vector>
 #include <map>
-#include <memory>
+#include <optional>
 #include <chrono>
 
 namespace nano_serving {
 
-class RadixNode : public std::enable_shared_from_this<RadixNode> {
+// Forward declaration
+class RadixCache;
+
+// Node ID type for type safety
+using NodeID = int;
+constexpr NodeID INVALID_NODE = -1;
+
+/**
+ * RadixNode - stored in arena, referenced by ID
+ * 
+ * No pointers, no reference counting - just plain data.
+ */
+class RadixNode {
 public:
-    /**
-     * Initialize radix node
-     *
-     * @param token Token ID this node represents (-1 for root)
-     */
-    explicit RadixNode(int token = -1);
-
-    ~RadixNode() = default;
-
-    // Prevent copying (use shared_ptr for sharing)
-    RadixNode(const RadixNode&) = delete;
-    RadixNode& operator=(const RadixNode&) = delete;
+    explicit RadixNode(int token = -1)
+        : token_(token), last_access_time_(0.0) {
+        update_access_time();
+    }
 
     // Node properties
     int get_token() const { return token_; }
     bool is_leaf() const { return children_.empty(); }
     bool is_root() const { return token_ == -1; }
-    long use_count() const;  // Returns shared_ptr reference count
     double get_last_access_time() const { return last_access_time_; }
     const std::vector<int>& get_kv_pages() const { return kv_pages_; }
 
-    // Children access (returns shared_ptr for RAII)
-    std::shared_ptr<RadixNode> get_child(int token);
-    std::shared_ptr<RadixNode> add_child(int token);
-    bool remove_child(int token);
+    // Children access (returns node ID, not pointer)
+    bool has_child(int token) const { return children_.count(token) > 0; }
+    NodeID get_child(int token) const;
+    void add_child(int token, NodeID child_id) { children_[token] = child_id; }
+    void remove_child(int token) { children_.erase(token); }
+    const std::map<int, NodeID>& get_children() const { return children_; }
 
     // KV pages management
     void set_kv_pages(const std::vector<int>& pages) { kv_pages_ = pages; }
@@ -51,42 +56,40 @@ public:
     // Timing
     void update_access_time();
 
-    // Tree navigation
-    int num_descendants() const;
-
 private:
     int token_;
-    std::map<int, std::shared_ptr<RadixNode>> children_;
+    std::map<int, NodeID> children_;  // token -> child node ID
     std::vector<int> kv_pages_;
     double last_access_time_;
 };
 
+/**
+ * RadixCache - Arena-based radix tree
+ * 
+ * Stores all nodes in a vector (arena), uses integer IDs instead of pointers.
+ * No reference counting, no manual memory management - just clean data structures.
+ */
 class RadixCache {
 public:
-    /**
-     * Initialize radix cache
-     */
     RadixCache();
-
     ~RadixCache() = default;
 
     /**
      * Find longest matching prefix in tree
      *
      * @param tokens Token sequence to match
-     * @return Pair of (match_length, last_matched_node)
+     * @return Pair of (match_length, last_matched_node_id)
      */
-    std::pair<int, std::shared_ptr<RadixNode>> match_prefix(const std::vector<int>& tokens);
+    std::pair<int, NodeID> match_prefix(const std::vector<int>& tokens);
 
     /**
      * Insert token sequence into tree
      *
      * @param tokens Token sequence to insert
      * @param kv_pages KV pages for each token (same length as tokens)
-     * @return Leaf node representing this sequence
+     * @return Node ID of leaf representing this sequence
      */
-    std::shared_ptr<RadixNode> insert(const std::vector<int>& tokens, 
-                                      const std::vector<int>& kv_pages);
+    NodeID insert(const std::vector<int>& tokens, const std::vector<int>& kv_pages);
 
     /**
      * Get KV pages for a prefix
@@ -99,19 +102,18 @@ public:
     /**
      * Find least-recently-used leaf node
      *
-     * @return Pair of (lru_leaf, path_to_leaf)
+     * @return Pair of (lru_leaf_id, path_to_leaf_ids)
      */
-    std::pair<std::shared_ptr<RadixNode>, std::vector<std::shared_ptr<RadixNode>>> find_lru_leaf();
+    std::pair<NodeID, std::vector<NodeID>> find_lru_leaf();
 
     /**
      * Evict a leaf node (remove from tree)
      *
-     * @param leaf Leaf node to evict
-     * @param path Path from root to leaf
+     * @param leaf_id Leaf node ID to evict
+     * @param path Path from root to leaf (node IDs)
      * @return KV pages that were freed
      */
-    std::vector<int> evict_leaf(std::shared_ptr<RadixNode> leaf, 
-                                const std::vector<std::shared_ptr<RadixNode>>& path);
+    std::vector<int> evict_leaf(NodeID leaf_id, const std::vector<NodeID>& path);
 
     /**
      * Evict LRU leaves until at least num_pages are freed
@@ -130,17 +132,33 @@ public:
     int get_num_nodes() const { return num_nodes_; }
     int get_total_tokens_cached() const { return total_tokens_cached_; }
 
-    // Root access
-    std::shared_ptr<RadixNode> get_root() { return root_; }
+    // Node access (for Python bindings)
+    NodeID get_root_id() const { return root_id_; }
+    const RadixNode& get_node(NodeID id) const;
+    RadixNode& get_node(NodeID id);
 
 private:
-    std::shared_ptr<RadixNode> root_;
+    // Arena storage - all nodes live here
+    std::vector<RadixNode> nodes_;
+    std::vector<bool> node_active_;  // Track which nodes are in use
+    
+    NodeID root_id_;
     int num_nodes_;
     int total_tokens_cached_;
 
+    // Allocate a new node in the arena
+    NodeID allocate_node(int token);
+    
+    // Free a node (mark as inactive)
+    void free_node(NodeID id);
+
     // Helper for finding LRU leaf
-    std::tuple<std::shared_ptr<RadixNode>, std::vector<std::shared_ptr<RadixNode>>, double> 
-    find_lru_recursive(std::shared_ptr<RadixNode> node, std::vector<std::shared_ptr<RadixNode>> path);
+    struct LRUResult {
+        NodeID leaf_id;
+        std::vector<NodeID> path;
+        double time;
+    };
+    LRUResult find_lru_recursive(NodeID node_id, std::vector<NodeID> path);
 };
 
 } // namespace nano_serving
