@@ -10,7 +10,7 @@ include_directories(${pybind11_INCLUDE_DIRS})
 
 # C++ library
 add_library(ch16_lib STATIC
-    src/kv_cache.cpp
+    src/radix_cache.cpp
 )
 
 target_include_directories(ch16_lib PUBLIC

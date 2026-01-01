@@ -1,87 +1,100 @@
 /*
- * Python bindings for Nano Serving Engine
+ * Python bindings for Nano Serving Engine (using shared_ptr for RAII)
  */
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-#include <pybind11/numpy.h>
 
-#include "kv_cache.h"
+#include "radix_cache.h"
 
 namespace py = pybind11;
 using namespace nano_serving;
 
 PYBIND11_MODULE(ch16, m) {
-    m.doc() = "Nano LLM Serving Engine - Chapter 16";
+    m.doc() = "Nano LLM Serving Engine - Chapter 16: Radix Cache for Prefix Sharing (RAII)";
 
-    // KVCachePool class
-    py::class_<KVCachePool>(m, "KVCachePool")
-        .def(py::init<int, int, int, int, int>(),
+    // RadixNode class - using shared_ptr holder for automatic lifetime management
+    py::class_<RadixNode, std::shared_ptr<RadixNode>>(m, "RadixNode")
+        .def(py::init<int>(),
+             py::arg("token") = -1,
+             "Initialize radix node (managed by shared_ptr)")
+
+        .def("get_token", &RadixNode::get_token,
+             "Get token ID")
+
+        .def("is_leaf", &RadixNode::is_leaf,
+             "Check if this is a leaf node")
+
+        .def("is_root", &RadixNode::is_root,
+             "Check if this is the root node")
+
+        .def("use_count", &RadixNode::use_count,
+             "Get shared_ptr reference count (automatic RAII management)")
+
+        .def("get_last_access_time", &RadixNode::get_last_access_time,
+             "Get last access timestamp")
+
+        .def("get_kv_pages", &RadixNode::get_kv_pages,
+             py::return_value_policy::reference_internal,
+             "Get KV page indices")
+
+        .def("get_child", &RadixNode::get_child,
+             py::arg("token"),
+             "Get child node for token (returns shared_ptr)")
+
+        .def("add_child", &RadixNode::add_child,
+             py::arg("token"),
+             "Add child node for token (returns shared_ptr)")
+
+        .def("remove_child", &RadixNode::remove_child,
+             py::arg("token"),
+             "Remove child node")
+
+        .def("update_access_time", &RadixNode::update_access_time,
+             "Update last access time")
+
+        .def("num_descendants", &RadixNode::num_descendants,
+             "Count total descendants");
+
+    // RadixCache class
+    py::class_<RadixCache>(m, "RadixCache")
+        .def(py::init<>(),
+             "Initialize radix cache")
+
+        .def("match_prefix", &RadixCache::match_prefix,
+             py::arg("tokens"),
+             "Find longest matching prefix, returns (match_length, last_node)")
+
+        .def("insert", &RadixCache::insert,
+             py::arg("tokens"),
+             py::arg("kv_pages"),
+             "Insert token sequence into tree with KV pages")
+
+        .def("get_pages_for_prefix", &RadixCache::get_pages_for_prefix,
+             py::arg("tokens"),
+             "Get KV page indices for a prefix")
+
+        .def("find_lru_leaf", &RadixCache::find_lru_leaf,
+             "Find least-recently-used leaf node, returns (leaf, path)")
+
+        .def("evict_leaf", &RadixCache::evict_leaf,
+             py::arg("leaf"),
+             py::arg("path"),
+             "Evict a leaf node, returns freed pages")
+
+        .def("evict_until_available", &RadixCache::evict_until_available,
              py::arg("num_pages"),
-             py::arg("page_size"),
-             py::arg("num_layers"),
-             py::arg("num_heads"),
-             py::arg("head_dim"),
-             "Initialize KV cache pool")
+             "Evict LRU leaves until at least num_pages are freed")
 
-        .def("allocate", &KVCachePool::allocate,
-             py::arg("num_tokens"),
-             "Allocate pages for num_tokens")
+        .def("clear", &RadixCache::clear,
+             "Clear entire cache")
 
-        .def("free", &KVCachePool::free,
-             py::arg("pages"),
-             "Free pages back to pool")
+        .def("get_num_nodes", &RadixCache::get_num_nodes,
+             "Get total number of nodes")
 
-        .def("store_kv", [](KVCachePool& pool,
-                           py::array_t<float> k,
-                           py::array_t<float> v,
-                           const std::vector<int>& page_indices,
-                           int layer_id) {
-            // Validate input shapes
-            auto k_buf = k.request();
-            auto v_buf = v.request();
+        .def("get_total_tokens_cached", &RadixCache::get_total_tokens_cached,
+             "Get total tokens cached")
 
-            if (k_buf.ndim != 3 || v_buf.ndim != 3) {
-                throw std::runtime_error("K/V must be 3D tensors [num_tokens, num_heads, head_dim]");
-            }
-
-            int num_tokens = k_buf.shape[0];
-
-            // Call C++ implementation
-            pool.storeKV(static_cast<const float*>(k_buf.ptr),
-                        static_cast<const float*>(v_buf.ptr),
-                        page_indices,
-                        layer_id,
-                        num_tokens);
-        },
-        py::arg("k"),
-        py::arg("v"),
-        py::arg("page_indices"),
-        py::arg("layer_id"),
-        "Store K/V tensors at specified pages")
-
-        .def("get_layer_cache", [](KVCachePool& pool, int layer_id) {
-            auto [k_ptr, v_ptr] = pool.getLayerCache(layer_id);
-
-            // Return as numpy arrays (view, not copy)
-            int cache_size = pool.getNumPages() * pool.getPageSize();
-
-            // Shape: [num_pages * page_size, num_heads, head_dim]
-            // Note: This is a simplified view for testing
-            py::array_t<float> k_array({cache_size}, {sizeof(float)}, k_ptr);
-            py::array_t<float> v_array({cache_size}, {sizeof(float)}, v_ptr);
-
-            return py::make_tuple(k_array, v_array);
-        },
-        py::arg("layer_id"),
-        "Get K/V cache arrays for a layer")
-
-        .def("get_num_free_pages", &KVCachePool::getNumFreePages,
-             "Get number of free pages")
-
-        .def("get_num_pages", &KVCachePool::getNumPages,
-             "Get total number of pages")
-
-        .def("get_page_size", &KVCachePool::getPageSize,
-             "Get page size");
+        .def("get_root", &RadixCache::get_root,
+             "Get root node (returns shared_ptr)");
 }

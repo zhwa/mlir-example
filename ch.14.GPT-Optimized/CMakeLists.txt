@@ -26,6 +26,7 @@ add_llvm_library(MLIRCh14TransformerDialect
   src/TransformerOps.cpp
   src/TransformerPasses.cpp
   src/TransformDialectOptimization.cpp
+  src/kv_cache.cpp
 
   DEPENDS
   Ch14TransformerDialectIncGen

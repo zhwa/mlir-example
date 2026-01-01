@@ -10,11 +10,36 @@ Brings together all optimizations:
 
 from typing import List, Optional, Dict, Any
 import sys
+import os
 sys.path.insert(0, '.')
 import numpy as np
 
+# Import KVCachePool from ch14
+build_paths = [
+    '../build/x64-release/ch.14.GPT-Optimized',
+    '../build/x64-debug/ch.14.GPT-Optimized',
+    'build/x64-release/ch.14.GPT-Optimized',
+    'build/x64-debug/ch.14.GPT-Optimized',
+    '../../build/x64-release/ch.14.GPT-Optimized',
+    '../../build/x64-debug/ch.14.GPT-Optimized',
+]
+
+ch14 = None
+for path in build_paths:
+    if os.path.exists(path):
+        sys.path.insert(0, path)
+        try:
+            import ch14
+            break
+        except ImportError:
+            sys.path.pop(0)
+
+if ch14 is None:
+    import ch14
+
+KVCachePool = ch14.KVCachePool
+
 from python.request import Request
-from python.kv_pool import KVCachePool
 from python.radix_manager import RadixCacheManager
 from python.chunked_prefill import ChunkedPrefillManager
 from python.decode_manager import DecodeManager

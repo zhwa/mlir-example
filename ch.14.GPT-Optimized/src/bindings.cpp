@@ -3,6 +3,7 @@
 #include "TransformerOps.h"
 #include "TransformerPasses.h"
 #include "TransformDialectOptimization.h"
+#include "kv_cache.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -87,7 +88,7 @@ public:
     DialectRegistry registry;
     linalg::registerTransformDialectExtension(registry);
     context_.appendDialectRegistry(registry);
-    
+
     // Load core dialects
     context_.loadDialect<transformer::TransformerDialect,
                          func::FuncDialect, arith::ArithDialect,
@@ -1139,4 +1140,60 @@ PYBIND11_MODULE(ch14, m) {
   m.def("forward", &forward,
         py::arg("output"),
         "JIT compile and execute computation graph");
+
+  // Chapter 14: KV Cache Pool (C++ implementation for production)
+  py::class_<gpt_optimized::KVCachePool>(m, "KVCachePool")
+      .def(py::init<int, int, int, int, int>(),
+           py::arg("num_pages"), py::arg("page_size"),
+           py::arg("num_layers"), py::arg("num_heads"), py::arg("head_dim"),
+           "Initialize KV cache pool with page-based memory management")
+      .def("allocate", &gpt_optimized::KVCachePool::allocate,
+           py::arg("num_tokens"),
+           "Allocate pages for num_tokens, returns list of page indices")
+      .def("free", &gpt_optimized::KVCachePool::free,
+           py::arg("pages"),
+           "Free pages back to pool")
+      .def("store_kv", 
+           [](gpt_optimized::KVCachePool &self,
+              py::array_t<float> k, py::array_t<float> v,
+              const std::vector<int>& page_indices, int layer_id) {
+             // Validate shapes: [num_tokens, num_heads, head_dim]
+             if (k.ndim() != 3 || v.ndim() != 3) {
+               throw std::runtime_error("K/V tensors must be 3D: [num_tokens, num_heads, head_dim]");
+             }
+             auto k_info = k.request();
+             auto v_info = v.request();
+             int num_tokens = k_info.shape[0];
+
+             self.storeKV(static_cast<float*>(k_info.ptr),
+                         static_cast<float*>(v_info.ptr),
+                         page_indices, layer_id, num_tokens);
+           },
+           py::arg("k"), py::arg("v"), py::arg("page_indices"), py::arg("layer_id"),
+           "Store K/V tensors [num_tokens, num_heads, head_dim] at specified pages")
+      .def("get_layer_cache",
+           [](gpt_optimized::KVCachePool &self, int layer_id) {
+             auto [k_ptr, v_ptr] = self.getLayerCache(layer_id);
+             int total_size = self.getNumPages() * self.getPageSize() * 
+                             /* num_heads */ 4 * /* head_dim */ 16; // These should be stored
+
+             // Create numpy arrays that view the C++ memory (no copy)
+             py::array_t<float> k_array({total_size}, {sizeof(float)}, k_ptr, py::cast(&self));
+             py::array_t<float> v_array({total_size}, {sizeof(float)}, v_ptr, py::cast(&self));
+
+             return py::make_tuple(k_array, v_array);
+           },
+           py::arg("layer_id"),
+           "Get K/V cache arrays for a layer (returns views, not copies)")
+      .def("pages_needed", &gpt_optimized::KVCachePool::pagesNeeded,
+           py::arg("num_tokens"),
+           "Calculate pages needed for num_tokens")
+      .def("can_allocate", &gpt_optimized::KVCachePool::canAllocate,
+           py::arg("num_tokens"),
+           "Check if allocation would succeed")
+      .def("get_num_free_pages", &gpt_optimized::KVCachePool::getNumFreePages,
+           "Get number of free pages")
+      .def_property_readonly("num_pages", &gpt_optimized::KVCachePool::getNumPages)
+      .def_property_readonly("page_size", &gpt_optimized::KVCachePool::getPageSize)
+      .def_property_readonly("num_free_pages", &gpt_optimized::KVCachePool::getNumFreePages);
 }

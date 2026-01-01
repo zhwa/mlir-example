@@ -1,13 +1,10 @@
-/*
- * KV Cache Pool Implementation
- */
-
+// KV Cache Pool Implementation
 #include "kv_cache.h"
 #include <algorithm>
 #include <cstring>
 #include <sstream>
 
-namespace nano_serving {
+namespace gpt_optimized {
 
 KVCachePool::KVCachePool(int num_pages, int page_size, 
                          int num_layers, int num_heads, int head_dim)
@@ -123,4 +120,4 @@ std::pair<float*, float*> KVCachePool::getLayerCache(int layer_id) {
     return {k_cache_[layer_id].data(), v_cache_[layer_id].data()};
 }
 
-} // namespace nano_serving
+} // namespace gpt_optimized

@@ -38,8 +38,10 @@ except ImportError as e:
     print("  cmake --build --preset x64-release --target ch14")
     ch14 = None
 
+# Import KVCachePool as alias
+KVCachePool = ch14.KVCachePool if ch14 else None
+
 from python.batch import Batch
-from python.kv_pool import KVCachePool
 
 class ModelConfig:
     """GPT model configuration"""

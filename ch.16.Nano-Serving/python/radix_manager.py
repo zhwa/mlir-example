@@ -3,14 +3,42 @@ Radix Cache Manager - High-Level Interface
 
 Provides a high-level API for radix cache with automatic eviction,
 cache hit tracking, and integration with the KV pool.
+
+Uses C++ RadixCache implementation directly from ch16 module.
 """
 
 from typing import List, Tuple
 import sys
+import os
+
 sys.path.insert(0, '.')
 
-from python.radix_cache import RadixCache
-from python.kv_pool import KVCachePool
+def import_cpp_module(module_name: str, chapter_path: str):
+    """Helper to import C++ modules from build directories"""
+    build_paths = [
+        f'../build/x64-release/{chapter_path}',
+        f'../build/x64-debug/{chapter_path}',
+        f'build/x64-release/{chapter_path}',
+        f'build/x64-debug/{chapter_path}',
+        f'../../build/x64-release/{chapter_path}',
+        f'../../build/x64-debug/{chapter_path}',
+    ]
+    
+    for path in build_paths:
+        if os.path.exists(path):
+            sys.path.insert(0, path)
+            try:
+                return __import__(module_name)
+            except ImportError:
+                sys.path.pop(0)
+    
+    # Final attempt without path (if already in sys.path)
+    return __import__(module_name)
+
+# Import C++ modules
+ch16 = import_cpp_module('ch16', 'ch.16.Nano-Serving')
+ch14 = import_cpp_module('ch14', 'ch.14.GPT-Optimized')
+KVCachePool = ch14.KVCachePool
 
 class RadixCacheManager:
     """
@@ -27,7 +55,7 @@ class RadixCacheManager:
         Args:
             kv_pool: KV cache pool for page management
         """
-        self.cache = RadixCache(kv_pool)
+        self.cache = ch16.RadixCache()  # C++ implementation
         self.kv_pool = kv_pool
 
         # Statistics
@@ -85,8 +113,19 @@ class RadixCacheManager:
                 new_pages.extend(page)
         except RuntimeError:
             # Out of memory - evict until we have space
-            num_evicted = self.cache.evict_until_available(num_pages_needed)
-            self.total_evictions += num_evicted
+            pages_freed = 0
+            while pages_freed < num_pages_needed:
+                try:
+                    leaf, path = self.cache.find_lru_leaf()
+                    freed_pages = self.cache.evict_leaf(leaf, path)
+                    if freed_pages:
+                        self.kv_pool.free(freed_pages)
+                        pages_freed += len(freed_pages)
+                        self.total_evictions += 1
+                    else:
+                        break
+                except:
+                    break
 
             try:
                 # Try again after eviction
@@ -102,18 +141,13 @@ class RadixCacheManager:
 
         # Step 3: Insert full sequence into cache
         # Build page list: one page per token
-        # For cached tokens, we don't store duplicate page info (they're already in tree)
         # For new tokens, we assign pages
         all_pages = []
 
-        # For cached prefix, get one page per token
+        # For cached prefix, get pages using C++ API
         if cached_len > 0:
-            node = self.cache.root
-            for token in tokens[:cached_len]:
-                child = node.get_child(token)
-                if child and child.kv_pages:
-                    all_pages.append(child.kv_pages[0])
-                node = child
+            prefix_pages = self.cache.get_pages_for_prefix(tokens[:cached_len])
+            all_pages.extend(prefix_pages)
 
         # Add new pages for uncached suffix
         all_pages.extend(new_pages)
@@ -156,10 +190,16 @@ class RadixCacheManager:
         Returns:
             Number of pages freed
         """
-        freed = self.cache.evict_lru_leaf()
-        if freed > 0:
-            self.total_evictions += freed
-        return freed
+        try:
+            leaf, path = self.cache.find_lru_leaf()
+            freed_pages = self.cache.evict_leaf(leaf, path)
+            if freed_pages:
+                self.kv_pool.free(freed_pages)
+                self.total_evictions += 1
+                return len(freed_pages)
+        except:
+            pass
+        return 0
 
     @property
     def cache_hit_rate(self) -> float:
@@ -175,18 +215,13 @@ class RadixCacheManager:
     @property
     def num_cached_sequences(self) -> int:
         """Get number of sequences in cache"""
-        return self.cache.num_nodes
+        return self.cache.get_num_nodes()
 
     def clear_stats(self):
         """Reset statistics counters"""
         self.cache_hits = 0
         self.cache_misses = 0
         self.total_evictions = 0
-
-    def clear_cache(self):
-        """Clear entire cache"""
-        self.cache.clear()
-        self.clear_stats()
 
     def __repr__(self) -> str:
         return (f"RadixCacheManager("

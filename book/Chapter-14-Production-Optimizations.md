@@ -494,9 +494,47 @@ for step in range(max_new_tokens):
 
 Complexity: O(N²) → O(N). Each iteration computes only one new Q/K/V.
 
-**What is KV Cache?** In transformer attention, each token computes three vectors: Query (Q), Key (K), and Value (V). During autoregressive generation, tokens attend to all previous tokens—but the K and V vectors for previous tokens don't change. KV caching stores these previously computed K/V tensors to avoid redundant recomputation. For a sequence of length N, without caching we recompute O(N) keys/values at each step; with caching we compute just one new K/V pair. This reduces generation complexity from O(N²) to O(N).
+**Production Implementation in C++**. Chapter 14 provides a page-based KV cache pool implementation in C++ ([kv_cache.cpp](ch.14.GPT-Optimized/src/kv_cache.cpp)) for production efficiency. The implementation uses block allocation similar to OS memory management:
 
-Chapter 14's codebase includes Python-level KV caching implementation in [generation.py](ch.14.GPT-Optimized/generation.py), with the `generate_cached` function demonstrating how to maintain key/value caches across generation steps. The compiler infrastructure also provides MLIR-level hooks (`gpt_forward_prefill` and `gpt_forward_decode`) for supporting stateful inference patterns, though the detailed implementation of these functions is beyond the scope of this educational chapter.
+```cpp
+class KVCachePool {
+  // Page-based allocation: pages reduce fragmentation
+  std::vector<int> allocate(int num_tokens);  
+  void free(const std::vector<int>& pages);
+  
+  // Store K/V tensors at allocated pages
+  void storeKV(const float* k, const float* v,
+               const std::vector<int>& page_indices,
+               int layer_id, int num_tokens);
+};
+```
+
+Key design decisions:
+
+**Page-based allocation**: Instead of allocating exact token counts, the pool allocates fixed-size pages (e.g., 16 tokens per page). This reduces fragmentation when requests finish at different times. A 100-token request uses 7 pages (96 tokens + 4 leftover), not 100 individual allocations.
+
+**Multi-layer storage**: Cache arrays are organized as `[num_layers][num_pages * page_size * num_heads * head_dim]`. Each layer's K/V are stored contiguously for better CPU cache locality during attention computation.
+
+**Python bindings**: The C++ implementation is exposed to Python via pybind11 in [bindings.cpp](ch.14.GPT-Optimized/src/bindings.cpp):
+
+```python
+from ch14 import KVCachePool
+
+# Create pool: 256 pages × 16 tokens/page = 4096 token capacity
+pool = KVCachePool(num_pages=256, page_size=16,
+                   num_layers=12, num_heads=12, head_dim=64)
+
+# Allocate pages for a prompt
+pages = pool.allocate(num_tokens=50)  # Returns [0, 1, 2, 3] (4 pages)
+
+# Store K/V tensors: shape [num_tokens, num_heads, head_dim]
+pool.store_kv(k_tensor, v_tensor, pages, layer_id=0)
+
+# Free pages when request completes
+pool.free(pages)
+```
+
+Chapter 16 extends this foundation with serving infrastructure: radix caching for prefix sharing, continuous batching for dynamic scheduling, and chunked prefill for responsiveness.
 
 ## 14.5 Summary
 

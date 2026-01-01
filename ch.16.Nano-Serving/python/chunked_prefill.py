@@ -7,11 +7,36 @@ with decode requests for better resource utilization.
 
 from typing import List, Optional, Tuple
 import sys
+import os
 sys.path.insert(0, '.')
+
+# Import KVCachePool from ch14
+build_paths = [
+    '../build/x64-release/ch.14.GPT-Optimized',
+    '../build/x64-debug/ch.14.GPT-Optimized',
+    'build/x64-release/ch.14.GPT-Optimized',
+    'build/x64-debug/ch.14.GPT-Optimized',
+    '../../build/x64-release/ch.14.GPT-Optimized',
+    '../../build/x64-debug/ch.14.GPT-Optimized',
+]
+
+ch14 = None
+for path in build_paths:
+    if os.path.exists(path):
+        sys.path.insert(0, path)
+        try:
+            import ch14
+            break
+        except ImportError:
+            sys.path.pop(0)
+
+if ch14 is None:
+    import ch14
+
+KVCachePool = ch14.KVCachePool
 
 from python.request import Request
 from python.batch import Batch
-from python.kv_pool import KVCachePool
 from python.chunked_request import ChunkedRequest
 
 class ChunkedPrefillManager:

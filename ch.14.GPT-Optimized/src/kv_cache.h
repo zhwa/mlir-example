@@ -1,10 +1,6 @@
-/*
- * KV Cache Pool - Page-based memory management
- * 
- * Manages physical KV cache pages for transformer inference.
- * Supports page allocation, deallocation, and K/V storage.
- */
-
+// KV Cache Pool - Page-based memory management for GPT inference
+// Manages physical KV cache pages for transformer inference.
+// Supports page allocation, deallocation, and K/V storage.
 #pragma once
 
 #include <vector>
@@ -12,31 +8,14 @@
 #include <memory>
 #include <stdexcept>
 
-namespace nano_serving {
+namespace gpt_optimized {
 
 class KVCachePool {
 public:
-    /**
-     * Initialize KV cache pool
-     * 
-     * @param num_pages Total number of pages in pool
-     * @param page_size Number of tokens per page
-     * @param num_layers Number of transformer layers
-     * @param num_heads Number of attention heads
-     * @param head_dim Dimension per head
-     */
-    KVCachePool(int num_pages, int page_size, 
-                int num_layers, int num_heads, int head_dim);
-
+    KVCachePool(int num_pages, int page_size, int num_layers, int num_heads, int head_dim);
     ~KVCachePool() = default;
 
-    /**
-     * Allocate pages for tokens
-     * 
-     * @param num_tokens Number of tokens requiring cache
-     * @return Vector of allocated page indices
-     * @throws std::runtime_error if insufficient pages
-     */
+    // Allocate pages for tokens
     std::vector<int> allocate(int num_tokens);
 
     /**
@@ -66,6 +45,20 @@ public:
      * @return Pair of (k_cache_ptr, v_cache_ptr)
      */
     std::pair<float*, float*> getLayerCache(int layer_id);
+
+    /**
+     * Calculate pages needed for num_tokens
+     */
+    int pagesNeeded(int num_tokens) const {
+        return (num_tokens + page_size_ - 1) / page_size_;
+    }
+
+    /**
+     * Check if allocation would succeed
+     */
+    bool canAllocate(int num_tokens) const {
+        return static_cast<int>(free_pages_.size()) >= pagesNeeded(num_tokens);
+    }
 
     /**
      * Get number of free pages
@@ -98,8 +91,7 @@ private:
     std::set<int> free_pages_;
 
     // Helper: get linear index for cache access
-    int getLinearIndex(int page_idx, int token_offset_in_page, 
-                       int head_idx) const;
+    int getLinearIndex(int page_idx, int token_offset_in_page, int head_idx) const;
 };
 
-} // namespace nano_serving
+} // namespace gpt_optimized

@@ -22,17 +22,59 @@ import numpy as np
 # Add python module to path (relative to this test file)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'python'))
 
+# Import C++ ch16 module for RadixNode and RadixCache
+build_paths = [
+    'build/x64-release/ch.16.Nano-Serving',
+    'build/x64-debug/ch.16.Nano-Serving',
+    '../build/x64-release/ch.16.Nano-Serving',
+    '../build/x64-debug/ch.16.Nano-Serving',
+]
+
+ch16 = None
+for path in build_paths:
+    if os.path.exists(path):
+        sys.path.insert(0, path)
+        try:
+            import ch16
+            break
+        except ImportError:
+            sys.path.pop(0)
+
+if ch16 is None:
+    import ch16  # Will raise ImportError with clear message
+
+# Import KVCachePool from ch14
+build_paths_ch14 = [
+    'build/x64-release/ch.14.GPT-Optimized',
+    'build/x64-debug/ch.14.GPT-Optimized',
+    '../build/x64-release/ch.14.GPT-Optimized',
+    '../build/x64-debug/ch.14.GPT-Optimized',
+]
+
+ch14 = None
+for path in build_paths_ch14:
+    if os.path.exists(path):
+        sys.path.insert(0, path)
+        try:
+            import ch14
+            break
+        except ImportError:
+            sys.path.pop(0)
+
+if ch14 is None:
+    import ch14
+
+KVCachePool = ch14.KVCachePool
+
 from request import Request
 from batch import Batch
 from sampling import SamplingParams
-from kv_pool import KVCachePool
 from prefill_manager import PrefillManager
+from radix_manager import RadixCacheManager
 from decode_manager import DecodeManager
 from executor import ModelExecutor, ModelConfig
 from chunked_request import ChunkedRequest
 from chunked_prefill import ChunkedPrefillManager
-from radix_node import RadixNode
-from radix_cache import RadixCache
 from radix_manager import RadixCacheManager
 from request_pool import RequestPool
 from continuous_batcher import ContinuousBatcher, sample_token
@@ -295,8 +337,8 @@ def phase4_test_radix_node():
     """Test radix nodes"""
     print("Phase 4.1: RadixNode...")
 
-    root = RadixNode(token=None)
-    assert root.is_root
+    root = ch16.RadixNode(-1)  # -1 for root token
+    assert root.is_root()
 
     child = root.add_child(10)
     assert root.get_child(10) == child
@@ -308,25 +350,25 @@ def phase4_test_radix_cache():
     print("Phase 4.2: RadixCache...")
 
     kv_pool = KVCachePool(num_pages=100, page_size=16, num_layers=12, num_heads=12, head_dim=64)
-    cache = RadixCache(kv_pool)
+    cache = ch16.RadixCache()
 
     tokens1 = [1, 2, 3, 4, 5]
     pages1 = list(range(5))
     cache.insert(tokens1, pages1)
 
-    assert cache.num_nodes == 5
+    assert cache.get_num_nodes() == 5
 
     matched_len, node = cache.match_prefix(tokens1)
     assert matched_len == 5
 
-    print(f"  ✓ Cache has {cache.num_nodes} nodes")
+    print(f"  ✓ Cache has {cache.get_num_nodes()} nodes")
 
 def phase4_test_shared_prefix():
     """Test shared prefix detection"""
     print("Phase 4.3: Shared prefix...")
 
     kv_pool = KVCachePool(num_pages=100, page_size=16, num_layers=12, num_heads=12, head_dim=64)
-    cache = RadixCache(kv_pool)
+    cache = ch16.RadixCache()
 
     tokens1 = [10, 20, 30, 40, 50]
     cache.insert(tokens1, list(range(5)))
@@ -334,7 +376,7 @@ def phase4_test_shared_prefix():
     tokens2 = [10, 20, 30, 40, 60]
     cache.insert(tokens2, list(range(5, 10)))
 
-    assert cache.num_nodes == 6  # Shared prefix + 2 branches
+    assert cache.get_num_nodes() == 6  # Shared prefix + 2 branches
 
     print(f"  ✓ Shared prefix detected")
 
