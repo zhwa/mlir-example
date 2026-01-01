@@ -10,52 +10,16 @@ Brings together all optimizations:
 
 from typing import List, Optional, Dict, Any
 import sys
-import os
 sys.path.insert(0, '.')
 import numpy as np
 
-# Import KVCachePool from ch14
-build_paths = [
-    '../build/x64-release/ch.14.GPT-Optimized',
-    '../build/x64-debug/ch.14.GPT-Optimized',
-    'build/x64-release/ch.14.GPT-Optimized',
-    'build/x64-debug/ch.14.GPT-Optimized',
-    '../../build/x64-release/ch.14.GPT-Optimized',
-    '../../build/x64-debug/ch.14.GPT-Optimized',
-]
-
-ch14 = None
-for path in build_paths:
-    if os.path.exists(path):
-        sys.path.insert(0, path)
-        try:
-            import ch14
-            break
-        except ImportError:
-            sys.path.pop(0)
-
-if ch14 is None:
-    import ch14
-
-KVCachePool = ch14.KVCachePool
-
-from python.request import Request
+from python.cpp_modules import KVCachePool
+from python.request import Request, SamplingParams
 from python.radix_manager import RadixCacheManager
 from python.chunked_prefill import ChunkedPrefillManager
 from python.decode_manager import DecodeManager
 from python.executor import ModelExecutor, ModelConfig
 from python.continuous_batcher import ContinuousBatcher
-
-class SamplingParams:
-    """Parameters for text generation sampling"""
-
-    def __init__(self,
-                 max_tokens: int = 16,
-                 temperature: float = 1.0,
-                 ignore_eos: bool = False):
-        self.max_tokens = max_tokens
-        self.temperature = temperature
-        self.ignore_eos = ignore_eos
 
 class NanoServingEngine:
     """

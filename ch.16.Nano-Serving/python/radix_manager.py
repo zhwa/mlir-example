@@ -9,36 +9,9 @@ Uses C++ RadixCache implementation directly from ch16 module.
 
 from typing import List, Tuple
 import sys
-import os
-
 sys.path.insert(0, '.')
 
-def import_cpp_module(module_name: str, chapter_path: str):
-    """Helper to import C++ modules from build directories"""
-    build_paths = [
-        f'../build/x64-release/{chapter_path}',
-        f'../build/x64-debug/{chapter_path}',
-        f'build/x64-release/{chapter_path}',
-        f'build/x64-debug/{chapter_path}',
-        f'../../build/x64-release/{chapter_path}',
-        f'../../build/x64-debug/{chapter_path}',
-    ]
-    
-    for path in build_paths:
-        if os.path.exists(path):
-            sys.path.insert(0, path)
-            try:
-                return __import__(module_name)
-            except ImportError:
-                sys.path.pop(0)
-    
-    # Final attempt without path (if already in sys.path)
-    return __import__(module_name)
-
-# Import C++ modules
-ch16 = import_cpp_module('ch16', 'ch.16.Nano-Serving')
-ch14 = import_cpp_module('ch14', 'ch.14.GPT-Optimized')
-KVCachePool = ch14.KVCachePool
+from python.cpp_modules import ch14, ch16, KVCachePool
 
 class RadixCacheManager:
     """

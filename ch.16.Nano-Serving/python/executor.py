@@ -12,26 +12,7 @@ sys.path.insert(0, '.')
 
 # Import Chapter 14's MLIR JIT module
 try:
-    build_paths = [
-        '../build/x64-release/ch.14.GPT-Optimized',
-        '../build/x64-debug/ch.14.GPT-Optimized',
-        '../../build/x64-release/ch.14.GPT-Optimized',
-        '../../build/x64-debug/ch.14.GPT-Optimized',
-    ]
-
-    ch14 = None
-    for path in build_paths:
-        if os.path.exists(path):
-            sys.path.insert(0, path)
-            try:
-                import ch14
-                break
-            except ImportError:
-                sys.path.pop(0)
-
-    if ch14 is None:
-        import ch14
-
+    from python.cpp_modules import ch14
 except ImportError as e:
     print(f"Warning: Could not import ch14 module: {e}")
     print("Phase 2 executor requires Chapter 14 to be built.")

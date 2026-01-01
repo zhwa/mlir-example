@@ -66,9 +66,8 @@ if ch14 is None:
 
 KVCachePool = ch14.KVCachePool
 
-from request import Request
+from request import Request, SamplingParams
 from batch import Batch
-from sampling import SamplingParams
 from prefill_manager import PrefillManager
 from radix_manager import RadixCacheManager
 from decode_manager import DecodeManager
