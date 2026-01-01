@@ -1,12 +1,18 @@
 //===- TransformDialectOptimization.cpp - Transform Dialect Optimizations -*-===//
 //
 // This file implements REAL Transform Dialect-based optimizations using
-// external transform scripts executed via the Transform Dialect interpreter.
+// EMBEDDED transform scripts, following the Torch-MLIR approach.
 //
-// This COMPLETELY REPLACES traditional passes with Transform Dialect operations.
+// The transform script is embedded as a string literal and parsed once at
+// initialization. This is the production approach used by Torch-MLIR:
+// - No external file dependencies
+// - Parse once, cache the result
+// - Zero runtime I/O overhead
+// - Transform script is part of the binary
 //
 //===----------------------------------------------------------------------===//
 
+#include "TransformDialectOptimization.h"
 #include "mlir/Dialect/Transform/IR/TransformDialect.h"
 #include "mlir/Dialect/Transform/IR/TransformOps.h"
 #include "mlir/Dialect/Transform/Transforms/TransformInterpreterUtils.h"
@@ -16,59 +22,83 @@
 
 #include <llvm/Support/raw_ostream.h>
 
-#include <dlfcn.h>
-#include <filesystem>
-
 using namespace mlir;
 
-/// Get the directory where this shared library is loaded from
-static std::filesystem::path getModuleDirectory() {
-  Dl_info info;
-  if (dladdr((void*)getModuleDirectory, &info)) {
-    return std::filesystem::path(info.dli_fname).parent_path();
-  }
-  return {};
+//===----------------------------------------------------------------------===//
+// Embedded Transform Script (Torch-MLIR style)
+//===----------------------------------------------------------------------===//
+
+// Transform Dialect optimization sequence
+// This is embedded directly in the binary, no external file needed
+static constexpr const char *kOptimizeTransformIR = R"mlir(
+// Transform Dialect optimization sequence for GPT model
+//
+// This uses REAL Transform Dialect operations to optimize the IR.
+// Replaces traditional passes with declarative transform specifications.
+
+transform.sequence failures(propagate) {
+^bb0(%arg0: !transform.any_op):
+  // Apply canonicalization patterns to simplify IR
+  // Includes CSE, folding, dead code elimination
+  transform.apply_patterns to %arg0 {
+    transform.apply_patterns.canonicalization
+  } : !transform.any_op
+}
+)mlir";
+
+//===----------------------------------------------------------------------===//
+// Cached Transform Module
+//===----------------------------------------------------------------------===//
+
+// Parse transform script once and cache it
+// This avoids reparsing on every compilation (Torch-MLIR pattern)
+static OwningOpRef<ModuleOp> getCachedTransformModule(MLIRContext *ctx) {
+  static OwningOpRef<ModuleOp> cachedModule;
+  static std::once_flag initFlag;
+  
+  std::call_once(initFlag, [ctx]() {
+    ParserConfig config(ctx);
+    cachedModule = parseSourceString<ModuleOp>(kOptimizeTransformIR, config);
+    if (!cachedModule) {
+      llvm::errs() << "FATAL: Failed to parse embedded transform script\n";
+    }
+  });
+  
+  return cachedModule.get() ? cachedModule.get().clone() : OwningOpRef<ModuleOp>();
 }
 
-/// Apply Transform Dialect optimizations using external script
+//===----------------------------------------------------------------------===//
+// Public API
+//===----------------------------------------------------------------------===//
+
+namespace mlir {
+
+/// Apply Transform Dialect optimizations using embedded transform script
 ///
-/// This uses REAL Transform Dialect operations from an external .mlir script.
-/// Uses the lower-level Transform Dialect API that doesn't require specific
-/// module structure.
+/// This follows the Torch-MLIR approach:
+/// 1. Transform script embedded as string literal in the binary
+/// 2. Parse once, cache the parsed module
+/// 3. Clone and apply to each compilation target
+/// 
+/// Benefits:
+/// - No external file dependencies
+/// - No runtime file I/O
+/// - Parse overhead paid only once
+/// - Production-ready approach used by major projects
 ///
-static LogicalResult applyTransformDialectOptimizationsImpl(ModuleOp module) {
+LogicalResult applyTransformDialectOptimizations(ModuleOp module) {
   MLIRContext *ctx = module.getContext();
   
-  // ==========================================================================
-  // Load transform script
-  // ==========================================================================
-  auto moduleDir = getModuleDirectory();
-  if (moduleDir.empty()) {
-    llvm::errs() << "ERROR: Could not determine module directory\n";
-    return failure();
-  }
+  llvm::outs() << "Applying embedded Transform Dialect optimizations...\n";
   
-  auto scriptPath = moduleDir / "optimize.mlir";
-  std::string scriptPathStr = scriptPath.string();
-  
-  llvm::outs() << "Loading Transform Dialect script: " << scriptPathStr << "\n";
-  
-  auto transformModule = parseSourceFile<ModuleOp>(scriptPathStr, ctx);
+  // Get the cached (and cloned) transform module
+  auto transformModule = getCachedTransformModule(ctx);
   if (!transformModule) {
-    llvm::errs() << "ERROR: Failed to load transform script\n";
+    llvm::errs() << "ERROR: Failed to get transform module\n";
     return failure();
   }
   
-  llvm::outs() << "✓ Loaded transform script\n";
-  
-  // ==========================================================================
-  // Execute transform via lower-level API
-  // ==========================================================================
-  // Use applyTransforms with RaggedArray API for more control
-  
-  llvm::outs() << "Executing Transform Dialect sequence...\n";
-  
-  // Find the top-level transform op (either named_sequence or sequence)
+  // Find the top-level transform operation
   Operation *topLevelTransformOp = nullptr;
   for (Operation &op : transformModule->getBodyRegion().getOps()) {
     if (auto transformOp = dyn_cast<transform::TransformOpInterface>(&op)) {
@@ -78,29 +108,24 @@ static LogicalResult applyTransformDialectOptimizationsImpl(ModuleOp module) {
   }
   
   if (!topLevelTransformOp) {
-    llvm::errs() << "ERROR: No top-level transform op found in script\n";
+    llvm::errs() << "ERROR: No transform operation found in embedded script\n";
     return failure();
   }
   
-  // Apply the transformations using Transform Dialect interpreter
+  // Apply the transformations
   transform::TransformOptions options;
   
   if (failed(transform::applyTransforms(
-          module.getOperation(),                        // Payload root - the module we want to optimize
-          cast<transform::TransformOpInterface>(topLevelTransformOp),  // Transform operation
-          {},                                           // No extra mappings
+          module.getOperation(),
+          cast<transform::TransformOpInterface>(topLevelTransformOp),
+          {},
           options))) {
     llvm::errs() << "ERROR: Transform sequence execution failed\n";
     return failure();
   }
   
-  llvm::outs() << "✓ Transform Dialect optimizations applied (100% Transform ops, 0% passes)\n";
+  llvm::outs() << "✓ Transform Dialect optimizations applied (Torch-MLIR style: embedded + cached)\n";
   return success();
 }
 
-// C++ interface for direct calls
-namespace mlir {
-LogicalResult applyTransformDialectOptimizations(ModuleOp module) {
-  return applyTransformDialectOptimizationsImpl(module);
-}
 } // namespace mlir

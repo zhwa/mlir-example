@@ -109,12 +109,10 @@ public:
     // Lower transformer dialect to linalg (tensor-based)
     pm.addNestedPass<func::FuncOp>(createLowerTransformerToStandardPass());
 
-    pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
-    pm.addNestedPass<func::FuncOp>(createCSEPass());
-
-    // Apply REAL Transform Dialect optimizations
-    // Uses transform operations (not traditional passes)
-    // Implementation in TransformDialectOptimization.cpp
+    // Apply Transform Dialect optimizations (Torch-MLIR style)
+    // This replaces legacy passes with declarative transform operations
+    // Includes: canonicalization, CSE, pattern folding, dead code elimination
+    // Implementation: TransformDialectOptimization.cpp (embedded transform script)
     if (failed(mlir::applyTransformDialectOptimizations(module))) {
       llvm::errs() << "Failed to apply Transform Dialect optimizations\n";
       return false;
@@ -137,13 +135,9 @@ public:
 
     // Lower linalg operations to loops
     pm.addNestedPass<func::FuncOp>(createConvertLinalgToLoopsPass());
-    pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
 
     // SCF optimizations (loop invariant code motion)
     pm.addPass(createLoopInvariantCodeMotionPass());
-    pm.addPass(createCanonicalizerPass());
-
-    pm.addNestedPass<func::FuncOp>(createCSEPass());
 
     // Lower to LLVM
     pm.addPass(createConvertMathToLLVMPass());

@@ -51,17 +51,22 @@ tile → fuse → vectorize → cleanup
 
 ```
 ch.14.GPT-Optimized/
-├── TUTORIAL.md              ⭐ Comprehensive guide (read this!)
-├── README.md                📄 This file (quick reference)
-├── transform_dialect.md     📚 Official MLIR documentation
+├── TUTORIAL.md                         ⭐ Comprehensive guide (read this!)
+├── README.md                           📄 This file (quick reference)
 ├── src/
-│   └── bindings.cpp         🔧 Transform dialect implementation
-├── inc/                     📝 Transformer dialect definitions
-├── test_all.py              ✅ Complete test suite (22 tests)
-├── demo.py                  🎮 Interactive generation demo
-├── benchmark.py             📊 Performance measurements
-└── generation.py            🔄 KV cache implementation
+│   ├── TransformDialectOptimization.cpp  🔥 Torch-MLIR style (embedded transform script)
+│   └── bindings.cpp                     🔧 Python interface
+├── inc/                                📝 Transformer dialect definitions
+├── test_all.py                         ✅ Complete test suite (22 tests)
+├── demo.py                             🎮 Interactive generation demo
+├── benchmark.py                        📊 Performance measurements
+└── generation.py                       🔄 KV cache implementation
 ```
+
+**Transform Dialect Implementation (Torch-MLIR Style):**
+- Transform script embedded as string literal (no external files!)
+- Parsed once and cached (zero runtime I/O)
+- Production approach used by major AI compilers
 
 ## Documentation
 

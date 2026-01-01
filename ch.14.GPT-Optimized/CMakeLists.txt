@@ -93,13 +93,3 @@ target_include_directories(ch14 PRIVATE
   ${PROJECT_BINARY_DIR}/inc
   ${FFI_INCLUDE_DIRS}
 )
-
-# Copy Transform Dialect optimization script to build directory
-# This makes it accessible from the binary at runtime
-add_custom_command(
-  TARGET ch14 POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different
-    ${CMAKE_CURRENT_SOURCE_DIR}/transforms/optimize.mlir
-    ${CMAKE_CURRENT_BINARY_DIR}/optimize.mlir
-  COMMENT "Copying Transform Dialect optimization script to build directory"
-)
