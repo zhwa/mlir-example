@@ -25,6 +25,7 @@ add_llvm_library(MLIRCh14TransformerDialect
   src/TransformerDialect.cpp
   src/TransformerOps.cpp
   src/TransformerPasses.cpp
+  src/TransformDialectOptimization.cpp
 
   DEPENDS
   Ch14TransformerDialectIncGen
@@ -67,6 +68,7 @@ target_link_libraries(ch14 PRIVATE
   MLIRVectorTransforms
   MLIRVectorTransformOps
   MLIRTransformDialect
+  MLIRTransformDialectTransforms
   MLIRTransforms
   MLIRTargetLLVMIRExport
   MLIRLLVMCommonConversion
@@ -90,4 +92,14 @@ target_include_directories(ch14 PRIVATE
   ${PROJECT_SOURCE_DIR}/inc
   ${PROJECT_BINARY_DIR}/inc
   ${FFI_INCLUDE_DIRS}
+)
+
+# Copy Transform Dialect optimization script to build directory
+# This makes it accessible from the binary at runtime
+add_custom_command(
+  TARGET ch14 POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    ${CMAKE_CURRENT_SOURCE_DIR}/transforms/optimize.mlir
+    ${CMAKE_CURRENT_BINARY_DIR}/optimize.mlir
+  COMMENT "Copying Transform Dialect optimization script to build directory"
 )

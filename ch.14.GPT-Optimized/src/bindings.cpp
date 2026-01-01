@@ -2,6 +2,7 @@
 #include "TransformerDialect.h"
 #include "TransformerOps.h"
 #include "TransformerPasses.h"
+#include "TransformDialectOptimization.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -42,6 +43,12 @@
 #include "mlir/Conversion/TensorToLinalg/TensorToLinalgPass.h"
 #include "mlir/Dialect/Linalg/Passes.h"
 
+// Transform Dialect for optimization
+#include "mlir/Dialect/Transform/IR/TransformDialect.h"
+#include "mlir/Dialect/Linalg/TransformOps/LinalgTransformOps.h"
+#include "mlir/Dialect/Linalg/TransformOps/DialectExtension.h"
+#include "mlir/Dialect/Transform/Transforms/TransformInterpreterUtils.h"
+
 #include <llvm/Support/TargetSelect.h>
 
 #include <pybind11/numpy.h>
@@ -76,12 +83,19 @@ static struct LLVMInit {
 class TransformerCompiler {
 public:
   TransformerCompiler() {
+    // Register Transform Dialect extensions before loading dialects
+    DialectRegistry registry;
+    linalg::registerTransformDialectExtension(registry);
+    context_.appendDialectRegistry(registry);
+    
+    // Load core dialects
     context_.loadDialect<transformer::TransformerDialect,
                          func::FuncDialect, arith::ArithDialect,
                          memref::MemRefDialect, scf::SCFDialect, math::MathDialect,
                          linalg::LinalgDialect, tensor::TensorDialect,
                          bufferization::BufferizationDialect,
-                         LLVM::LLVMDialect>();
+                         LLVM::LLVMDialect,
+                         transform::TransformDialect>();
   }
 
   MLIRContext& getContext() { return context_; }
@@ -98,11 +112,13 @@ public:
     pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
     pm.addNestedPass<func::FuncOp>(createCSEPass());
 
-    // Linalg optimizations (on tensors before bufferization)
-    pm.addPass(createLinalgGeneralizeNamedOpsPass());
-    pm.addPass(createCanonicalizerPass());
-    pm.addPass(createLinalgElementwiseOpFusionPass());
-    pm.addPass(createCanonicalizerPass());
+    // Apply REAL Transform Dialect optimizations
+    // Uses transform operations (not traditional passes)
+    // Implementation in TransformDialectOptimization.cpp
+    if (failed(mlir::applyTransformDialectOptimizations(module))) {
+      llvm::errs() << "Failed to apply Transform Dialect optimizations\n";
+      return false;
+    }
 
     // Bufferization: tensor → memref
     DialectRegistry registry;
