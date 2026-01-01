@@ -109,10 +109,10 @@ public:
     // Lower transformer dialect to linalg (tensor-based)
     pm.addNestedPass<func::FuncOp>(createLowerTransformerToStandardPass());
 
-    // Apply Transform Dialect optimizations (Torch-MLIR style)
+    // Apply Transform Dialect optimizations (production approach)
     // This replaces legacy passes with declarative transform operations
     // Includes: canonicalization, CSE, pattern folding, dead code elimination
-    // Implementation: TransformDialectOptimization.cpp (embedded transform script)
+    // Implementation: TransformDialectOptimization.cpp (embedded + cached)
     if (failed(mlir::applyTransformDialectOptimizations(module))) {
       llvm::errs() << "Failed to apply Transform Dialect optimizations\n";
       return false;

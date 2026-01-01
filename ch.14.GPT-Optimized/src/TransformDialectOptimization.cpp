@@ -1,10 +1,10 @@
 //===- TransformDialectOptimization.cpp - Transform Dialect Optimizations -*-===//
 //
 // This file implements REAL Transform Dialect-based optimizations using
-// EMBEDDED transform scripts, following the Torch-MLIR approach.
+// EMBEDDED transform scripts (production pattern used by major MLIR projects).
 //
 // The transform script is embedded as a string literal and parsed once at
-// initialization. This is the production approach used by Torch-MLIR:
+// initialization. This production approach provides:
 // - No external file dependencies
 // - Parse once, cache the result
 // - Zero runtime I/O overhead
@@ -25,7 +25,7 @@
 using namespace mlir;
 
 //===----------------------------------------------------------------------===//
-// Embedded Transform Script (Torch-MLIR style)
+// Embedded Transform Script (Production Pattern)
 //===----------------------------------------------------------------------===//
 
 // Transform Dialect optimization sequence
@@ -51,11 +51,11 @@ transform.sequence failures(propagate) {
 //===----------------------------------------------------------------------===//
 
 // Parse transform script once and cache it
-// This avoids reparsing on every compilation (Torch-MLIR pattern)
+// This avoids reparsing on every compilation (production optimization)
 static OwningOpRef<ModuleOp> getCachedTransformModule(MLIRContext *ctx) {
   static OwningOpRef<ModuleOp> cachedModule;
   static std::once_flag initFlag;
-  
+
   std::call_once(initFlag, [ctx]() {
     ParserConfig config(ctx);
     cachedModule = parseSourceString<ModuleOp>(kOptimizeTransformIR, config);
@@ -63,7 +63,7 @@ static OwningOpRef<ModuleOp> getCachedTransformModule(MLIRContext *ctx) {
       llvm::errs() << "FATAL: Failed to parse embedded transform script\n";
     }
   });
-  
+
   return cachedModule.get() ? cachedModule.get().clone() : OwningOpRef<ModuleOp>();
 }
 
@@ -75,7 +75,7 @@ namespace mlir {
 
 /// Apply Transform Dialect optimizations using embedded transform script
 ///
-/// This follows the Torch-MLIR approach:
+/// Production approach (used by major MLIR-based compilers):
 /// 1. Transform script embedded as string literal in the binary
 /// 2. Parse once, cache the parsed module
 /// 3. Clone and apply to each compilation target
@@ -84,20 +84,20 @@ namespace mlir {
 /// - No external file dependencies
 /// - No runtime file I/O
 /// - Parse overhead paid only once
-/// - Production-ready approach used by major projects
+/// - Proven production pattern
 ///
 LogicalResult applyTransformDialectOptimizations(ModuleOp module) {
   MLIRContext *ctx = module.getContext();
-  
+
   llvm::outs() << "Applying embedded Transform Dialect optimizations...\n";
-  
+
   // Get the cached (and cloned) transform module
   auto transformModule = getCachedTransformModule(ctx);
   if (!transformModule) {
     llvm::errs() << "ERROR: Failed to get transform module\n";
     return failure();
   }
-  
+
   // Find the top-level transform operation
   Operation *topLevelTransformOp = nullptr;
   for (Operation &op : transformModule->getBodyRegion().getOps()) {
@@ -106,15 +106,15 @@ LogicalResult applyTransformDialectOptimizations(ModuleOp module) {
       break;
     }
   }
-  
+
   if (!topLevelTransformOp) {
     llvm::errs() << "ERROR: No transform operation found in embedded script\n";
     return failure();
   }
-  
+
   // Apply the transformations
   transform::TransformOptions options;
-  
+
   if (failed(transform::applyTransforms(
           module.getOperation(),
           cast<transform::TransformOpInterface>(topLevelTransformOp),
@@ -123,8 +123,8 @@ LogicalResult applyTransformDialectOptimizations(ModuleOp module) {
     llvm::errs() << "ERROR: Transform sequence execution failed\n";
     return failure();
   }
-  
-  llvm::outs() << "✓ Transform Dialect optimizations applied (Torch-MLIR style: embedded + cached)\n";
+
+  llvm::outs() << "✓ Transform Dialect optimizations applied (cached transform script)\n";
   return success();
 }
 
