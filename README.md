@@ -223,16 +223,18 @@ python3 test_jit.py
 **Documentation**: `ch.14.GPT-Optimized/README.md`, `TUTORIAL.md`
 
 ### Chapter 15: GPU Programming Concepts
-**Goal**: Introduction to GPU memory hierarchies and parallel programming
+**Goal**: Learn GPU programming by examining GPU dialect IR (no GPU hardware required)
 
 **Key Concepts**:
-- GPU architecture (SMs, warps, threads)
-- Memory hierarchies (global, shared, registers)
-- Coalesced memory access patterns
-- Thread block and grid organization
-- Foundation for future CUDA/GPU chapters
+- GPU dialect IR structure (gpu.module, gpu.func, gpu.launch_func)
+- Thread indexing (gpu.thread_id, gpu.block_id, gpu.block_dim)
+- Memory hierarchies (global memory vs workgroup/shared memory)
+- Synchronization primitives (gpu.barrier)
+- Three representative patterns: 1D parallelism, 2D+shared memory, reductions
 
-**Documentation**: `ch.15.GPU-Concepts/README.md`, `TUTORIAL.md`
+**Implementation**: Python module generating GPU IR for three kernels (vector add, matmul, softmax)
+
+**Documentation**: `ch.15.GPU-Concepts/README.md`
 
 ### Chapter 16: Nano LLM Serving
 **Goal**: Build production-style LLM serving engine with modern optimizations

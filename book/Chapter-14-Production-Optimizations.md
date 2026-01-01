@@ -342,7 +342,7 @@ LogicalResult applyTransformDialectOptimizations(ModuleOp module) {
 }
 ```
 
-This pattern works well in production for several reasons. The transform script compiles into the binary, eliminating all deployment complexity around file distribution, path configuration, and version synchronization. Parsing happens once regardless of how many modules you compile, so there's essentially zero parsing overhead after the first compilation. The `std::call_once` mechanism ensures thread safety even with concurrent compilations. Each compilation receives its own clone of the cached transform module, preventing any interference between concurrent operations. Finally, modifying the optimization strategy requires only editing the embedded string literal and recompiling—there are no external files to track and distribute.
+This pattern works well in production.
 
 **Transform Dialect Fundamentals**. Transform dialect operates on two levels of IR simultaneously. The **payload IR** contains your actual program—operations like `linalg.matmul`, tensor values, and function definitions that represent the computation you're compiling. The **transform IR** contains operations that manipulate the payload IR—operations like `transform.structured.tile` or `transform.apply_patterns` that describe transformations to apply. Transform operations work with **handles**, which are transform IR values that reference sets of payload IR operations or values. When a transform operation executes, it operates on the payload IR objects referenced by its handle operands.
 
