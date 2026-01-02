@@ -136,7 +136,7 @@ This multi-stage approach:
 - **Scale initialization**: Must create and fill constant memref before MulOp
 - **Transpose loops**: Must iterate over **output shape**, not input shape
 
-### LLVM 19 Compatibility
+### LLVM 19+ Compatibility
 Fixed several API changes:
 - `createLinalgGeneralizationPass()` → `createLinalgGeneralizeNamedOpsPass()`
 - `.cast<T>()` → `mlir::cast<T>()`
