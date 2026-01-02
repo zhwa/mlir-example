@@ -73,7 +73,7 @@ Without bounds checking, threads access invalid memory—undefined behavior.
 
 GPU memory is hierarchical: **global memory** (slow, large), **shared memory** (fast, small), and **registers** (fastest, smallest). Understanding this hierarchy is critical for reading GPU dialect IR.
 
-GPUs have three memory levels with different performance characteristics. Global memory (HBM/GDDR) provides 16-80 GB capacity with ~300-500 cycle latency and 1-2 TB/s bandwidth, accessible to all threads and represented in MLIR as `memref<?xf32>` with default address space. Shared memory offers 64-128 KB per SM with ~5-10 cycle latency (50-100× faster than global), scoped to threads within the same block and allocated in MLIR via `gpu.alloc()` producing `memref<NxM xf32, 3>` where address space 3 indicates workgroup memory. Registers provide ~256 KB per SM (32-64 registers per thread) with zero-cycle latency, private to each thread, and managed automatically by the compiler as SSA values.
+GPUs have three memory levels with different performance characteristics. Global memory (HBM/GDDR) provides 16-80 GB capacity with ~400-800 cycle latency (can spike higher under contention or uncoalesced access) and 1-2 TB/s bandwidth, accessible to all threads and represented in MLIR as `memref<?xf32>` with default address space (technically Address Space 0). Shared memory offers 64-128 KB per SM with ~20-40 cycle latency and aggregate bandwidth often exceeding 15-20 TB/s across the chip (an order of magnitude faster than global memory), scoped to threads within the same block and allocated in MLIR via `gpu.alloc()` producing `memref<NxM xf32, 3>` where address space 3 indicates workgroup memory (this convention is target-dependent: NVVM and ROCDL both use address space 3 for shared memory). Registers provide ~256 KB per SM (32-64 registers per thread) with very low latency (2-4 cycles read-after-write, though this is typically hidden via warp switching, giving the appearance of "zero-cycle" access), private to each thread, and managed automatically by the compiler as SSA values rather than memory-mapped addresses.
 
 **Shared Memory in MLIR**. Shared memory allocations appear as `gpu.alloc`:
 
@@ -91,7 +91,7 @@ gpu.barrier
 %shared_value = memref.load %tile[%i, %j] : memref<16x16xf32, 3>
 ```
 
-The address space (3 = workgroup) tells the compiler to allocate in fast on-chip shared memory, not slow global memory.
+The address space (3 = workgroup) tells the compiler to allocate in fast on-chip shared memory, not slow global memory. Note that address space 3 is the convention for both NVVM (NVIDIA) and ROCDL (AMD) targets, though address space mappings are technically target-dependent in MLIR.
 
 **Memory Coalescing**. Global memory transfers happen in 32-128 byte chunks. When threads in a warp access **consecutive addresses**, hardware coalesces loads into a single transaction:
 
@@ -252,7 +252,7 @@ func.func @main(...) {
 }
 ```
 
-The matrix multiplication kernel uses 2D indexing for both grid and block organization (`blocks in (gridX, gridY, 1)` and `threads in (16, 16, 1)`). Shared memory appears as `gpu.alloc() : memref<16x16xf32, 3>` where address space 3 indicates workgroup memory. The IR shows the memory hierarchy through type annotations: global loads use `memref<?x?xf32>` while shared memory uses `memref<16x16xf32, 3>`. The `gpu.barrier` operation ensures all threads finish loading data before any thread reads from shared memory, enabling the cooperative pattern where all 256 threads (16×16) load one element each into the shared tile. Shared memory provides 50-100× speedup over global memory (~5-10 cycle latency versus ~300-500 cycles), which is why production kernels load tiles into shared memory and reuse data multiple times to dramatically reduce global memory traffic.
+The matrix multiplication kernel uses 2D indexing for both grid and block organization (`blocks in (gridX, gridY, 1)` and `threads in (16, 16, 1)`). Shared memory appears as `gpu.alloc() : memref<16x16xf32, 3>` where address space 3 indicates workgroup memory. The IR shows the memory hierarchy through type annotations: global loads use `memref<?x?xf32>` while shared memory uses `memref<16x16xf32, 3>`. The `gpu.barrier` operation ensures all threads finish loading data before any thread reads from shared memory, enabling the cooperative pattern where all 256 threads (16×16) load one element each into the shared tile. Shared memory provides significant speedup over global memory (~20-40 cycle latency versus ~400-800 cycles, roughly 10-20× faster), which is why production kernels load tiles into shared memory and reuse data multiple times to dramatically reduce global memory traffic.
 
 ## 15.5 Softmax: Reductions and Block Cooperation
 
@@ -327,11 +327,12 @@ gpu.func @softmax(...) kernel {
 
 The softmax kernel uses four barriers positioned after computing the local max, after computing the global max, after computing local sums, and after computing the global sum. Shared memory allocated via `gpu.alloc() : memref<256xf32, 3>` enables thread communication, where address space 3 indicates workgroup memory accessible to all threads in the block. Each stage of the multi-stage algorithm depends on the previous barrier completing. The cooperative pattern follows a consistent rhythm: all threads contribute partial results, one thread (typically thread 0) performs the reduction, then all threads read the final result.
 
-**Why Barriers Matter**. Without barriers, race conditions occur:
+**Why Barriers Matter**. Without barriers, race conditions occur. For example, if Thread 0 begins the reduction phase before Thread 255 has finished writing its local maximum to `shared_max[255]`, Thread 0 will read stale or uninitialized data, leading to an incorrect global maximum:
 
 ```
-Thread 0: writes shared_max[0] = 5.0
-Thread 1: reads shared_max[0] before Thread 0 writes → undefined behavior!
+Thread 0: starts reading shared_max[] for reduction
+Thread 255: still writing shared_max[255] = 8.3 → Race condition!
+Result: Thread 0 computes wrong maximum
 ```
 
 `gpu.barrier` ensures **all threads** reach the barrier before **any thread** proceeds. This guarantees:
@@ -351,7 +352,7 @@ All follow: compute locally → barrier → reduce cooperatively → barrier →
 Build and run from the repository root:
 
 ```bash
-cd ch.15.GPU-Concepts && python3 test_gpu.py
+python3 ch.15.GPU-Concepts/test_gpu.py
 ```
 
 The test outputs GPU dialect IR for all three kernels with annotated explanations. You'll see the actual IR structure showing `gpu.thread_id`, `gpu.alloc`, `gpu.barrier`, and `gpu.launch_func` operations. The output demonstrates how thread indexing, shared memory, and synchronization appear in practice.

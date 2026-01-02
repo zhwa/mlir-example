@@ -16,9 +16,7 @@ for _ in range(max_tokens):
 
 Production systems solve these problems with **KV caching** (O(N²) → O(N)), **continuous batching** (parallel multi-request execution), and **paged memory management** (dramatically increased capacity). The combination enables serving many concurrent users interactively. The practical impact becomes clear when comparing user experience: naive implementations process one request at a time with sequential token generation, creating deep queues where users wait unacceptably long. Production systems like vLLM and SGLang batch many requests together, generating tokens in parallel across the batch, keeping queue depth minimal and response times short. This chapter explains these techniques through concept-then-implementation pairs.
 
-## 16.1 Request Lifecycle: Concept and Implementation
-
-### 16.1.1 Request Abstraction
+## 16.1 Request Lifecycle
 
 Production serving organizes computation around **requests**—user tasks with specific prompts and generation parameters. Each request tracks input specifications and dynamic state throughout execution.
 
@@ -48,7 +46,7 @@ req.output_tokens = [42, 73]
 # ... continues until device_len == max_device_len or EOS token
 ```
 
-### 16.1.2 Implementation: Request Class
+### Request Class
 
 The `Request` class encapsulates a single user request and tracks its state throughout the lifecycle:
 
@@ -77,7 +75,7 @@ class Request:
 
 The `extend_len` property dynamically determines workload—many tokens during prefill, exactly one during decode.
 
-### 16.1.3 Batch Abstraction
+### Batch Abstraction
 
 Multiple requests execute together in batches to achieve parallelism. The scheduler and manager components (introduced in sections 16.3 and 16.6) use the Batch abstraction to group requests for efficient GPU execution. The key challenge is that prefill and decode phases have fundamentally different batching requirements: prefill processes many tokens per request (the entire uncached prompt), while decode processes exactly one token per request (the newly generated token).
 
@@ -112,9 +110,7 @@ class Batch:
 
 Batch construction varies by phase—concatenated sequences for prefill, single tokens for decode.
 
-## 16.2 Paged KV Cache: Concept and Implementation
-
-### 16.2.1 The Memory Fragmentation Problem
+## 16.2 Paged KV Cache
 
 The naive approach allocates max_seq_len memory for each request—wasteful when actual prompt lengths vary widely (50-2000 tokens). Production systems use **paged memory management**: divide KV cache into fixed-size pages, allocate on-demand.
 
@@ -136,9 +132,9 @@ Request 2 (100 tokens): Uses pages [5, 6, 7, 8, 9] (6 pages, minimal waste)
 Request 3 (1500 tokens): Uses pages [10-103]       (94 pages, minimal waste)
 ```
 
-### 16.2.2 KV Cache Pool Implementation
+### KV Cache Pool
 
-**Why Chapter 14's KV Cache Isn't Enough**. In Chapter 14, we implemented KV caching to avoid recomputing attention for previous tokens—a single request maintains its cache as a contiguous tensor growing with each decode iteration. This works well for processing one request at a time, but production serving processes dozens to hundreds of concurrent requests. If we allocate contiguous memory for each request's maximum possible length, we waste enormous amounts of GPU memory on unused capacity.
+**KV Cache Isn't Enough**. In Chapter 14, we implemented KV caching to avoid recomputing attention for previous tokens—a single request maintains its cache as a contiguous tensor growing with each decode iteration. This works well for processing one request at a time, but production serving processes dozens to hundreds of concurrent requests. If we allocate contiguous memory for each request's maximum possible length, we waste enormous amounts of GPU memory on unused capacity.
 
 The problem is allocation granularity. Chapter 14's approach allocates `max_seq_len × hidden_dim` memory per request upfront. When requests have varying actual lengths (some use 50 tokens, others use 1500), most allocations are oversized. Even worse, growing contiguous allocations can't reuse freed memory from completed requests—fragmentation prevents efficient packing.
 
@@ -182,9 +178,7 @@ For example, accessing token 42 in a request with 16-token pages involves three 
 
 Paging allocates based on actual usage rather than worst-case, enabling 5-10× more concurrent requests.
 
-## 16.3 Continuous Batching: Concept and Implementation
-
-### 16.3.1 The Static Batching Problem
+## 16.3 Continuous Batching
 
 Traditional batching waits for **all requests** to complete before accepting new work. This creates severe underutilization when requests finish at different times.
 
@@ -199,7 +193,7 @@ GPU Utilization: 4/4 → 1/4 (25%) for 880 iterations
 
 LLM decode generates exactly one token per request per iteration. When a request finishes, its slot becomes immediately available.
 
-### 16.3.2 Continuous Batching Solution
+### Continuous Batching Solution
 
 To fix the static batching problem, we introduce **continuous batching**—a dynamic scheduling approach where the batch composition changes every iteration. The key insight is that decode iterations are independent and uniform: each request generates exactly one token per iteration regardless of its current sequence length or how many tokens remain until completion. This uniformity means we can safely add or remove requests from the batch between iterations without breaking the computation.
 
@@ -248,9 +242,7 @@ Req 6:                     █████████████████�
 GPU Utilization: Stays near 4/4 consistently!
 ```
 
-## 16.4 Radix Cache: Concept and Implementation
-
-### 16.4.1 The Prefix Reuse Problem
+## 16.4 Radix Cache
 
 Many requests share common prefixes: system prompts, few-shot examples, document context. Computing KV cache independently for each request wastes computation.
 
@@ -267,7 +259,7 @@ Radix tree:
           [20,21] [30,31] [40..43] ← Only unique portions computed
 ```
 
-### 16.4.2 Radix Tree Properties
+### Radix Tree Properties
 
 A radix tree is a **compressed trie** where each node stores one token and its corresponding KV cache pages, each path from root to node represents a token sequence, shared prefixes are stored once as internal nodes, and unique suffixes branch off as leaf nodes.
 
@@ -281,11 +273,11 @@ A radix tree is a **compressed trie** where each node stores one token and its c
 | Hash table | token[] → cache | O(N) | High | Exact matches only |
 | Radix tree | Tree nodes | O(N) | Moderate | Prefix sharing |
 
-### 16.4.3 Arena Allocation
+### Arena Allocation
 
 The implementation uses arena-based memory management, storing all nodes in a contiguous `std::vector` and referencing them by integer IDs rather than pointers. This provides several benefits: no manual memory management, cache-friendly access, and clear ownership semantics. Nodes never move in memory after allocation, so integer IDs remain valid.
 
-### 16.4.4 Node Structure
+### Node Structure
 
 Each node in the radix tree represents a single token position in a cached sequence and stores four essential pieces of information: the token value at this position, the KV cache pages holding this token's attention state, a children map connecting to subsequent tokens, and a timestamp for LRU eviction.
 
@@ -317,7 +309,7 @@ public:
 
 **Design Rationale**. Using `std::map<int, NodeID>` for the children map handles sparse vocabularies efficiently. With 50,000+ tokens in typical vocabularies, storing a dense array per node would waste enormous memory. The map only stores edges that actually exist in cached request paths. The integer NodeID rather than a pointer provides safety—nodes never move in the arena vector, so IDs remain valid without reference counting or smart pointer overhead. The `last_access_time_` timestamp supports LRU eviction by tracking when each cached path was last reused, allowing the system to identify cold branches for removal when memory pressure occurs.
 
-### 16.4.5 Radix Cache Operations
+### Radix Cache Operations
 
 The RadixCache class provides three core operations that implement prefix matching, tree growth, and memory reclamation. Understanding these operations reveals how the cache automatically detects and exploits prefix sharing across requests.
 
@@ -375,7 +367,7 @@ public:
 
 The three operations work together to provide transparent prefix reuse. When a request arrives, `match_prefix()` identifies reusable computation. After prefill completes, `insert()` preserves that work for future requests with similar prefixes. When memory fills, `evict_lru_leaf()` removes cold paths while preserving hot shared prefixes. The elegance is that all this happens automatically—the serving system doesn't need complex heuristics to detect sharing patterns; the tree structure naturally captures and exploits prefix overlap.
 
-### 16.4.6 Usage Pattern
+### Usage Pattern
 
 On request admission:
 1. **Query cache**: `match_prefix()` returns how many tokens already cached
@@ -384,7 +376,7 @@ On request admission:
 
 Subsequent requests with matching prefixes skip redundant computation.
 
-### 16.4.7 LRU Eviction Strategy
+### LRU Eviction Strategy
 
 When GPU memory fills and no free pages remain, the system must evict cached entries to make room for new requests. The eviction policy carefully balances two objectives: free sufficient memory for immediate needs, while preserving the most valuable cached state for future reuse. The strategy is to evict leaf nodes (unique suffixes) while preserving internal nodes (shared prefixes).
 
@@ -396,8 +388,6 @@ The eviction algorithm scans the tree to find the leaf node with the oldest `las
 
 ## 16.5 Chunked Prefill
 
-### 16.5.1 The Long Prompt Starvation Problem
-
 Interactive LLM serving faces a fundamental scheduling challenge: long prompts monopolize GPU resources, causing short prompts to wait unacceptably long. This creates poor user experience where small queries (chatbot messages, quick questions) experience high latency due to large context processing (document analysis, multi-shot examples) ahead in the queue.
 
 Naive FCFS (First-Come-First-Served) scheduling processes requests sequentially. A single 2000-token prompt (200ms prefill on modern GPUs) forces all subsequent requests to wait, regardless of their size. This violates the principle of fairness: small requests should not be penalized by large requests ahead in the queue.
@@ -406,7 +396,7 @@ Without chunking, request 0's 2000 tokens occupy the GPU for an extended period 
 
 **Key Insight**: Prefill computation is **divisible**—we can split it into smaller chunks and interleave execution. Unlike indivisible operations (single matrix multiplication), attention computation over 2000 tokens can be broken into 4× 500-token chunks without sacrificing correctness. The KV cache for tokens 0-499 remains valid when computing tokens 500-999. This divisibility enables fair scheduling where multiple requests make progress simultaneously.
 
-### 16.5.2 Chunking Strategy
+### Chunking Strategy
 
 The solution is to divide each prompt into fixed-size chunks (e.g., 256 tokens) and process them round-robin across all waiting requests. This provides bounded wait time—no request waits longer than one chunk duration. All requests advance at similar rates with proportional progress, though overhead slightly increases due to multiple kernel launches.
 
@@ -422,7 +412,7 @@ Medium chunks around 512 tokens balance fairness and throughput. Short requests 
 
 Large chunks around 2048 tokens prioritize throughput over fairness. The scheduler processes larger contiguous sequences, maximizing GPU compute efficiency and minimizing overhead. However, short requests may experience significant head-of-line blocking if they queue behind large chunks. This configuration suits batch processing workloads where minimizing total completion time matters more than individual request latency.
 
-### 16.5.3 Chunked Prefill Manager Implementation
+### Chunked Prefill Manager
 
 The ChunkedPrefillManager implements the round-robin scheduling algorithm with two key parameters: `token_budget` caps the total tokens processed per iteration (preventing memory overflow), and `chunk_size` determines the maximum tokens extracted from any single request per round (ensuring fairness). Understanding the scheduling logic reveals how the manager balances throughput, fairness, and memory constraints.
 
@@ -472,7 +462,7 @@ class ChunkedPrefillManager:
 
 Round-robin ensures fair progress—each request gets one chunk per round, preventing long prompts from starving short ones.
 
-### 16.5.4 Execution Timeline Comparison
+### Execution Timeline Comparison
 
 Comparing execution timelines reveals chunking's impact on request interleaving and latency.
 
@@ -486,13 +476,11 @@ Chunked scheduling divides the 2000-token request into 8 chunks of 256 tokens ea
 
 The improvement is most dramatic for interactive workloads. Short chatbot queries that would previously wait for large document context processing can now begin generating responses almost immediately. The long request takes slightly longer overall due to scheduling overhead, but the system maintains responsiveness for all request sizes. Decode iterations can interleave with prefill chunks, ensuring running requests continue generating tokens even while new requests are being admitted.
 
-### 16.5.5 Integration with Decode Phase
+### Integration with Decode Phase
 
 Chunked prefill enables **mixed-phase execution**: prefill chunks and decode iterations run in the same time slice. Each iteration processes prefill chunks (token budget limited), then decode iterations (batch size limited), ensuring both make progress.
 
 ## 16.6 Prefill-Decode Separation
-
-### 16.6.1 Phase Characteristics
 
 Prefill and decode phases have fundamentally different performance characteristics requiring specialized optimization strategies.
 
@@ -502,11 +490,11 @@ Prefill and decode phases have fundamentally different performance characteristi
 
 Different phases need different batch sizes—small for compute-bound prefill to avoid memory overflow, large for bandwidth-bound decode to saturate memory bandwidth.
 
-### 16.6.2 Scheduling Fundamentals
+### Scheduling Fundamentals
 
 The different phase characteristics necessitate different scheduling strategies. Prefill uses FCFS (First-Come-First-Served) with token budget constraints to maintain fairness while preventing long prompts from monopolizing resources. The token budget caps the total tokens processed in a single iteration, ensuring predictable memory usage and latency bounds. Decode uses greedy batch formation up to max batch size, maximizing throughput by saturating memory bandwidth with as many concurrent requests as possible. Since each request generates exactly one token per iteration, the batch size directly determines parallelism.
 
-### 16.6.3 Two-Phase Managers Implementation
+### Two-Phase Managers
 
 The serving system implements separate manager classes for prefill and decode, each optimized for its phase's characteristics. Understanding their distinct scheduling policies and APIs reveals how the system adapts to different computational patterns.
 
@@ -562,7 +550,7 @@ class DecodeManager:
 
 Prefill uses FCFS with token budget for fairness and small batches, while decode uses greedy packing for throughput with large batches.
 
-### 16.6.4 Integration Pattern: Two-Phase Scheduler
+### Integration Pattern: Two-Phase Scheduler
 
 The TwoPhaseScheduler coordinates both managers in a unified serving loop. Its `step()` method orchestrates one complete iteration of the two-phase execution pattern. Understanding this coordination reveals how requests flow through the serving system.
 
@@ -613,7 +601,7 @@ Previous sections introduced individual components—paged KV cache, continuous 
 
 The architecture follows a layered design where each component has well-defined responsibilities and clean interfaces. Higher layers handle scheduling and orchestration using Python for expressiveness and rapid development. Lower layers implement performance-critical operations in C++/MLIR for computational efficiency. This separation of concerns makes the system maintainable—scheduling logic can evolve independently of execution kernels, and execution optimizations don't require modifying scheduling algorithms.
 
-### 16.7.1 NanoServing Architecture
+### NanoServing Architecture
 
 The serving engine organizes computation as a pipeline where requests flow through multiple stages, each handling a specific aspect of the serving process. Understanding this dataflow is essential to comprehending how production LLM serving works. The pipeline consists of nine sequential stages that transform incoming requests into generated responses:
 
@@ -635,7 +623,7 @@ The serving engine organizes computation as a pipeline where requests flow throu
 
 **Pipeline Flow**. Request lifecycle follows a left-to-right flow through these stages: admission → cache lookup → memory allocation → prefill scheduling → decode scheduling → execution → cache update → completion. Requests spend most time in prefill and decode stages (the hot path), while other stages handle fast bookkeeping. The radix cache provides a cross-cutting optimization, allowing requests to skip computation by reusing cached prefixes from structurally similar predecessors. Resource management threads through the entire pipeline—the KV pool tracks memory, the radix cache manages sharing and eviction, and the schedulers enforce capacity limits through continuous coordination.
 
-### 16.7.2 NanoServingEngine Implementation
+### NanoServingEngine Implementation
 
 The `NanoServingEngine` class implements this architecture, coordinating all components through three primary methods: initialization establishes component instances and configures their parameters, request admission handles incoming work by checking cache and allocating memory, and the main serving loop executes iterative processing to make incremental progress on all active requests.
 
@@ -704,7 +692,7 @@ Phase 2 handles decode generation: the decode manager forms a batch from all run
 
 The `serve()` method implements the outermost loop, continuously calling `step()` to process all queued and running requests. This simple infinite loop represents the core of production serving: iterate forever, processing whatever work exists, maintaining high GPU utilization through dynamic batching and fair scheduling. Real systems add error handling, graceful shutdown, metrics collection, and health checks around this core loop, but the fundamental pattern remains—continuous iteration making incremental progress on the active request set.
 
-### 16.7.3 Request Dataflow
+### Request Dataflow
 
 Understanding a concrete example clarifies how abstract components interact during actual request processing. Consider a request with a partially cached prompt.
 
@@ -745,7 +733,7 @@ Decode iterations show the batching pattern. Step 4 processes 50 iterations gene
 
 Completion and cleanup demonstrate resource lifecycle management. The request finishes when it reaches max tokens or generates an end-of-sequence marker, triggering deallocation of its KV pages (4 pages returned to the pool). However, the radix cache entry persists—the path [1..10, 20, 21, 22] remains in the tree for future requests to reuse. This persistence is valuable: if 100 requests share this prefix, the first request pays the computation cost while subsequent 99 requests benefit from the cached state.
 
-### 16.7.4 Performance Summary
+### Performance Summary
 
 Each algorithmic component addresses a specific performance bottleneck, and their effects compose multiplicatively rather than additively. Understanding the individual contributions clarifies why production serving achieves such dramatic speedups over naive implementations.
 
