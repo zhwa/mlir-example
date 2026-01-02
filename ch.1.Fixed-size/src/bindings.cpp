@@ -46,7 +46,7 @@ namespace mlir {
 ///   4. Returns result as a new NumPy array
 ///
 /// Expected shapes: A is 8×32, B is 32×16, returns C as 8×16
-py::array_t<float> gemm(py::array_t<float> A, py::array_t<float> B) {
+py::array_t<float> gemm(const py::array_t<float>& A, const py::array_t<float>& B) {
   // Get buffer info
   auto A_buf = A.request();
   auto B_buf = B.request();

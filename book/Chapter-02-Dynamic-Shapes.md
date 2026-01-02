@@ -517,7 +517,7 @@ void gemm(
 );
 ```
 
-This is why the "21 parameters" number appears in MLIR tutorials—it's 3 memrefs × 7 fields per memref. Our Python binding code (via `pybind11` and `libffi`) extracts pointer, shape, and stride information from NumPy arrays and marshals them into this calling convention. The details are handled automatically by MLIR's execution engine, but understanding the underlying structure demystifies what's happening when we cross the Python/C boundary.
+This is why the "21 parameters" number appears in MLIR tutorials—it's 3 memrefs × 7 fields per memref. In this chapter, our C++ driver function `executeGemm` manually constructs these arguments from the raw pointers and dimensions we pass from Python. In Chapter 7, we'll introduce a more advanced system using `libffi` to handle this automatically for any function signature.
 
 ## 2.5 Building Dynamic IR with the C++ API
 
@@ -985,9 +985,11 @@ Similarly, `memref.load` and `memref.store` are lowered to address computations 
 
 This is the machinery that makes dynamic shapes work—the compiled code performs a few extra loads and multiplications to compute addresses and bounds, but the overall structure is the same as the static version.
 
-## 2.7 Calling from Python: No Changes Required
+## 2.7 Calling from Python: Passing Runtime Dimensions
 
-One of the elegant aspects of MLIR's approach is that **the Python side doesn't change** when we move from static to dynamic shapes. Our test code from Chapter 1 works without modification:
+One of the elegant aspects of MLIR's approach is that the **Python user code** doesn't change when we move from static to dynamic shapes. Our test script works without modification because NumPy arrays already carry their shape information.
+
+However, the **binding implementation** does change. In Chapter 1, we only passed raw data pointers because dimensions were hardcoded in the compiled binary. Now, we must explicitly extract dimensions from the NumPy arrays and pass them to our C++ driver, which forwards them to the JIT-compiled code.
 
 ```python
 import numpy as np
@@ -1153,11 +1155,6 @@ func.func @compute(%x: memref<?x?xf32>, %y: memref<?x?xf32>, %result: memref<?x?
 
 This transformation is non-trivial—it must reason about data dependencies, operation semantics, and memory lifetimes. Chapter 4 explores bufferization concepts in depth, including one-shot bufferization, destination-passing style, and allocation strategies.
 
-### Why We Skipped Tensors
-
-By working directly with memrefs, we've avoided the bufferization pipeline but also lost some optimization opportunities. Tensor-level transformations like **fusion** (combining multiple operations into a single loop) and **tiling** (blocking for cache efficiency) are more straightforward when operations are expressed as immutable tensor computations.
-
-For the matrix multiplications and attention mechanisms in this book, the loss is minor—our operations are already at the right granularity. But for complex computation graphs with many small operations, tensor-based optimization can yield significant performance improvements. Readers building production compilers should study MLIR's bufferization documentation after mastering the memref-level fundamentals presented here.
 
 ## 2.12 Summary
 

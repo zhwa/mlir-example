@@ -44,7 +44,7 @@ LogicalResult applyLoweringPasses(ModuleOp module);
 ///
 /// Returns:
 ///   1D NumPy array of float32 (probabilities summing to 1.0)
-py::array_t<float> softmax(py::array_t<float> input) {
+py::array_t<float> softmax(const py::array_t<float>& input) {
   // Get buffer info
   auto buf = input.request();
 

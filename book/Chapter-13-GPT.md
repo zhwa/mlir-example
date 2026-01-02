@@ -33,7 +33,7 @@ def gpt_forward(token_ids, weights):
 
 **Implementation Architecture**. Chapter 13 inherits Chapter 12's linalg-based lowering patterns for the 8 common transformer operations (LayerNorm, Linear, GELU, Add, Matmul, Transpose, Softmax, Scale). Operations take tensor inputs and return tensor results (functional style), enabling automatic bufferization while maintaining clean, composable IR.
 
-These operations lower to structured `linalg` dialect operations, enabling optimization passes and portable compilation. Chapter 13 adds GPT-specific operations (Embedding, MaskedSoftmax, RoPE) that lower directly to SCF loops for domain-specific logic not expressible in linalg's structured iteration model. This hybrid approach—linalg for regular computations, manual loops for specialized operations—balances optimization opportunities with implementation flexibility.
+These operations lower to structured `linalg` dialect operations, enabling optimization passes and portable compilation. Chapter 13 adds GPT-specific operations (Embedding, MaskedSoftmax, RoPE) that also lower to `linalg.generic`, using index-based access (`linalg.index`) for domain-specific logic. This approach maintains a uniform Linalg-based IR across the entire model, allowing the same optimization passes to apply everywhere.
 
 **Bufferization Pipeline**. After IR is generated, the bufferization pipeline automatically converts functional tensor operations to efficient memref code:
 
@@ -101,38 +101,42 @@ def Transformer_EmbeddingOp : Transformer_Op<"embedding"> {
 }
 ```
 
-**Lowering to Standard Dialects**. The embedding lowering pattern (from `src/TransformerPasses.cpp`) converts `transformer.embedding` to nested loops that perform indexed lookups:
+**Lowering to Standard Dialects**. The embedding lowering pattern (from `src/TransformerPasses.cpp`) converts `transformer.embedding` to a `linalg.generic` operation that performs indexed lookups:
 
-**Step 1: Extract input shapes and create output tensor**
 ```cpp
-int64_t seqLen = indicesType.getShape()[0];    // e.g., 10 tokens
-int64_t dModel = tableType.getShape()[1];      // e.g., 768 dims
-auto resultType = RankedTensorType::get({seqLen, dModel}, f32);
-Value empty = rewriter.create<tensor::EmptyOp>(loc, resultType);
+struct EmbeddingOpLowering : public OpRewritePattern<EmbeddingOp> {
+  LogicalResult matchAndRewrite(EmbeddingOp op, PatternRewriter &rewriter) const override {
+    // ... setup code ...
+
+    // Create linalg.generic with parallel iterators
+    Value result = rewriter.create<linalg::GenericOp>(
+        loc, resultType,
+        ValueRange{},               // No inputs (we extract manually)
+        ValueRange{emptyTensor},    // Output buffer
+        indexingMaps,               // Identity map for output
+        iteratorTypes,              // Parallel iterators
+        [capturedIndices, capturedTable](OpBuilder &b, Location loc, ValueRange args) {
+          // Get current indices (i, j)
+          Value posIdx = b.create<linalg::IndexOp>(loc, 0);
+          Value dimIdx = b.create<linalg::IndexOp>(loc, 1);
+          
+          // Extract token ID: token_id = indices[i]
+          Value tokenId32 = b.create<tensor::ExtractOp>(loc, capturedIndices, ValueRange{posIdx});
+          Value tokenIdx = b.create<arith::IndexCastOp>(loc, b.getIndexType(), tokenId32);
+          
+          // Extract embedding: val = table[token_id, j]
+          Value embVal = b.create<tensor::ExtractOp>(loc, capturedTable, ValueRange{tokenIdx, dimIdx});
+          b.create<linalg::YieldOp>(loc, embVal);
+        }
+    ).getResult(0);
+
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
 ```
 
-**Step 2: Generate outer loop over sequence positions**
-```cpp
-Value result = rewriter.create<scf::ForOp>(loc, 0, seqLen, 1, ValueRange{empty},
-  [&](OpBuilder &b, Location loc, Value i, ValueRange iterArgs) {
-    // Extract token ID at position i
-    Value tokenId32 = b.create<tensor::ExtractOp>(loc, indices, ValueRange{i});
-    Value tokenIdx = b.create<arith::IndexCastOp>(loc, indexType, tokenId32);
-    // ... (inner loop copies embedding vector)
-```
-
-**Step 3: Inner loop copies the d_model-dimensional embedding**
-```cpp
-    // For each dimension j in [0, d_model):
-    //   output[i, j] = table[tokenIdx, j]
-    Value updatedTensor = b.create<scf::ForOp>(loc, 0, dModel, 1, ...
-      [&](OpBuilder &b2, Location loc, Value j, ValueRange args2) {
-        Value embVal = b2.create<tensor::ExtractOp>(loc, table, {tokenIdx, j});
-        Value updated = b2.create<tensor::InsertOp>(loc, embVal, tensor, {i, j});
-        return updated;
-```
-
-The lowering generates **nested SCF loops on tensors**: outer loop iterates sequence positions, inner loop copies each embedding dimension. We use manual loops rather than linalg because embedding lookup requires random access via token IDs (irregular indexing pattern).
+The lowering generates a **parallel Linalg operation**: the runtime (or subsequent passes) can parallelize across both sequence length and embedding dimension. Inside the body, we use `linalg.index` to get the current loop indices, `tensor.extract` to read the token ID, and then another `tensor.extract` to read from the embedding table.
 
 **Bufferization Pipeline**. After lowering, the bufferization pipeline automatically converts tensor operations to efficient memref code:
 
@@ -251,51 +255,68 @@ def Transformer_MaskedSoftmaxOp : Transformer_Op<"masked_softmax"> {
 
 Unlike the conceptual description earlier, the actual operation takes the mask as an explicit parameter. This design separates mask creation (via `create_causal_mask`) from application, allowing flexibility: the same mask can be reused across multiple attention heads or layers.
 
-**Lowering Masked Softmax**. The lowering applies the mask and computes softmax in four steps using nested SCF loops:
+**Lowering Masked Softmax**. The lowering applies the mask and computes softmax using a sequence of Linalg operations:
 
 **Step 1: Add mask to logits** (masking future positions)
 ```cpp
-// masked_logits[i,j] = logits[i,j] + mask[i,j]
-// where mask[i,j] = 0 if j <= i, else -inf
-Value maskedLogits = rewriter.create<scf::ForOp>(loc, ...,
-  [&](OpBuilder &b, Location loc, Value i, Value j, ValueRange args) {
-    Value logit = b.create<tensor::ExtractOp>(loc, input, {i, j});
-    Value maskVal = b.create<tensor::ExtractOp>(loc, mask, {i, j});
-    Value masked = b.create<arith::AddFOp>(loc, logit, maskVal);
-    // insert back into tensor
+// masked_logits = logits + mask
+Value maskedInput = rewriter.create<linalg::GenericOp>(
+    loc, resultType,
+    ValueRange{input, mask},
+    ValueRange{emptyMasked},
+    addMaskMaps,
+    iteratorTypes,
+    [](OpBuilder &b, Location loc, ValueRange args) {
+      Value masked = b.create<arith::AddFOp>(loc, args[0], args[1]);
+      b.create<linalg::YieldOp>(loc, masked);
+    }
+).getResult(0);
 ```
 
 **Step 2: Find max value per row** (numerical stability)
 ```cpp
 // max_val = max(masked_logits[i, :])
-Value maxVal = rewriter.create<scf::ForOp>(loc, 0, seqLen, 1, init_negInf,
-  [&](OpBuilder &b, Location loc, Value j, ValueRange args) {
-    Value current = b.create<tensor::ExtractOp>(loc, maskedLogits, {i, j});
-    Value prevMax = args[0];
-    Value newMax = b.create<arith::MaximumFOp>(loc, current, prevMax);
-    return newMax;
+Value maxResult = rewriter.create<linalg::ReduceOp>(
+    loc,
+    ValueRange{maskedInput},
+    ValueRange{maxBuffer},
+    SmallVector<int64_t>{rank - 1},
+    [](OpBuilder &b, Location loc, ValueRange args) {
+      Value newMax = b.create<arith::MaximumFOp>(loc, args[0], args[1]);
+      b.create<linalg::YieldOp>(loc, newMax);
+    }
+).getResult(0);
 ```
 
 **Step 3: Compute exp and sum**
 ```cpp
-// exp_sum = sum(exp(masked_logits[i,j] - max_val))
-Value expSum = rewriter.create<scf::ForOp>(loc, 0, seqLen, 1, init_zero,
-  [&](OpBuilder &b, Location loc, Value j, ValueRange args) {
-    Value val = b.create<tensor::ExtractOp>(loc, maskedLogits, {i, j});
-    Value shifted = b.create<arith::SubFOp>(loc, val, maxVal);
-    Value expVal = b.create<math::ExpOp>(loc, shifted);
-    Value sum = b.create<arith::AddFOp>(loc, expVal, args[0]);
-    return sum;
+// exp_val = exp(masked_logits - max_val)
+Value expResult = rewriter.create<linalg::GenericOp>(..., 
+    [](OpBuilder &b, Location loc, ValueRange args) {
+      Value shifted = b.create<arith::SubFOp>(loc, args[0], args[1]);
+      Value expVal = b.create<math::ExpOp>(loc, shifted);
+      b.create<linalg::YieldOp>(loc, expVal);
+    }).getResult(0);
+
+// sum_val = sum(exp_val)
+Value sumResult = rewriter.create<linalg::ReduceOp>(..., 
+    [](OpBuilder &b, Location loc, ValueRange args) {
+      Value newSum = b.create<arith::AddFOp>(loc, args[0], args[1]);
+      b.create<linalg::YieldOp>(loc, newSum);
+    }).getResult(0);
 ```
 
 **Step 4: Normalize by sum**
 ```cpp
-// output[i,j] = exp(masked_logits[i,j] - max_val) / exp_sum
-Value normalized = b.create<arith::DivFOp>(loc, expVal, expSum);
-Value result = b.create<tensor::InsertOp>(loc, normalized, output, {i, j});
+// output = exp_val / sum_val
+Value result = rewriter.create<linalg::GenericOp>(..., 
+    [](OpBuilder &b, Location loc, ValueRange args) {
+      Value normalized = b.create<arith::DivFOp>(loc, args[0], args[1]);
+      b.create<linalg::YieldOp>(loc, normalized);
+    }).getResult(0);
 ```
 
-After bufferization, these tensor operations become efficient memref operations with in-place updates. The mask is applied during the element-wise addition without requiring separate memory allocation.
+This pattern reuses the same Linalg reduction/element-wise approach as standard Softmax (Chapter 6), simply adding the mask addition step at the beginning.
 
 **Memory and Computation Trade-offs**. Generating the mask on-the-fly saves memory bandwidth by avoiding storage and retrieval of a `seq_len × seq_len` matrix. While a 2048×2048 float32 mask would require 16MB (our implementation uses float32 for simplicity), the comparison adds negligible overhead—typically hidden by instruction pipelining in the attention mechanism's dot products. Modern production systems often use boolean (i1) or 8-bit integer masks (reducing to 4MB or 512KB), but the bandwidth savings remain the key benefit. In MLIR, generating masks on-the-fly enables better kernel fusion through the linalg dialect, keeping mask logic in registers and reducing DRAM traffic.
 
@@ -496,71 +517,63 @@ def Transformer_RoPEOp : Transformer_Op<"rope"> {
 }
 ```
 
-**Lowering RoPE to Standard Dialects**. The lowering generates tensor operations with nested SCF loops computing rotations in four stages:
+**Lowering RoPE to Standard Dialects**. The lowering generates a `linalg.generic` operation that computes rotations in parallel:
 
-**Step 1: Set up outer loop over sequence positions**
 ```cpp
-// Outer loop: iterate positions 0..seq_len-1 (pos = implicit position)
-Value result = rewriter.create<scf::ForOp>(
-  loc, zeroIdx, seqLenVal, oneIdx, ValueRange{empty},
-  [&](OpBuilder &b, Location loc, Value pos, ValueRange iterArgs) {
-    Value posFloat = b.create<arith::SIToFPOp>(loc, b.getF32Type(), 
-                       b.create<arith::IndexCastOp>(loc, b.getI64Type(), pos));
+struct RoPEOpLowering : public OpRewritePattern<RoPEOp> {
+  LogicalResult matchAndRewrite(RoPEOp op, PatternRewriter &rewriter) const override {
+    // ... setup constants ...
+
+    Value result = rewriter.create<linalg::GenericOp>(
+        loc, resultType,
+        ValueRange{input},
+        ValueRange{emptyTensor},
+        indexingMaps,
+        iteratorTypes,
+        [capturedBase, ...](OpBuilder &b, Location loc, ValueRange args) {
+          Value x = args[0];
+          
+          // Get current indices
+          Value posIdx = b.create<linalg::IndexOp>(loc, rank - 2);
+          Value dimIdx = b.create<linalg::IndexOp>(loc, rank - 1);
+
+          // Compute pair index j = dim / 2 (integer division)
+          Value j_i64 = b.create<arith::DivSIOp>(loc, dimI64, two_i64);
+          
+          // Check if dimension is even (0, 2, 4...)
+          Value isEven = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, 
+                                                 dimIdxMod2, zero_i64);
+
+          // Compute theta_j = 10000^(-2j/d_model)
+          // ... (math operations) ...
+          Value angle = b.create<arith::MulFOp>(loc, posFloat, theta);
+          Value cosAngle = b.create<math::CosOp>(loc, angle);
+          Value sinAngle = b.create<math::SinOp>(loc, angle);
+
+          // Get the paired value (if even, get next; if odd, get prev)
+          Value pairDimIdx = b.create<arith::SelectOp>(loc, isEven, nextDim, prevDim);
+          Value xPair = b.create<tensor::ExtractOp>(loc, capturedInput, pairIndices);
+
+          // Apply rotation
+          // output[2j]   = x[2j]*cos - x[2j+1]*sin
+          // output[2j+1] = x[2j]*sin + x[2j+1]*cos
+          Value evenResult = b.create<arith::SubFOp>(loc, xCos, xPairSin);
+          Value oddResult = b.create<arith::AddFOp>(loc, xPairSin, xCos);
+          Value rotated = b.create<arith::SelectOp>(loc, isEven, evenResult, oddResult);
+
+          b.create<linalg::YieldOp>(loc, rotated);
+        }
+    ).getResult(0);
+
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
 ```
 
-**Step 2: Inner loop processes dimension pairs with stride 2**
-```cpp
-    // Process pairs: (0,1), (2,3), (4,5), ...
-    Value updatedTensor = b.create<scf::ForOp>(
-      loc, zeroIdx, dModelVal, twoIdx, ValueRange{currentTensor},
-      [&](OpBuilder &b2, Location loc, Value dimIdx, ValueRange args2) {
-        // dimIdx steps by 2, processing consecutive pairs
-```
+**Critical Implementation Detail**: We use `linalg.index` to determine the current position and dimension. The logic handles the pairwise rotation by checking if the current dimension index is even or odd, then extracting the *other* element of the pair using `tensor.extract`. This allows the operation to be fully parallelized by Linalg, as each element computation is independent (once the pair is read).
 
-**Step 3: Compute rotation angle θ and trigonometric values**
-```cpp
-        // θ_j = 10000^(-2j/d_model) where j = dimIdx / 2
-        Value j_i64 = b2.create<arith::DivSIOp>(loc, dimIdxI64, two_i64);  // Integer division!
-        Value j_float = b2.create<arith::SIToFPOp>(loc, b2.getF32Type(), j_i64);
-
-        Value twoJ = b2.create<arith::MulFOp>(loc, two_f32, j_float);
-        Value ratio = b2.create<arith::DivFOp>(loc, twoJ, dModelFloat);
-
-        // base^(-ratio) = exp(-ratio * log(base))
-        Value theta = b2.create<math::ExpOp>(loc, 
-          b2.create<arith::MulFOp>(loc, 
-            b2.create<arith::NegFOp>(loc, ratio), 
-            b2.create<math::LogOp>(loc, base)));
-
-        Value angle = b2.create<arith::MulFOp>(loc, posFloat, theta);
-        Value cosAngle = b2.create<math::CosOp>(loc, angle);
-        Value sinAngle = b2.create<math::SinOp>(loc, angle);
-```
-
-**Step 4: Apply 2D rotation to dimension pair**
-```cpp
-        // Extract pair (x0, x1) from input
-        Value x0 = b2.create<tensor::ExtractOp>(loc, input, ValueRange{pos, dimIdx});
-        Value x1 = b2.create<tensor::ExtractOp>(loc, input, ValueRange{pos, dimIdxPlus1});
-
-        // Rotation: [cos -sin] [x0]   [x0*cos - x1*sin]
-        //           [sin  cos] [x1] = [x0*sin + x1*cos]
-        Value out0 = b2.create<arith::SubFOp>(loc, 
-          b2.create<arith::MulFOp>(loc, x0, cosAngle),
-          b2.create<arith::MulFOp>(loc, x1, sinAngle));
-
-        Value out1 = b2.create<arith::AddFOp>(loc,
-          b2.create<arith::MulFOp>(loc, x0, sinAngle),
-          b2.create<arith::MulFOp>(loc, x1, cosAngle));
-
-        // Insert rotated pair back into output tensor
-        Value tensor1 = b2.create<tensor::InsertOp>(loc, out0, tensor, ValueRange{pos, dimIdx});
-        Value tensor2 = b2.create<tensor::InsertOp>(loc, out1, tensor1, ValueRange{pos, dimIdxPlus1});
-```
-
-**Critical Implementation Detail**: Computing pair index `j = dimIdx / 2` requires **integer division** (`arith::DivSIOp`), ensuring dims (0,1) get j=0, dims (2,3) get j=1, etc. Using floating-point division would cause numerical errors in theta computation. Trigonometric functions (`cos`, `sin`, `exp`, `log`) compile to LLVM intrinsics mapping to hardware instructions.
-
-**Bufferization Transform**. After lowering, the bufferization pipeline converts `tensor.extract/insert` to `memref.load/store`, `tensor.empty` to `memref.alloc`, and tensor loop-carried values to memref in-place updates. The result is efficient memref code with nested loops and direct memory access.
+**Bufferization Transform**. After lowering, the bufferization pipeline converts `tensor.extract` to `memref.load`, `tensor.empty` to `memref.alloc`, and the `linalg.generic` to a parallel loop nest.
 
 **Integrating RoPE into Attention**. RoPE modifies the attention computation:
 

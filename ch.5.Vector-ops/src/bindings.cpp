@@ -35,7 +35,7 @@ namespace mlir {
 ///
 /// Returns:
 ///   C: NumPy array (1D, float32) containing result
-py::array_t<float> saxpy(float alpha, py::array_t<float> A, py::array_t<float> B) {
+py::array_t<float> saxpy(float alpha, const py::array_t<float>& A, const py::array_t<float>& B) {
   auto A_buf = A.request();
   auto B_buf = B.request();
 

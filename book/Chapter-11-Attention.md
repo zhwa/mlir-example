@@ -347,21 +347,23 @@ struct TransposeOpLowering : public OpRewritePattern<TransposeOp> {
                                   PatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
     Value input = op.getInput();
-    Value output = op.getOutput();
+    auto resultType = cast<RankedTensorType>(op.getResult().getType());
+    int rank = resultType.getRank();
 
-    auto inputType = cast<MemRefType>(input.getType());
-    int64_t rank = inputType.getRank();
+    // Create empty output tensor
+    Value empty = rewriter.create<tensor::EmptyOp>(
+        loc, resultType.getShape(), resultType.getElementType());
 
     // Permutation: swap last two dimensions
-    SmallVector<int64_t> perm(rank);
+    SmallVector<int64_t> perm;
     for (int64_t i = 0; i < rank; ++i)
-      perm[i] = i;
+      perm.push_back(i);
     std::swap(perm[rank - 2], perm[rank - 1]);
 
-    rewriter.create<linalg::TransposeOp>(
-        loc, input, output, perm);
+    Value result = rewriter.create<linalg::TransposeOp>(
+        loc, input, empty, perm).getResult()[0];
 
-    rewriter.replaceOp(op, output);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
@@ -386,9 +388,9 @@ Softmax combines reductions (finding max, summing) with element-wise operations 
 **Step 1: Find Maximum**
 
 ```mlir
-linalg.reduce { arith.maximumf }
-  ins(%input : memref<?x?xf32>)
-  outs(%max_vals : memref<?xf32>)
+%max_vals = linalg.reduce { arith.maximumf }
+  ins(%input : tensor<?x?xf32>)
+  outs(%init_max : tensor<?xf32>)
   dimensions = [1]
 ```
 
@@ -397,7 +399,7 @@ Reduces along dimension 1 (last dimension for 2D), applying `arith.maximumf` to 
 **Step 2: Subtract Max (Broadcasting)**
 
 ```mlir
-linalg.generic {
+%shifted = linalg.generic {
   indexing_maps = [
     affine_map<(d0, d1) -> (d0)>,      // max_vals: broadcast d0
     affine_map<(d0, d1) -> (d0, d1)>,  // input: full tensor
@@ -405,8 +407,8 @@ linalg.generic {
   ],
   iterator_types = ["parallel", "parallel"]
 }
-ins(%max_vals, %input : memref<?xf32>, memref<?x?xf32>)
-outs(%shifted : memref<?x?xf32>) {
+ins(%max_vals, %input : tensor<?xf32>, tensor<?x?xf32>)
+outs(%init_shifted : tensor<?x?xf32>) {
 ^bb0(%max: f32, %inp: f32, %out: f32):
   %sub = arith.subf %inp, %max : f32
   linalg.yield %sub : f32
@@ -422,46 +424,48 @@ The affine map `(d0, d1) -> (d0)` **broadcasts** `max_vals`: for each `(i, j)`, 
 ```cpp
 struct SoftmaxOpLowering : public OpRewritePattern<SoftmaxOp> {
   LogicalResult matchAndRewrite(SoftmaxOp op, PatternRewriter &rewriter) const override {
-    // ... extract location, input, types, allocate temporaries ...
+    // ... extract location, input, types ...
     
-    // Step 1: Reduce max along last dimension
-    rewriter.create<linalg::ReduceOp>(
-        loc, ValueRange{input}, ValueRange{maxVals},
-        ArrayRef<int64_t>{rank - 1},
+    // Step 1: Find max along last dimension
+    // (Create init tensor filled with -inf)
+    Value maxVals = rewriter.create<linalg::ReduceOp>(
+        loc, ValueRange{input}, ValueRange{filledMax},
+        SmallVector<int64_t>{rank - 1},
         [&](OpBuilder &b, Location loc, ValueRange args) {
           Value max = b.create<arith::MaximumFOp>(loc, args[0], args[1]);
           b.create<linalg::YieldOp>(loc, max);
-        });
+        }).getResult(0);
     
     // Step 2: Subtract max (broadcasting) and compute exp
     Value expVals = rewriter.create<linalg::GenericOp>(
-        loc, outputType, ValueRange{input, maxVals}, ValueRange{expTensor},
-        broadcastMaps, iteratorTypes,
+        loc, inputType, ValueRange{input, maxVals}, ValueRange{emptyExp},
+        indexingMaps, iteratorTypes,
         [&](OpBuilder &b, Location loc, ValueRange args) {
           Value diff = b.create<arith::SubFOp>(loc, args[0], args[1]);
           Value exp = b.create<math::ExpOp>(loc, diff);
           b.create<linalg::YieldOp>(loc, exp);
         }).getResult(0);
     
-    // Step 3: Reduce sum along last dimension
-    rewriter.create<linalg::ReduceOp>(
-        loc, ValueRange{expVals}, ValueRange{sumVals},
-        ArrayRef<int64_t>{rank - 1},
+    // Step 3: Sum exp values along last dimension
+    // (Create init tensor filled with 0.0)
+    Value sumVals = rewriter.create<linalg::ReduceOp>(
+        loc, ValueRange{expVals}, ValueRange{filledSum},
+        SmallVector<int64_t>{rank - 1},
         [&](OpBuilder &b, Location loc, ValueRange args) {
           Value sum = b.create<arith::AddFOp>(loc, args[0], args[1]);
           b.create<linalg::YieldOp>(loc, sum);
-        });
-    
-    // Step 4: Divide by sum (broadcasting)
-    Value normalized = rewriter.create<linalg::GenericOp>(
-        loc, outputType, ValueRange{expVals, sumVals}, ValueRange{outTensor},
-        broadcastMaps, iteratorTypes,
-        [&](OpBuilder &b, Location loc, ValueRange args) {
-          Value result = b.create<arith::DivFOp>(loc, args[0], args[1]);
-          b.create<linalg::YieldOp>(loc, result);
         }).getResult(0);
     
-    rewriter.replaceOp(op, normalized);
+    // Step 4: Normalize by dividing exp values by sum
+    Value result = rewriter.create<linalg::GenericOp>(
+        loc, inputType, ValueRange{expVals, sumVals}, ValueRange{emptyResult},
+        indexingMaps, iteratorTypes,
+        [&](OpBuilder &b, Location loc, ValueRange args) {
+          Value normalized = b.create<arith::DivFOp>(loc, args[0], args[1]);
+          b.create<linalg::YieldOp>(loc, normalized);
+        }).getResult(0);
+    
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
@@ -474,7 +478,7 @@ Linalg's structured form enables **fusion**: later passes can merge operations, 
 Addition and multiplication are element-wise: `output[i, j] = lhs[i, j] + rhs[i, j]`. Linalg generic handles these:
 
 ```mlir
-linalg.generic {
+%sum = linalg.generic {
   indexing_maps = [
     affine_map<(d0, d1) -> (d0, d1)>,  // lhs
     affine_map<(d0, d1) -> (d0, d1)>,  // rhs
@@ -482,8 +486,8 @@ linalg.generic {
   ],
   iterator_types = ["parallel", "parallel"]
 }
-ins(%lhs, %rhs : memref<?x?xf32>, memref<?x?xf32>)
-outs(%output : memref<?x?xf32>) {
+ins(%lhs, %rhs : tensor<?x?xf32>, tensor<?x?xf32>)
+outs(%init : tensor<?x?xf32>) {
 ^bb0(%l: f32, %r: f32, %out: f32):
   %sum = arith.addf %l, %r : f32
   linalg.yield %sum : f32
@@ -499,31 +503,43 @@ outs(%output : memref<?x?xf32>) {
 ```cpp
 struct AddOpLowering : public OpRewritePattern<AddOp> {
   LogicalResult matchAndRewrite(AddOp op,
-                                  PatternRewriter &rewriter) const override {
-    auto loc = op.getLoc();
+                                PatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
     Value lhs = op.getLhs();
     Value rhs = op.getRhs();
-    Value output = op.getOutput();
-    
-    auto outputType = cast<MemRefType>(output.getType());
-    int64_t rank = outputType.getRank();
-    
-    // Build identity affine maps for all operands
+
+    auto resultType = cast<RankedTensorType>(op.getResult().getType());
+    int rank = resultType.getRank();
+
+    // Create empty output tensor
+    Value empty = rewriter.create<tensor::EmptyOp>(
+        loc, resultType.getShape(), resultType.getElementType());
+
+    // Create indexing maps: all identity (parallel element-wise operation)
     SmallVector<AffineMap> indexingMaps;
-    for (int i = 0; i < 3; ++i)
-      indexingMaps.push_back(rewriter.getMultiDimIdentityMap(rank));
-    
-    SmallVector<utils::IteratorType> iterators(
-        rank, utils::IteratorType::parallel);
-    
-    rewriter.create<linalg::GenericOp>(
-        loc, TypeRange{}, ValueRange{lhs, rhs}, ValueRange{output},
-        indexingMaps, iterators,
-        [&](OpBuilder &b, Location loc, ValueRange args) {
+    auto identityMap = AffineMap::getMultiDimIdentityMap(rank, rewriter.getContext());
+    indexingMaps.push_back(identityMap);  // lhs
+    indexingMaps.push_back(identityMap);  // rhs
+    indexingMaps.push_back(identityMap);  // output
+
+    // All dimensions are parallel (no reductions)
+    SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
+
+    // Create linalg.generic operation
+    Value result = rewriter.create<linalg::GenericOp>(
+        loc,
+        resultType,
+        /*inputs=*/ValueRange{lhs, rhs},
+        /*outputs=*/ValueRange{empty},
+        /*indexingMaps=*/indexingMaps,
+        /*iteratorTypes=*/iteratorTypes,
+        /*bodyBuilder=*/[](OpBuilder &b, Location loc, ValueRange args) {
+          // args[0] = lhs element, args[1] = rhs element
           Value sum = b.create<arith::AddFOp>(loc, args[0], args[1]);
           b.create<linalg::YieldOp>(loc, sum);
-        });
-    
+        }
+    ).getResult(0);
+
     rewriter.replaceOp(op, result);
     return success();
   }
@@ -615,112 +631,64 @@ output = ch11.forward(result_tensor)
 The C++ implementation:
 
 ```cpp
-py::array_t<float> forward(const Tensor& input) {
-  // Extract computation graph
-  auto& graph = input.node;
+py::array_t<float> forward(const Tensor& output) {
+  TransformerCompiler& compiler = getCompiler();
+
+  // 1. Collect inputs via topological traversal
+  // ... (omitted for brevity) ...
+
+  // 2. Build MLIR module
+  OpBuilder builder(&compiler.getContext());
+  auto module = ModuleOp::create(builder.getUnknownLoc());
   
-  // Build MLIR module containing the computation
-  MLIRContext& context = getCompiler().getContext();
-  OpBuilder builder(&context);
-  auto module = builder.create<ModuleOp>(builder.getUnknownLoc());
-  
-  // Convert graph to MLIR function
-  builder.setInsertionPointToEnd(module.getBody());
-  buildGraphFunction(builder, module, graph);
-  
-  // Compile to native code
-  void* funcPtr = getCompiler().compileAndGetFunctionPtr(module, "graph_func");
-  
-  // Execute via libffi
-  py::array_t<float> result = executeFunctionViaLibffi(funcPtr, graph);
-  
-  return result;
+  // 3. Create function with tensor signature
+  // ... (create func, entry block, map args) ...
+
+  // 4. Compile computation graph to MLIR
+  IRBuilder irBuilder(builder);
+  // Map inputs to function arguments...
+  Value resultValue = irBuilder.compileNode(output.node);
+
+  builder.create<func::ReturnOp>(builder.getUnknownLoc(), resultValue);
+  module.push_back(func);
+
+  // 5. Compile to native code and execute
+  void* fnPtr = compiler.compileAndGetFunctionPtr(module, "compute");
+  // ... (execute via libffi) ...
 }
 ```
 
 Four stages: graph → MLIR, MLIR → LLVM, LLVM → native, native → execution. Let's examine each.
 
-**Stage 1: Graph to MLIR**. The `buildGraphFunction()` traverses the graph, emitting MLIR operations:
+**Stage 1: Graph to MLIR**. The `IRBuilder` class traverses the graph, emitting MLIR operations recursively:
 
 ```cpp
-void buildGraphFunction(OpBuilder& builder, ModuleOp module,
-                         std::shared_ptr<GraphNode> outputNode) {
-  auto loc = builder.getUnknownLoc();
-  
-  // Collect all input nodes
-  std::vector<std::shared_ptr<GraphNode>> inputs;
-  std::unordered_map<GraphNode*, Value> nodeToValue;
-  collectInputs(outputNode, inputs);
-  
-  // Build function signature with TENSOR types
-  SmallVector<Type> argTypes;
-  for (auto& input : inputs) {
-    // Dynamic tensor types (compatible with NumPy arrays)
-    SmallVector<int64_t> dynamicShape(input->shape.size(), ShapedType::kDynamic);
-    auto tensorType = RankedTensorType::get(dynamicShape, builder.getF32Type());
-    argTypes.push_back(tensorType);
-  }
-  
-  // Function returns a tensor (not mutating an output parameter)
-  SmallVector<int64_t> outputShape(outputNode->shape.size(), ShapedType::kDynamic);
-  auto outputType = RankedTensorType::get(outputShape, builder.getF32Type());
-  
-  // Create function with tensor signature
-  auto funcType = builder.getFunctionType(argTypes, {outputType});
-  auto func = builder.create<func::FuncOp>(loc, "graph_func", funcType);
-  auto* entryBlock = func.addEntryBlock();
-  builder.setInsertionPointToStart(entryBlock);
-  
-  // Map input nodes to function arguments (tensors)
-  for (size_t i = 0; i < inputs.size(); ++i) {
-    nodeToValue[inputs[i].get()] = entryBlock->getArgument(i);
-  }
-  
-  // Emit operations for each node (returning tensors)
-  Value finalResult = emitNode(builder, outputNode, nodeToValue);
-  
-  builder.create<func::ReturnOp>(loc, finalResult);
-  module.push_back(func);
-}
-```
+class IRBuilder {
+public:
+  OpBuilder& builder;
+  std::unordered_map<GraphNode*, Value> valueMap;
 
-**Emitting Operations**. The `emitNode()` function returns tensor values:
+  Value compileNode(std::shared_ptr<GraphNode> node) {
+    if (valueMap.count(node.get())) return valueMap[node.get()];
+    
+    Location loc = builder.getUnknownLoc();
+    Value result;
 
-```cpp
-Value emitNode(OpBuilder& builder, std::shared_ptr<GraphNode> node,
-               std::unordered_map<GraphNode*, Value>& nodeToValue) {
-  // Check if already emitted
-  if (nodeToValue.count(node.get())) {
-    return nodeToValue[node.get()];
-  }
-  
-  auto loc = builder.getUnknownLoc();
-  
-  switch (node->type) {
-    case OpType::Input:
-      // Already in nodeToValue (mapped to function arguments)
-      assert(false && "Input nodes should be pre-mapped");
-      
-    case OpType::Matmul: {
-      // Emit input nodes first (recursion)
-      Value lhs = emitNode(builder, node->inputs[0], nodeToValue);
-      Value rhs = emitNode(builder, node->inputs[1], nodeToValue);
-      
-      // Compute result type
-      auto lhsType = mlir::cast<RankedTensorType>(lhs.getType());
-      auto rhsType = mlir::cast<RankedTensorType>(rhs.getType());
-      SmallVector<int64_t> resultShape = {lhsType.getShape()[0], rhsType.getShape()[1]};
-      auto resultType = RankedTensorType::get(resultShape, builder.getF32Type());
-      
-      // Emit matmul operation (returns tensor result)
-      Value result = builder.create<MatmulOp>(loc, resultType, lhs, rhs).getResult();
-      
-      nodeToValue[node.get()] = result;
-      return result;
+    switch (node->type) {
+      case OpType::Matmul: {
+        Value lhs = compileNode(node->inputs[0]);
+        Value rhs = compileNode(node->inputs[1]);
+        auto resultType = RankedTensorType::get(node->shape, builder.getF32Type());
+        result = builder.create<MatmulOp>(loc, resultType, lhs, rhs).getResult();
+        break;
+      }
+      // ... other cases (Add, Transpose, Softmax) ...
     }
-    // ... other cases ...
+    
+    valueMap[node.get()] = result;
+    return result;
   }
-}
+};
 ```
 
 The pattern: emit dependencies recursively, compute result type, emit operation returning tensor result, cache result. No allocations—tensor operations are pure functions. The lowering patterns (Section 11.3) create `tensor.empty` operations, and bufferization (next) converts those to allocations.

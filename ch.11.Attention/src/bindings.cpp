@@ -198,7 +198,7 @@ static TransformerCompiler& getCompiler() {
 // Memref Marshalling
 //===----------------------------------------------------------------------===//
 
-void marshal_memref_2d(std::vector<void*>& args, py::array_t<float> arr) {
+void marshal_memref_2d(std::vector<void*>& args, const py::array_t<float>& arr) {
   auto buf = arr.request();
   float* data = static_cast<float*>(buf.ptr);
   args.emplace_back(data);
@@ -243,7 +243,7 @@ public:
 
   Tensor(std::shared_ptr<GraphNode> n) : node(n) {}
 
-  Tensor(py::array_t<float> data) {
+  Tensor(const py::array_t<float>& data) {
     node = std::make_shared<GraphNode>(OpType::Input);
     node->data = data;
     auto buf = data.request();

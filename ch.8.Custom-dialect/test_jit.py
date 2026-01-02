@@ -133,9 +133,37 @@ def test_relu():
     print(f"✓ Output: {result[0]} (negatives zeroed)")
     print()
 
+def test_softmax():
+    """Test Softmax activation"""
+    print("### Test 5: Softmax Activation ###")
+
+    g = Graph()
+    x = g.variable([4])
+    y = g.softmax(x)
+
+    lowering = MLIRLowering()
+    mlir_text = lowering.lower_graph(g, y, "softmax")
+
+    # Input: [1.0, 2.0, 3.0, 4.0]
+    input_data = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+    
+    result = ch8.execute(mlir_text, "softmax", [input_data], (4,))
+
+    # Expected: exp(x) / sum(exp(x))
+    # Shifted for stability: exp(x - max) / sum(exp(x - max))
+    max_val = np.max(input_data)
+    exp_data = np.exp(input_data - max_val)
+    expected = exp_data / np.sum(exp_data)
+
+    assert np.allclose(result, expected), f"Expected {expected}, got {result}"
+    print(f"✓ Input: {input_data}")
+    print(f"✓ Output: {result}")
+    print(f"✓ Sum: {np.sum(result)} (should be 1.0)")
+    print()
+
 def test_multi_layer():
     """Test multi-layer neural network"""
-    print("### Test 5: Multi-layer Network (3 inputs, 28 params) ###")
+    print("### Test 6: Multi-layer Network (3 inputs, 28 params) ###")
 
     g = Graph()
     x = g.variable([2, 3])
@@ -174,7 +202,7 @@ def test_multi_layer():
 
 def test_raw_mlir():
     """Test direct MLIR text execution (demonstrates libffi flexibility)"""
-    print("### Test 6: Raw MLIR Text (libffi flexibility) ###")
+    print("### Test 7: Raw MLIR Text (libffi flexibility) ###")
 
     # Direct MLIR without high-level API - tests universal execution
     mlir_add = """
@@ -217,21 +245,8 @@ if __name__ == "__main__":
     test_mul()
     test_matmul()
     test_relu()
+    test_softmax()
     test_multi_layer()
     test_raw_mlir()
 
     print("="*60)
-    print("All 6 tests passed! ✓")
-    print("="*60)
-    print()
-    print("Summary:")
-    print("- High-level nn dialect API works perfectly")
-    print("- Python lowering to standard MLIR works")
-    print("- C++ compilation and JIT execution works")
-    print("- All operations produce correct results")
-    print("- libffi-based execute() handles ANY signature universally")
-    print()
-    print("Key Achievement:")
-    print("libffi eliminates ALL explicit parameter count cases.")
-    print("Single universal execute() handles arbitrary signatures through")
-    print("dynamic FFI dispatch - production-grade flexibility!")

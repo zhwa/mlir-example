@@ -180,7 +180,7 @@ static NNCompiler& getCompiler() {
 // Memref Marshalling (from Chapter 8)
 //===----------------------------------------------------------------------===//
 
-void marshal_memref_1d(std::vector<void*>& args, py::array_t<float> arr) {
+void marshal_memref_1d(std::vector<void*>& args, const py::array_t<float>& arr) {
     auto buf = arr.request();
     float* data = static_cast<float*>(buf.ptr);
     args.emplace_back(data);
@@ -190,7 +190,7 @@ void marshal_memref_1d(std::vector<void*>& args, py::array_t<float> arr) {
     args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(1)));
 }
 
-void marshal_memref_2d(std::vector<void*>& args, py::array_t<float> arr) {
+void marshal_memref_2d(std::vector<void*>& args, const py::array_t<float>& arr) {
     auto buf = arr.request();
     float* data = static_cast<float*>(buf.ptr);
     args.emplace_back(data);
@@ -220,9 +220,10 @@ public:
 
     Tensor(std::vector<ssize_t> shape, std::string op_type,
            std::shared_ptr<Tensor> input1 = nullptr,
-           std::shared_ptr<Tensor> input2 = nullptr)
+           std::shared_ptr<Tensor> input2 = nullptr,
+           std::shared_ptr<Tensor> input3 = nullptr)
         : shape_(shape), op_type_(op_type), is_computed_(false),
-          input1_(input1), input2_(input2) {}
+          input1_(input1), input2_(input2), input3_(input3) {}
 
     py::array_t<float> numpy() {
         if (!is_computed_) {
@@ -236,6 +237,7 @@ public:
     bool is_input() const { return op_type_ == "input"; }
     std::shared_ptr<Tensor> input1() const { return input1_; }
     std::shared_ptr<Tensor> input2() const { return input2_; }
+    std::shared_ptr<Tensor> input3() const { return input3_; }
 
     void set_data(py::array_t<float> data) {
         data_ = data;
@@ -249,6 +251,7 @@ private:
     bool is_computed_;
     std::shared_ptr<Tensor> input1_;
     std::shared_ptr<Tensor> input2_;
+    std::shared_ptr<Tensor> input3_;
 };
 
 // Graph compiler - Industrial approach with OpBuilder
@@ -272,6 +275,7 @@ public:
             } else {
                 if (t->input1()) collect(t->input1());
                 if (t->input2()) collect(t->input2());
+                if (t->input3()) collect(t->input3());
                 tensor_ids[t.get()] = inputs.size() + ops.size();
                 ops.emplace_back(t);
             }
@@ -348,7 +352,7 @@ private:
         // Build operations - each creates and returns a new tensor value
         for (size_t i = 0; i < ops.size(); ++i) {
             auto& op = ops[i];
-            
+
             Value input1 = valueMap[op->input1().get()];
             Value result;
             std::string op_name = op->op_type();
@@ -365,6 +369,12 @@ private:
                 result = builder.create<MatMulOp>(loc, resultType, input1, input2).getResult();
             } else if (op_name == "relu") {
                 result = builder.create<ReLUOp>(loc, resultType, input1).getResult();
+            } else if (op_name == "softmax") {
+                result = builder.create<SoftmaxOp>(loc, resultType, input1).getResult();
+            } else if (op_name == "linear") {
+                Value input2 = valueMap[op->input2().get()];
+                Value input3 = op->input3() ? valueMap[op->input3().get()] : Value();
+                result = builder.create<LinearOp>(loc, resultType, input1, input2, input3).getResult();
             } else {
                 throw std::runtime_error("Unknown operation: " + op_name);
             }
@@ -386,7 +396,7 @@ private:
     }
 
     // Execute without parsing MLIR text
-    static py::array_t<float> execute_direct(void* fnPtr, py::list inputs, py::tuple output_shape)
+    static py::array_t<float> execute_direct(void* fnPtr, const py::list& inputs, const py::tuple& output_shape)
     {
         std::vector<ssize_t> out_shape;
         for (auto item : output_shape) {
@@ -465,6 +475,21 @@ std::shared_ptr<Tensor> relu(std::shared_ptr<Tensor> a) {
     return std::make_shared<Tensor>(a->shape(), "relu", a, nullptr);
 }
 
+std::shared_ptr<Tensor> softmax(std::shared_ptr<Tensor> a) {
+    return std::make_shared<Tensor>(a->shape(), "softmax", a, nullptr);
+}
+
+std::shared_ptr<Tensor> linear(std::shared_ptr<Tensor> input, std::shared_ptr<Tensor> weight, std::shared_ptr<Tensor> bias) {
+    if (input->shape().size() != 2) throw std::runtime_error("Linear input must be 2D");
+    if (weight->shape().size() != 2) throw std::runtime_error("Linear weight must be 2D");
+    if (input->shape()[1] != weight->shape()[1]) throw std::runtime_error("Linear input/weight shape mismatch");
+    if (bias && bias->shape().size() != 1) throw std::runtime_error("Linear bias must be 1D");
+    if (bias && bias->shape()[0] != weight->shape()[0]) throw std::runtime_error("Linear bias shape mismatch");
+
+    std::vector<ssize_t> out_shape = {input->shape()[0], weight->shape()[0]};
+    return std::make_shared<Tensor>(out_shape, "linear", input, weight, bias);
+}
+
 //===----------------------------------------------------------------------===//
 // Python Module
 //===----------------------------------------------------------------------===//
@@ -494,4 +519,6 @@ PYBIND11_MODULE(ch9, m) {
     m.def("forward", &GraphCompiler::forward, "Forward pass: compile and execute tensor graph");
     m.def("matmul", &matmul, "Matrix multiplication");
     m.def("relu", &relu, "ReLU activation");
+    m.def("softmax", &softmax, "Softmax activation");
+    m.def("linear", &linear, "Linear layer", py::arg("input"), py::arg("weight"), py::arg("bias") = nullptr);
 }

@@ -60,7 +60,7 @@ The `ComputationGraph` class manages this vector:
 class ComputationGraph {
 public:
     explicit ComputationGraph(MLIRContext* ctx);
-    
+
     int addVariable(const std::vector<int64_t>& shape);
     int add(int lhs, int rhs);
     int matmul(int lhs, int rhs);
@@ -256,7 +256,7 @@ Value buildElementWiseOp(OpBuilder& builder, Location loc,
                          Value lhs, Value rhs, OpType opType) {
     auto lhsType = lhs.getType().cast<RankedTensorType>();
     auto rank = lhsType.getRank();
-    
+
     // Create identity affine maps: (d0, d1, ...) -> (d0, d1, ...)
     SmallVector<AffineMap> indexingMaps;
     auto identityMap = builder.getMultiDimIdentityMap(rank);
@@ -269,25 +269,28 @@ The identity map means: for position (i,j) in the output, read from position (i,
 
 **Defining Iterator Types**
 
-Element-wise operations have all-parallel iteration—no reductions, every output element is independent:
+Element-wise operations have all-parallel iteration—no reductions, every output element is independent. We use `utils::IteratorType::parallel` to specify this:
 
 ```cpp
-    SmallVector<StringRef> iteratorTypes(rank, getParallelIteratorTypeName());
+    SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
 ```
 
-For 2D, this creates `["parallel", "parallel"]`. For 3D, `["parallel", "parallel", "parallel"]`. Parallel iterators tell the compiler these can execute in any order or concurrently, enabling optimizations like parallelization and vectorization.
+For 2D, this creates `[parallel, parallel]`. Parallel iterators tell the compiler these can execute in any order or concurrently, enabling optimizations like parallelization and vectorization.
 
 **Creating Output Tensor**
 
-We need an output tensor with the same shape as inputs:
+We need an output tensor with the same shape as inputs. Since we support dynamic shapes (where dimensions might be unknown at compile time), we must construct the shape at runtime using `tensor.dim` operations:
 
 ```cpp
-    auto outputType = lhsType;  // Same type as input
-    Value emptyTensor = builder.create<tensor::EmptyOp>(loc, outputType.getShape(), 
-                                                        outputType.getElementType());
+    // Create empty tensor for result
+    SmallVector<OpFoldResult> dynSizes;
+    for (int i = 0; i < rank; ++i) {
+        dynSizes.push_back(builder.create<tensor::DimOp>(loc, lhs, i).getResult());
+    }
+    Value emptyTensor = builder.create<tensor::EmptyOp>(loc, dynSizes, lhsType.getElementType());
 ```
 
-`tensor.empty` declares a tensor without allocating or initializing—it's a placeholder that bufferization will turn into actual memory allocation later.
+`tensor.empty` declares a tensor without allocating or initializing—it's a placeholder that bufferization will turn into actual memory allocation later. By using dynamic sizes, our code works for both static and dynamic input shapes.
 
 **Building linalg.generic with Region**
 
@@ -296,12 +299,12 @@ The core operation specifies inputs, outputs, indexing, iterators, and the scala
 ```cpp
     auto genericOp = builder.create<linalg::GenericOp>(
         loc,
-        /*resultTensorTypes=*/TypeRange{outputType},
-        /*inputs=*/ValueRange{lhs, rhs},
-        /*outputs=*/ValueRange{emptyTensor},
-        /*indexingMaps=*/indexingMaps,
-        /*iteratorTypes=*/iteratorTypes,
-        /*bodyBuilder=*/[&](OpBuilder& b, Location loc, ValueRange args) {
+        lhsType, // Result type
+        ValueRange{lhs, rhs}, // Inputs
+        ValueRange{emptyTensor}, // Outputs
+        indexingMaps,
+        iteratorTypes,
+        [&](OpBuilder& b, Location loc, ValueRange args) {
             // args[0] = lhs element, args[1] = rhs element, args[2] = output element
             Value result;
             if (opType == OpType::Add) {
@@ -311,7 +314,7 @@ The core operation specifies inputs, outputs, indexing, iterators, and the scala
             }
             b.create<linalg::YieldOp>(loc, result);
         });
-    
+
     return genericOp.getResult(0);
 }
 ```
@@ -351,25 +354,39 @@ We work with `RankedTensorType` instead of memrefs—tensors represent immutable
 
 **Determine Result Shape**
 
-For matrix multiply, if left is M×K and right is K×N, result is M×N:
+For matrix multiply, if left is M×K and right is K×N, result is M×N. We handle both static and dynamic dimensions by checking if the input dimensions are dynamic:
 
 ```cpp
-    SmallVector<int64_t> resultShape = {lhsShape[0], rhsShape[1]};
+    // Determine result type shape - use static if both inputs are static
+    SmallVector<int64_t> resultShape;
+    if (lhsType.isDynamicDim(0)) {
+        resultShape.push_back(ShapedType::kDynamic);
+    } else {
+        resultShape.push_back(lhsType.getDimSize(0));
+    }
+    // ... same for second dimension ...
+
     auto resultType = RankedTensorType::get(resultShape, builder.getF32Type());
 ```
 
 **Initialize Output Tensor**
 
-Matrix multiply accumulates, so we need zero initialization. We use `tensor.empty` and `linalg.fill`:
+Matrix multiply accumulates, so we need zero initialization. We use `tensor.empty` (using runtime dimensions if needed) and `linalg.fill`:
 
 ```cpp
-    // Create empty tensor
-    Value emptyTensor = builder.create<tensor::EmptyOp>(loc, resultShape, 
-                                                        builder.getF32Type());
-    
-    // Fill with zeros
-    Value zero = builder.create<arith::ConstantOp>(loc, builder.getF32FloatAttr(0.0f));
-    Value zeroTensor = builder.create<linalg::FillOp>(loc, zero, emptyTensor).result();
+    // Create empty output tensor with potentially static sizes
+    SmallVector<OpFoldResult> outputSizes;
+    outputSizes.push_back(lhsType.isDynamicDim(0) ? 
+        OpFoldResult(m.getDefiningOp()->getResult(0)) :
+        builder.getIndexAttr(lhsType.getDimSize(0)));
+    // ... same for second dimension ...
+
+    Value empty = builder.create<tensor::EmptyOp>(loc, outputSizes, builder.getF32Type());
+
+    // Initialize to zero
+    Value zero = builder.create<arith::ConstantOp>(loc, builder.getF32Type(),
+                                                   builder.getF32FloatAttr(0.0));
+    Value init = builder.create<linalg::FillOp>(loc, zero, empty).getResult(0);
 ```
 
 `linalg.fill` takes a scalar value and a destination tensor, returning a new tensor with all elements set to that scalar. This is pure (functional) style—no mutation, just value transformations.
@@ -379,14 +396,14 @@ Matrix multiply accumulates, so we need zero initialization. We use `tensor.empt
 With inputs and zero-initialized output ready:
 
 ```cpp
-    Value result = builder.create<linalg::MatmulOp>(
-        loc, 
-        /*resultTypes=*/TypeRange{resultType},
-        /*inputs=*/ValueRange{lhs, rhs}, 
-        /*outputs=*/ValueRange{zeroTensor}
-    ).getResult(0);
-    
-    return result;
+    // Perform matrix multiplication using linalg.matmul
+    auto matmulOp = builder.create<linalg::MatmulOp>(
+        loc, resultType,
+        ValueRange{lhs, rhs},
+        ValueRange{init}
+    );
+
+    return matmulOp.getResult(0);
 }
 ```
 
@@ -554,17 +571,17 @@ py::array_t<float> execute_generic(intptr_t fnPtr,
 {
     // 1. Prepare output array
     py::array_t<float> output(output_shape);
-    
+
     // 2. Build argument list for the function call
     std::vector<intptr_t> args;
-    
+
     // Marshal output memref
     if (output_shape.size() == 1) {
         marshal_memref_1d(output, args);
     } else if (output_shape.size() == 2) {
         marshal_memref_2d(output, args);
     }
-    
+
     // Marshal input memrefs
     for (const auto& input : inputs) {
         if (input.ndim() == 1) {
@@ -573,26 +590,26 @@ py::array_t<float> execute_generic(intptr_t fnPtr,
             marshal_memref_2d(input, args);
         }
     }
-    
+
     // 3. Setup libffi call interface
     size_t num_args = args.size();
     std::vector<ffi_type*> arg_types(num_args, &ffi_type_pointer);
     std::vector<void*> arg_values(num_args);
-    
+
     for (size_t i = 0; i < num_args; ++i) {
         arg_values[i] = &args[i];  // Address of each intptr_t
     }
-    
+
     ffi_cif cif;
     ffi_status status = ffi_prep_cif(&cif, FFI_DEFAULT_ABI, num_args,
                                      &ffi_type_void, arg_types.data());
     if (status != FFI_OK) {
         throw std::runtime_error("ffi_prep_cif failed");
     }
-    
+
     // 4. Make the call!
     ffi_call(&cif, FFI_FN(fnPtr), nullptr, arg_values.data());
-    
+
     return output;
 }
 ```
@@ -710,14 +727,14 @@ def test_matmul():
     A = g.variable([2, 3])
     B = g.variable([3, 4])
     C = g.matmul(A, B)
-    
+
     print(g.get_mlir(C, "matmul"))  # Inspect generated IR
     fn = g.compile(C, "matmul")      # Compile
-    
+
     A_data = np.random.randn(2, 3).astype(np.float32)
     B_data = np.random.randn(3, 4).astype(np.float32)
     result = ch7.execute_generic(fn, [A_data, B_data], (2, 4))
-    
+
     expected = A_data @ B_data
     assert np.allclose(result, expected)
     print("✓ MatMul test passed")

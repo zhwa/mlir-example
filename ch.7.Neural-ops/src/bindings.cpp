@@ -66,32 +66,30 @@ private:
 };
 
 // Helper to marshal memref arguments
-void marshal_memref_1d(std::vector<void*>& args, py::array_t<float> arr) {
+void marshal_memref_1d(std::vector<void*>& args, const py::array_t<float>& arr) {
     auto buf = arr.request();
     float* data = static_cast<float*>(buf.ptr);
-
-    args.push_back(data);  // allocated_ptr
-    args.push_back(data);  // aligned_ptr
-    args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(0)));  // offset
-    args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[0])));  // size
-    args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(1)));  // stride
+    args.emplace_back(data);  // allocated_ptr
+    args.emplace_back(data);  // aligned_ptr
+    args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(0)));  // offset
+    args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[0])));  // size
+    args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(1)));  // stride
 }
 
-void marshal_memref_2d(std::vector<void*>& args, py::array_t<float> arr) {
+void marshal_memref_2d(std::vector<void*>& args, const py::array_t<float>& arr) {
     auto buf = arr.request();
     float* data = static_cast<float*>(buf.ptr);
-
-    args.push_back(data);  // allocated_ptr
-    args.push_back(data);  // aligned_ptr
-    args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(0)));  // offset
-    args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[0])));  // size0
-    args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[1])));  // size1
-    args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[1])));  // stride0
-    args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(1)));  // stride1
+    args.emplace_back(data);  // allocated_ptr
+    args.emplace_back(data);  // aligned_ptr
+    args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(0)));  // offset
+    args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[0])));  // size0
+    args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[1])));  // size1
+    args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[1])));  // stride0
+    args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(1)));  // stride1
 }
 
 // libffi-based execute - handles ANY signature universally with LLJIT
-py::array_t<float> execute_generic(uintptr_t fnPtr, py::list inputs, py::tuple output_shape) {
+py::array_t<float> execute_generic(uintptr_t fnPtr, const py::list& inputs, const py::tuple& output_shape) {
     // Prepare output array
     std::vector<ssize_t> out_shape;
     for (auto item : output_shape) {

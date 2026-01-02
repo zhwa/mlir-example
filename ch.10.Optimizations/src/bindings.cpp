@@ -133,8 +133,9 @@ public:
         pm.addPass(mlir::createLoopInvariantCodeMotionPass());
         pm.addPass(mlir::createCanonicalizerPass());
 
-        // 6. Vectorization (NEW! Explicit SIMD)
-        // Convert vector operations to SCF (for unrolling/lowering)
+        // 6. Vectorization Support (Optional)
+        // We rely on LLVM auto-vectorization (-O3), but these passes 
+        // handle any explicit vector ops if introduced later.
         pm.addPass(mlir::createConvertVectorToSCFPass());
         pm.addPass(mlir::createCanonicalizerPass());
 
@@ -197,7 +198,7 @@ static NNCompiler& getCompiler() {
 // Memref Marshalling (from Chapter 8)
 //===----------------------------------------------------------------------===//
 
-void marshal_memref_1d(std::vector<void*>& args, py::array_t<float> arr) {
+void marshal_memref_1d(std::vector<void*>& args, const py::array_t<float>& arr) {
     auto buf = arr.request();
     float* data = static_cast<float*>(buf.ptr);
     args.emplace_back(data);
@@ -207,7 +208,7 @@ void marshal_memref_1d(std::vector<void*>& args, py::array_t<float> arr) {
     args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(1)));
 }
 
-void marshal_memref_2d(std::vector<void*>& args, py::array_t<float> arr) {
+void marshal_memref_2d(std::vector<void*>& args, const py::array_t<float>& arr) {
     auto buf = arr.request();
     float* data = static_cast<float*>(buf.ptr);
     args.emplace_back(data);
@@ -404,7 +405,7 @@ private:
     }
 
     // Execute without parsing MLIR text
-    static py::array_t<float> execute_direct(void* fnPtr, py::list inputs, py::tuple output_shape) {
+    static py::array_t<float> execute_direct(void* fnPtr, const py::list& inputs, const py::tuple& output_shape) {
 
         std::vector<ssize_t> out_shape;
         for (auto item : output_shape) {

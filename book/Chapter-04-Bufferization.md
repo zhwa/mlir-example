@@ -390,7 +390,7 @@ Key transformations occur throughout the function. The return type is removed an
 One-Shot Bufferize has a critical option: **bufferizeFunctionBoundaries**. This controls whether the pass bufferizes function signatures (arguments and return types) or only function bodies.
 
 ```cpp
-bufferization::OneShotBufferizationOptions options;
+bufferization::OneShotBufferizePassOptions options;
 options.bufferizeFunctionBoundaries = true;  // Bufferize signatures
 ```
 
@@ -405,8 +405,11 @@ For standalone compilation (Chapters 1-4), we use `true` because we're compiling
 Bufferization must decide memory layout—how multi-dimensional tensors map to linear memory. The layout map specifies this:
 
 ```cpp
-options.setFunctionBoundaryTypeConversion(
-    bufferization::LayoutMapOption::IdentityLayoutMap);
+bufferization::OneShotBufferizePassOptions options;
+options.bufferizeFunctionBoundaries = true;
+// Explicitly set layout map (default is Identity)
+options.functionBoundaryTypeConversion = 
+    bufferization::LayoutMapOption::IdentityLayoutMap;
 ```
 
 IdentityLayoutMap means "use row-major (C-style) layout with unit strides." For example, `tensor<8x16xf32>` becomes `memref<8x16xf32>` with default strides, where element `[i,j]` is stored at offset `i*16 + j`. This matches NumPy's default layout (`C_CONTIGUOUS`).
@@ -676,12 +679,13 @@ LogicalResult applyOptimizationPasses(ModuleOp module) {
   // Phase 1: Simplification
   pm.addPass(createCanonicalizerPass());
 
-  // Phase 2: Bufferization (tensor → memref)
-  bufferization::OneShotBufferizationOptions options;
-  options.bufferizeFunctionBoundaries = true;
-  options.setFunctionBoundaryTypeConversion(
-      bufferization::LayoutMapOption::IdentityLayoutMap);
-  pm.addPass(bufferization::createOneShotBufferizePass(options));
+  // LLVM 21: Configure OneShotBufferize with OneShotBufferizePassOptions
+  // We need to enable function boundary bufferization
+  bufferization::OneShotBufferizePassOptions bufferizationOptions;
+  bufferizationOptions.bufferizeFunctionBoundaries = true;
+  
+  // "One-Shot Bufferize" converts all tensors to memrefs (including function args/results)
+  pm.addPass(bufferization::createOneShotBufferizePass(bufferizationOptions));
   pm.addPass(bufferization::createBufferResultsToOutParamsPass());
   pm.addPass(createConvertBufferizationToMemRefPass());
   pm.addPass(createCanonicalizerPass());

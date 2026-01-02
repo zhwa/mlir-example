@@ -4,7 +4,7 @@ Chapter 11 built scaled dot-product attention—the core mechanism enabling tran
 
 This chapter composes Chapter 11's attention with additional components to build complete transformer blocks. We'll implement **layer normalization** (normalizing activations across the embedding dimension for training stability), **feedforward networks** (two-layer MLPs with nonlinear activations providing per-position computation), and **residual connections** (skip connections enabling gradient flow in deep networks). The Python API remains simple—users call `transformer_block(x)` and get output—but underneath, MLIR orchestrates complex multi-operation pipelines with automatic optimization.
 
-Chapter 12's architecture follows established patterns: we extend the Transformer dialect (from Chapter 11's attention operations) with `transformer.layernorm`, `transformer.ffn`, and `transformer.residual` operations, implement lowering patterns to standard dialects, and maintain the computation graph API. The result is a reusable transformer block abstraction suitable for building larger models (Chapter 13's GPT) while demonstrating how MLIR's compositional design scales from individual operations to complex architectural components.
+Chapter 12's architecture follows established patterns: we extend the Transformer dialect (from Chapter 11's attention operations) with `transformer.layer_norm`, `transformer.linear`, `transformer.gelu`, and `transformer.add` operations, implement lowering patterns to standard dialects, and maintain the computation graph API. The result is a reusable transformer block abstraction suitable for building larger models (Chapter 13's GPT) while demonstrating how MLIR's compositional design scales from individual operations to complex architectural components.
 
 The chapter progresses from understanding transformer block architecture (why each component matters), through implementing layer normalization (variance calculation and normalization), feedforward networks (linear layers with GELU activation), to composing everything with residual connections. We'll see how MLIR's optimization passes (Chapter 10's fusion and vectorization) automatically apply to these new operations without additional code. By the end, you'll have a complete transformer block implementation and understand how production transformers decompose into manageable, optimizable components.
 
@@ -145,8 +145,8 @@ def Transformer_LayerNormOp : Transformer_Op<"layer_norm"> {
   let results = (outs AnyTensor:$result);
 
   let assemblyFormat = [{
-    $input `,` $gamma `,` $beta attr-dict `:` 
-    type($input) `,` type($gamma) `,` type($beta) `->` type($result)
+    $input `,` $gamma `,` $beta
+    attr-dict `:` `(` type($input) `,` type($gamma) `,` type($beta) `)` `->` type($result)
   }];
 }
 ```
@@ -490,12 +490,12 @@ The complete FFN operation composes these building blocks:
 
 ```python
 # High-level FFN API
-ffn_out = transformer.ffn(input, W1, b1, W2, b2)
+ffn_out = ch12.ffn(input, W1, b1, W2, b2)
 
 # Lowers to:
-hidden = transformer.linear(input, W1, b1)     # → linalg ops
-activated = transformer.gelu(hidden)            # → linalg.generic
-output = transformer.linear(activated, W2, b2)  # → linalg ops
+hidden = ch12.linear(input, W1, b1)     # → linalg ops
+activated = ch12.gelu(hidden)            # → linalg.generic
+output = ch12.linear(activated, W2, b2)  # → linalg ops
 
 # After bufferization pipeline, these become efficient memref operations
 ```

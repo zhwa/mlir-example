@@ -119,7 +119,7 @@ PassManager pm(context);
 pm.addPass(createCanonicalizerPass());           // Simplify IR
 pm.addPass(createConvertLinalgToLoopsPass());    // Linalg → Loops
 pm.addPass(createSCFToControlFlowPass());        // SCF → CF
-pm.addPass(createFinalizeMemRefToLLVMPass());    // MemRef → LLVM
+pm.addPass(createFinalizeMemRefToLLVMConversionPass());    // MemRef → LLVM
 
 // Run all passes on the module
 if (failed(pm.run(module))) {

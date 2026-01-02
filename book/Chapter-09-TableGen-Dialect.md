@@ -1217,6 +1217,17 @@ struct NNReLUOpLowering : public OpRewritePattern<ReLUOp> {
 
 ReLU uses `linalg.generic` with `arith.maximumf` instead of `addf`. The structure is identical—same pattern class, same rewriter usage, same operation replacement. This consistency is OpRewritePattern's strength: once you understand the pattern, all lowerings follow the same structure.
 
+**Advanced Lowering: Softmax**. Softmax requires a more complex multi-pass approach. To ensure numerical stability, we use the standard formula: $softmax(x_i) = \frac{e^{x_i - max(x)}}{\sum e^{x_j - max(x)}}$. This requires three passes over the data:
+1.  **Max**: Compute the maximum value along the reduction dimension.
+2.  **Exp**: Compute $e^{x - max}$ for each element.
+3.  **Sum & Div**: Compute the sum of exponentials, then divide each element by the sum.
+
+Implementing this in `OpRewritePattern` involves creating a chain of `linalg.generic` operations. The first pass is a reduction, the second is element-wise (broadcasting the max), and the third is another reduction followed by element-wise division. This demonstrates how high-level operations can be decomposed into sequences of simpler linear algebra primitives.
+
+**Linear Layer Lowering**. The `nn.linear` operation combines matrix multiplication with an optional bias addition: $output = input \times weight^T + bias$.
+The lowering first creates a `linalg.matmul` (or equivalent `linalg.generic`) for the multiplication. Note that `nn.linear` typically expects the weight matrix to be transposed ($[out\_features, in\_features]$), so the lowering must handle this, either by transposing the weight tensor or by using a `linalg.generic` with appropriate indexing maps.
+If a bias is present, a second `linalg.generic` adds it to the result, broadcasting the bias vector across the batch dimension.
+
 **The Conversion Pass**. Patterns are collected into a pass:
 
 ```cpp
@@ -1236,7 +1247,8 @@ struct ConvertNNToStandardPass
     // Register rewrite patterns
     RewritePatternSet patterns(&getContext());
     patterns.add<NNAddOpLowering, NNMulOpLowering, 
-                 NNMatMulOpLowering, NNReLUOpLowering>(&getContext());
+                 NNMatMulOpLowering, NNReLUOpLowering,
+                 NNSoftmaxOpLowering, NNLinearOpLowering>(&getContext());
     
     // Apply conversion
     if (failed(applyPartialConversion(getOperation(), target, std::move(patterns)))) {

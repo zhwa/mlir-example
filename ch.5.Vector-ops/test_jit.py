@@ -92,47 +92,8 @@ def test_lowered_ir():
     print(ir[:1000])
     print("... (truncated)")
 
-def benchmark():
-    """Simple performance comparison."""
-    print("\n=== Performance Benchmark ===")
-    import time
-
-    size = 1000000
-    alpha = 2.5
-    A = np.random.randn(size).astype(np.float32)
-    B = np.random.randn(size).astype(np.float32)
-
-    # Warmup
-    _ = ch5_vector_ops.saxpy(alpha, A, B)
-    _ = alpha * A + B
-
-    # NumPy benchmark
-    start = time.time()
-    for _ in range(100):
-        result_numpy = alpha * A + B
-    numpy_time = time.time() - start
-
-    # MLIR JIT benchmark
-    start = time.time()
-    for _ in range(100):
-        result_mlir = ch5_vector_ops.saxpy(alpha, A, B)
-    mlir_time = time.time() - start
-
-    print(f"Vector size: {size}")
-    print(f"Iterations: 100")
-    print(f"NumPy time: {numpy_time:.4f}s")
-    print(f"MLIR time: {mlir_time:.4f}s")
-    print(f"Speedup: {numpy_time / mlir_time:.2f}x")
-
-    # Verify correctness
-    if np.allclose(result_numpy, result_mlir):
-        print("✓ Results match")
-    else:
-        print("✗ Results differ!")
-
 if __name__ == "__main__":
     test_saxpy_basic()
     test_saxpy_large()
     test_ir_generation()
     test_lowered_ir()
-    benchmark()

@@ -9,7 +9,7 @@ import numpy as np
 
 print("\n" + "="*70)
 print(" Chapter 10: Optimized Compilation")
-print(" Fusion + Vectorization with vector dialect")
+print(" Fusion + Auto-Vectorization")
 print("="*70 + "\n")
 
 # Test 1: MatMul
@@ -49,5 +49,5 @@ print("✓ Element-wise fusion correctness verified")
 
 print("\n" + "="*70)
 print(" All tests passed!")
-print(" Optimizations: Linalg fusion + vectorization (vector dialect)")
+print(" Optimizations: Linalg fusion + auto-vectorization")
 print("="*70)

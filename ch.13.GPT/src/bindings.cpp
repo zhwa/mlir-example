@@ -188,7 +188,7 @@ static TransformerCompiler& getCompiler() {
 // Memref Marshalling
 //===----------------------------------------------------------------------===//
 
-void marshal_memref_2d(std::vector<void*>& args, py::array_t<float> arr) {
+void marshal_memref_2d(std::vector<void*>& args, const py::array_t<float>& arr) {
   auto buf = arr.request();
   float* data = static_cast<float*>(buf.ptr);
   args.emplace_back(data);
@@ -200,7 +200,7 @@ void marshal_memref_2d(std::vector<void*>& args, py::array_t<float> arr) {
   args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(1)));
 }
 
-void marshal_memref_3d(std::vector<void*>& args, py::array_t<float> arr) {
+void marshal_memref_3d(std::vector<void*>& args, const py::array_t<float>& arr) {
   auto buf = arr.request();
   float* data = static_cast<float*>(buf.ptr);
   args.emplace_back(data);
@@ -215,7 +215,7 @@ void marshal_memref_3d(std::vector<void*>& args, py::array_t<float> arr) {
   args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(1)));
 }
 
-void marshal_memref_1d(std::vector<void*>& args, py::array_t<float> arr) {
+void marshal_memref_1d(std::vector<void*>& args, const py::array_t<float>& arr) {
   auto buf = arr.request();
   float* data = static_cast<float*>(buf.ptr);
   args.emplace_back(data);
@@ -226,7 +226,7 @@ void marshal_memref_1d(std::vector<void*>& args, py::array_t<float> arr) {
 }
 
 // Marshal int32 arrays (for embedding indices)
-void marshal_memref_1d_i32(std::vector<void*>& args, py::array_t<int32_t> arr) {
+void marshal_memref_1d_i32(std::vector<void*>& args, const py::array_t<int32_t>& arr) {
   auto buf = arr.request();
   int32_t* data = static_cast<int32_t*>(buf.ptr);
   args.emplace_back(data);
@@ -309,8 +309,8 @@ public:
 // Operation Builders
 //===----------------------------------------------------------------------===//
 
-Tensor layer_norm(const Tensor& input, py::array_t<float> gamma, 
-                  py::array_t<float> beta, float epsilon = 1e-5f) {
+Tensor layer_norm(const Tensor& input, const py::array_t<float>& gamma, 
+                  const py::array_t<float>& beta, float epsilon = 1e-5f) {
   auto node = std::make_shared<GraphNode>(OpType::LayerNorm);
   node->inputs.emplace_back(input.node);
   node->gamma = gamma;
@@ -320,7 +320,7 @@ Tensor layer_norm(const Tensor& input, py::array_t<float> gamma,
   return Tensor(node);
 }
 
-Tensor linear(const Tensor& input, py::array_t<float> weight, py::array_t<float> bias) {
+Tensor linear(const Tensor& input, const py::array_t<float>& weight, const py::array_t<float>& bias) {
   auto node = std::make_shared<GraphNode>(OpType::Linear);
   node->inputs.emplace_back(input.node);
   node->weight = weight;
@@ -380,7 +380,7 @@ Tensor scale(const Tensor& input, float scale_factor) {
 // Token embedding lookup (Chapter 13)
 // indices: [seq_len] int32, table: [vocab_size, d_model] float
 // output: [seq_len, d_model] float
-Tensor embedding(py::array_t<int32_t> indices, py::array_t<float> table) {
+Tensor embedding(const py::array_t<int32_t>& indices, const py::array_t<float>& table) {
   auto node = std::make_shared<GraphNode>(OpType::Embedding);
   node->indices = indices;
   node->table = table;
@@ -428,8 +428,8 @@ Tensor rope(const Tensor& input) {
 // High-Level Compositions
 //===----------------------------------------------------------------------===//
 
-Tensor ffn(const Tensor& input, py::array_t<float> w1, py::array_t<float> b1,
-           py::array_t<float> w2, py::array_t<float> b2) {
+Tensor ffn(const Tensor& input, const py::array_t<float>& w1, const py::array_t<float>& b1,
+           const py::array_t<float>& w2, const py::array_t<float>& b2) {
   Tensor hidden = linear(input, w1, b1);
   Tensor activated = gelu(hidden);
   return linear(activated, w2, b2);
@@ -447,10 +447,10 @@ Tensor scaled_dot_product_attention(const Tensor& Q, const Tensor& K, const Tens
 }
 
 Tensor multi_head_attention(const Tensor& input,
-                             py::array_t<float> w_q, py::array_t<float> b_q,
-                             py::array_t<float> w_k, py::array_t<float> b_k,
-                             py::array_t<float> w_v, py::array_t<float> b_v,
-                             py::array_t<float> w_o, py::array_t<float> b_o) {
+                             const py::array_t<float>& w_q, const py::array_t<float>& b_q,
+                             const py::array_t<float>& w_k, const py::array_t<float>& b_k,
+                             const py::array_t<float>& w_v, const py::array_t<float>& b_v,
+                             const py::array_t<float>& w_o, const py::array_t<float>& b_o) {
   Tensor Q = linear(input, w_q, b_q);
   Tensor K = linear(input, w_k, b_k);
   Tensor V = linear(input, w_v, b_v);
@@ -459,14 +459,14 @@ Tensor multi_head_attention(const Tensor& input,
 }
 
 Tensor transformer_block(const Tensor& input,
-                         py::array_t<float> w_q, py::array_t<float> b_q,
-                         py::array_t<float> w_k, py::array_t<float> b_k,
-                         py::array_t<float> w_v, py::array_t<float> b_v,
-                         py::array_t<float> w_o, py::array_t<float> b_o,
-                         py::array_t<float> gamma1, py::array_t<float> beta1,
-                         py::array_t<float> w1, py::array_t<float> b1,
-                         py::array_t<float> w2, py::array_t<float> b2,
-                         py::array_t<float> gamma2, py::array_t<float> beta2) {
+                         const py::array_t<float>& w_q, const py::array_t<float>& b_q,
+                         const py::array_t<float>& w_k, const py::array_t<float>& b_k,
+                         const py::array_t<float>& w_v, const py::array_t<float>& b_v,
+                         const py::array_t<float>& w_o, const py::array_t<float>& b_o,
+                         const py::array_t<float>& gamma1, const py::array_t<float>& beta1,
+                         const py::array_t<float>& w1, const py::array_t<float>& b1,
+                         const py::array_t<float>& w2, const py::array_t<float>& b2,
+                         const py::array_t<float>& gamma2, const py::array_t<float>& beta2) {
   Tensor normed1 = layer_norm(input, gamma1, beta1);
   Tensor attn_out = multi_head_attention(normed1, w_q, b_q, w_k, b_k, w_v, b_v, w_o, b_o);
   Tensor residual1 = input + attn_out;
@@ -511,10 +511,10 @@ Tensor multi_layer_transformer(const Tensor& input,
 // input: [seq_len, d_model]
 // Returns attention output with position encoding and causal masking
 Tensor gpt_attention(const Tensor& input,
-                     py::array_t<float> w_q, py::array_t<float> b_q,
-                     py::array_t<float> w_k, py::array_t<float> b_k,
-                     py::array_t<float> w_v, py::array_t<float> b_v,
-                     py::array_t<float> w_o, py::array_t<float> b_o) {
+                     const py::array_t<float>& w_q, const py::array_t<float>& b_q,
+                     const py::array_t<float>& w_k, const py::array_t<float>& b_k,
+                     const py::array_t<float>& w_v, const py::array_t<float>& b_v,
+                     const py::array_t<float>& w_o, const py::array_t<float>& b_o) {
   // Project to Q, K, V
   Tensor Q = linear(input, w_q, b_q);
   Tensor K = linear(input, w_k, b_k);
@@ -543,14 +543,14 @@ Tensor gpt_attention(const Tensor& input,
 
 // GPT Block: LayerNorm → Attention → Residual → LayerNorm → FFN → Residual
 Tensor gpt_block(const Tensor& input,
-                 py::array_t<float> w_q, py::array_t<float> b_q,
-                 py::array_t<float> w_k, py::array_t<float> b_k,
-                 py::array_t<float> w_v, py::array_t<float> b_v,
-                 py::array_t<float> w_o, py::array_t<float> b_o,
-                 py::array_t<float> w1, py::array_t<float> b1,
-                 py::array_t<float> w2, py::array_t<float> b2,
-                 py::array_t<float> gamma1, py::array_t<float> beta1,
-                 py::array_t<float> gamma2, py::array_t<float> beta2) {
+                 const py::array_t<float>& w_q, const py::array_t<float>& b_q,
+                 const py::array_t<float>& w_k, const py::array_t<float>& b_k,
+                 const py::array_t<float>& w_v, const py::array_t<float>& b_v,
+                 const py::array_t<float>& w_o, const py::array_t<float>& b_o,
+                 const py::array_t<float>& w1, const py::array_t<float>& b1,
+                 const py::array_t<float>& w2, const py::array_t<float>& b2,
+                 const py::array_t<float>& gamma1, const py::array_t<float>& beta1,
+                 const py::array_t<float>& gamma2, const py::array_t<float>& beta2) {
   // Pre-norm attention
   Tensor normed1 = layer_norm(input, gamma1, beta1);
   Tensor attn_out = gpt_attention(normed1, w_q, b_q, w_k, b_k, w_v, b_v, w_o, b_o);
@@ -568,11 +568,11 @@ Tensor gpt_block(const Tensor& input,
 // all_weights: list of weights for all layers (16 per layer)
 // final_gamma, final_beta: final layer norm
 // Returns: [seq_len, d_model] hidden states
-Tensor gpt_forward(py::array_t<int32_t> indices,
-                   py::array_t<float> embedding_table,
+Tensor gpt_forward(const py::array_t<int32_t>& indices,
+                   const py::array_t<float>& embedding_table,
                    const std::vector<py::array_t<float>>& all_weights,
-                   py::array_t<float> final_gamma,
-                   py::array_t<float> final_beta) {
+                   const py::array_t<float>& final_gamma,
+                   const py::array_t<float>& final_beta) {
   if (all_weights.size() % 16 != 0) {
     throw std::runtime_error("Expected 16 weights per layer");
   }

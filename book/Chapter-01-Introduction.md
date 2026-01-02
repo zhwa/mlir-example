@@ -767,88 +767,92 @@ The result is LLVM dialect IR—MLIR operations that directly correspond to LLVM
 
 ---
 
-## 1.10 JIT Compilation and Execution
+## 1.11 JIT Compilation and Execution
 
-With our IR fully lowered to LLVM dialect, we can now compile it to executable machine code and run it. MLIR provides the `ExecutionEngine` class that wraps LLVM's JIT compiler, making this process straightforward. The implementation resides in `jit.cpp`.
+With our IR fully lowered to LLVM dialect, we can now compile it to executable machine code and run it. MLIR provides the `ExecutionEngine` class that wraps LLVM's JIT compiler. The implementation resides in `jit.cpp`.
 
-### Creating the Execution Engine
+In this chapter, we wrap the entire JIT pipeline—from IR creation to execution—in a single C++ function `executeGemm`. This simplifies the Python interface, though in later chapters we'll separate these steps to enable caching.
+
+### The JIT Driver Function
+
+The `executeGemm` function orchestrates the complete lifecycle. First, it initializes LLVM's target architecture support (x86, ARM, etc.), which only needs to happen once per process.
 
 ```cpp
-void* jitCompileFunction(ModuleOp module) {
-  ExecutionEngineOptions options;
+  static bool initialized = false;
+  if (!initialized) {
+    llvm::InitializeNativeTarget();
+    llvm::InitializeNativeTargetAsmPrinter();
+    initialized = true;
+  }
+```
+
+Next, it creates the MLIR context, loads the necessary dialects, and generates our module using the `createGemmModule` function we wrote earlier. It then applies the optimization pipeline.
+
+```cpp
+  MLIRContext context;
+  context.loadDialect<func::FuncDialect, LLVM::LLVMDialect>();
+  auto module = createGemmModule(context);
+
+  if (failed(applyOptimizationPasses(*module))) {
+    llvm::errs() << "Optimization failed\n";
+    return;
+  }
+```
+
+Before creating the execution engine, we must register the translations that convert MLIR dialects to LLVM IR. Then we create the engine with an optimization transformer set to level 3 (`-O3`), which ensures the generated machine code is efficient.
+
+```cpp
+  registerBuiltinDialectTranslation(*module->getContext());
+  registerLLVMDialectTranslation(*module->getContext());
+
+  mlir::ExecutionEngineOptions options;
   options.transformer = mlir::makeOptimizingTransformer(3, 0, nullptr);
   
-  auto engine = mlir::ExecutionEngine::create(module, options);
-  if (!engine) {
-    llvm::errs() << "Failed to create execution engine\n";
-    return nullptr;
-  }
-  
-  auto result = (*engine)->lookup("gemm_8x16x32");
-  if (!result) {
-    llvm::errs() << "Failed to find function\n";
-    return nullptr;
-  }
-  
-  return reinterpret_cast<void*>(*result);
-}
+  auto maybeEngine = mlir::ExecutionEngine::create(*module, options);
+  auto engine = std::move(*maybeEngine);
 ```
 
-The `ExecutionEngine::create` method performs several steps internally. First, it translates the MLIR LLVM dialect to actual LLVM IR (a format LLVM's optimizer and code generator understand). Second, it applies LLVM optimizations through the transformer we configured—the `makeOptimizingTransformer(3, 0, nullptr)` creates an optimization pipeline equivalent to `-O3` compiler flags. This includes instruction selection, register allocation, instruction scheduling, and architecture-specific optimizations like vectorization.
-
-Third, the execution engine JIT-compiles the optimized LLVM IR to native machine code for the host architecture (x86_64, ARM, etc.). This generated code is stored in memory and is immediately executable. Finally, we use `lookup` to find our function by name, getting back a pointer to the compiled code.
-
-The transformer is crucial for performance. Without optimization (transformer level 0), we'd get naive code with redundant loads, no vectorization, and poor register usage. With `-O3` (level 3), LLVM applies aggressive optimizations that can match hand-written assembly for many computations. Chapter 3 will explore the execution engine in more depth, including caching strategies to avoid recompiling the same code repeatedly.
-
-### Invoking the Compiled Function from C++
+Finally, we look up the compiled function by its name (`gemm_8x16x32`). The engine returns a void pointer to the machine code, which we cast to a function pointer matching our signature (three float pointers) and execute.
 
 ```cpp
-typedef void (*GemmFunc)(float*, float*, float*);
-
-void callGemmJIT(void* funcPtr, float* A, float* B, float* C) {
-  auto gemm = reinterpret_cast<GemmFunc>(funcPtr);
+  auto result = engine->lookup("gemm_8x16x32");
+  
+  typedef void (*GemmFunc)(float*, float*, float*);
+  auto gemm = reinterpret_cast<GemmFunc>(*result);
   gemm(A, B, C);
-}
 ```
-
-Once we have the function pointer from JIT compilation, calling it is straightforward. We cast the void pointer to a function pointer type matching our signature: three float pointers (one for each matrix) and no return value. The memrefs in our MLIR code compile down to simple pointers for fixed-size arrays—the dimensions are baked into the generated code as loop bounds.
-
-In memory, the arrays are just contiguous sequences of floats in row-major order. When we pass NumPy arrays from Python, NumPy ensures the data is contiguous, so we can safely pass the underlying memory pointers to compiled code. Chapter 2 will reveal additional complexity when we introduce dynamic shapes: memrefs become descriptor structs containing size and stride information, requiring more complex calling conventions.
 
 ### Python Integration with Pybind11
 
-The final piece is exposing our JIT compiler to Python so we can easily test and use it. Pybind11 provides seamless C++/Python integration. The implementation in `bindings.cpp` wraps our JIT compiler in a Python-friendly interface.
-
-**Understanding the Python ↔ C++ Boundary**: This is where Python's high-level NumPy arrays cross into C++'s low-level memory world. Python code calls `gemm(A, B)` with NumPy arrays. Pybind11 extracts raw memory pointers from these arrays. We pass these pointers to JIT-compiled machine code (which expects raw float pointers). The compiled code writes results directly into memory. Python sees the modified NumPy array. Understanding this boundary is crucial for performance—copying data across this boundary is expensive, so we avoid it by passing pointers.
+The final piece is exposing this driver to Python. The implementation in `bindings.cpp` is now remarkably simple because `executeGemm` handles the heavy lifting.
 
 ```cpp
-py::array_t<float> gemm(py::array_t<float> A, py::array_t<float> B) {
-  // Validate shapes
-  if (A.shape(0) != 8 || A.shape(1) != 32)
-    throw std::runtime_error("A must be 8x32");
-  if (B.shape(0) != 32 || B.shape(1) != 16)
-    throw std::runtime_error("B must be 32x16");
+py::array_t<float> gemm(const py::array_t<float>& A, const py::array_t<float>& B) {
+  // ... (Shape validation omitted for brevity) ...
+
+  // Allocate output array
+  auto C = py::array_t<float>({8, 16});
   
-  // Allocate output
-  py::array_t<float> C({8, 16});
+  // Get raw pointers from NumPy arrays
+  float* ptrA = static_cast<float*>(A.request().ptr);
+  float* ptrB = static_cast<float*>(B.request().ptr);
+  float* ptrC = static_cast<float*>(C.request().ptr);
   
-  // Get raw pointers
-  float* ptrA = A.mutable_data();
-  float* ptrB = B.mutable_data();
-  float* ptrC = C.mutable_data();
-  
-  // JIT compile and execute
-  auto module = createGemmModule(context);
-  applyOptimizationPasses(module);
-  void* funcPtr = jitCompileFunction(module);
-  callGemmJIT(funcPtr, ptrA, ptrB, ptrC);
+  // Execute JIT pipeline
+  mlir::executeGemm(ptrA, ptrB, ptrC);
   return C;
 }
+```
 
+Finally, we expose this function to Python using the `PYBIND11_MODULE` macro, which creates the `ch1_fixed_size` module we import in our test script.
+
+```cpp
 PYBIND11_MODULE(ch1_fixed_size, m) {
-  m.def("gemm", &gemm, "JIT-compiled GEMM");
+  m.def("gemm", &gemm, "Compute C = A @ B where A is 8x32 and B is 32x16");
 }
 ```
+
+**Understanding the Python ↔ C++ Boundary**: This is where Python's high-level NumPy arrays cross into C++'s low-level memory world. Pybind11 extracts raw memory pointers from the NumPy arrays. We pass these pointers to `executeGemm`, which passes them to the JIT-compiled machine code. The compiled code writes results directly into the memory backing the NumPy array `C`. This zero-copy interaction is crucial for performance.
 
 This workflow validates shapes, generates IR, applies passes, JIT compiles, and executes—all triggered by a Python function call. Chapter 3 will optimize this by caching compiled functions.
 
@@ -891,7 +895,7 @@ The ones matrix test provides easy manual verification: each element should be 3
 
 ---
 
-## 1.11 Summary
+## 1.12 Summary
 
 This chapter introduced MLIR's foundational concepts and implemented a complete JIT-compiled matrix multiply. We explored how the multi-level problem emerged from heterogeneous computing, why LLVM IR alone proved insufficient, and how MLIR's dialect system provides extensible operation vocabularies at different abstraction levels. Through progressive lowering and composable passes, MLIR transforms high-level operations into executable machine code while maintaining optimization opportunities at each stage.
 

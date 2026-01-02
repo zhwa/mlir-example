@@ -79,19 +79,19 @@ GPUs have three memory levels with different performance characteristics. Global
 
 ```mlir
 // Allocate 16×16 tile in shared memory
-%tile = gpu.alloc() : memref<16x16xf32, 3>  // 3 = workgroup address space
+%tile = gpu.alloc() : memref<16x16xf32, 2>  // 2 = workgroup address space
 
 // Load data cooperatively
-memref.store %value, %tile[%row, %col] : memref<16x16xf32, 3>
+memref.store %value, %tile[%row, %col] : memref<16x16xf32, 2>
 
 // Synchronize all threads in block
 gpu.barrier
 
 // All threads can now read the tile
-%shared_value = memref.load %tile[%i, %j] : memref<16x16xf32, 3>
+%shared_value = memref.load %tile[%i, %j] : memref<16x16xf32, 2>
 ```
 
-The address space (3 = workgroup) tells the compiler to allocate in fast on-chip shared memory, not slow global memory. Note that address space 3 is the convention for both NVVM (NVIDIA) and ROCDL (AMD) targets, though address space mappings are technically target-dependent in MLIR.
+The address space (2 = workgroup) tells the compiler to allocate in fast on-chip shared memory, not slow global memory. Note that address space 3 is the convention for NVVM (NVIDIA) and ROCDL (AMD) targets, but the logical MLIR GPU dialect often uses address space 2 for workgroup memory before lowering.
 
 **Memory Coalescing**. Global memory transfers happen in 32-128 byte chunks. When threads in a warp access **consecutive addresses**, hardware coalesces loads into a single transaction:
 
@@ -220,9 +220,9 @@ gpu.module @kernels {
     %bx = gpu.block_id x : index
     %by = gpu.block_id y : index
     
-    // Allocate shared memory (address space 3 = workgroup)
-    %tileA = gpu.alloc() : memref<16x16xf32, 3>
-    %tileB = gpu.alloc() : memref<16x16xf32, 3>
+    // Allocate shared memory (address space 2 = workgroup)
+    %tileA = gpu.alloc() : memref<16x16xf32, 2>
+    %tileB = gpu.alloc() : memref<16x16xf32, 2>
     
     // Compute global indices: row = blockY * 16 + threadY
     %row = arith.addi %blockOffsetY, %ty : index
@@ -230,12 +230,12 @@ gpu.module @kernels {
     
     // Cooperative loading: global → shared
     %aVal = memref.load %A[%row, %col] : memref<?x?xf32>
-    memref.store %aVal, %tileA[%ty, %tx] : memref<16x16xf32, 3>
+    memref.store %aVal, %tileA[%ty, %tx] : memref<16x16xf32, 2>
     
     gpu.barrier  // Wait for all threads to finish loading
     
     // Read from shared memory (50-100× faster!)
-    %tileVal = memref.load %tileA[%ty, %tx] : memref<16x16xf32, 3>
+    %tileVal = memref.load %tileA[%ty, %tx] : memref<16x16xf32, 2>
     memref.store %tileVal, %C[%row, %col] : memref<?x?xf32>
     
     gpu.barrier  // Synchronize before next iteration
@@ -252,7 +252,7 @@ func.func @main(...) {
 }
 ```
 
-The matrix multiplication kernel uses 2D indexing for both grid and block organization (`blocks in (gridX, gridY, 1)` and `threads in (16, 16, 1)`). Shared memory appears as `gpu.alloc() : memref<16x16xf32, 3>` where address space 3 indicates workgroup memory. The IR shows the memory hierarchy through type annotations: global loads use `memref<?x?xf32>` while shared memory uses `memref<16x16xf32, 3>`. The `gpu.barrier` operation ensures all threads finish loading data before any thread reads from shared memory, enabling the cooperative pattern where all 256 threads (16×16) load one element each into the shared tile. Shared memory provides significant speedup over global memory (~20-40 cycle latency versus ~400-800 cycles, roughly 10-20× faster), which is why production kernels load tiles into shared memory and reuse data multiple times to dramatically reduce global memory traffic.
+The matrix multiplication kernel uses 2D indexing for both grid and block organization (`blocks in (gridX, gridY, 1)` and `threads in (16, 16, 1)`). Shared memory appears as `gpu.alloc() : memref<16x16xf32, 2>` where address space 2 indicates workgroup memory. The IR shows the memory hierarchy through type annotations: global loads use `memref<?x?xf32>` while shared memory uses `memref<16x16xf32, 2>`. The `gpu.barrier` operation ensures all threads finish loading data before any thread reads from shared memory, enabling the cooperative pattern where all 256 threads (16×16) load one element each into the shared tile. Shared memory provides significant speedup over global memory (~20-40 cycle latency versus ~400-800 cycles, roughly 10-20× faster), which is why production kernels load tiles into shared memory and reuse data multiple times to dramatically reduce global memory traffic.
 
 ## 15.5 Softmax: Reductions and Block Cooperation
 
@@ -299,15 +299,15 @@ builder.create<gpu::BarrierOp>(loc);  // Barrier 2
 
 ```mlir
 gpu.func @softmax(...) kernel {
-  %shared_max = gpu.alloc() : memref<256xf32, 3>
-  %shared_sum = gpu.alloc() : memref<256xf32, 3>
+  %shared_max = gpu.alloc() : memref<256xf32, 2>
+  %shared_sum = gpu.alloc() : memref<256xf32, 2>
   
   // Each thread: compute local max → store
   memref.store %local_max, %shared_max[%tx]
   gpu.barrier  // Wait for all threads
   
-  // Thread 0: reduce to global max
-  scf.if %is_thread_0 { /* reduce shared_max */ }
+  // Thread 0: reduce to global max (simplified in example)
+  // In production: tree reduction loop here
   gpu.barrier  // Wait for thread 0
   
   // All threads: read global_max, compute exp and local sum
@@ -315,8 +315,8 @@ gpu.func @softmax(...) kernel {
   memref.store %local_sum, %shared_sum[%tx]
   gpu.barrier  // Wait for all threads
   
-  // Thread 0: reduce to global sum
-  scf.if %is_thread_0 { /* reduce shared_sum */ }
+  // Thread 0: reduce to global sum (simplified in example)
+  // In production: tree reduction loop here
   gpu.barrier  // Wait for thread 0
   
   // All threads: normalize using global_sum
@@ -325,7 +325,7 @@ gpu.func @softmax(...) kernel {
 }
 ```
 
-The softmax kernel uses four barriers positioned after computing the local max, after computing the global max, after computing local sums, and after computing the global sum. Shared memory allocated via `gpu.alloc() : memref<256xf32, 3>` enables thread communication, where address space 3 indicates workgroup memory accessible to all threads in the block. Each stage of the multi-stage algorithm depends on the previous barrier completing. The cooperative pattern follows a consistent rhythm: all threads contribute partial results, one thread (typically thread 0) performs the reduction, then all threads read the final result.
+The softmax kernel uses four barriers positioned after computing the local max, after computing the global max, after computing local sums, and after computing the global sum. Shared memory allocated via `gpu.alloc() : memref<256xf32, 2>` enables thread communication, where address space 2 indicates workgroup memory accessible to all threads in the block. Each stage of the multi-stage algorithm depends on the previous barrier completing. The cooperative pattern follows a consistent rhythm: all threads contribute partial results, one thread (typically thread 0) performs the reduction, then all threads read the final result.
 
 **Why Barriers Matter**. Without barriers, race conditions occur. For example, if Thread 0 begins the reduction phase before Thread 255 has finished writing its local maximum to `shared_max[255]`, Thread 0 will read stale or uninitialized data, leading to an incorrect global maximum:
 

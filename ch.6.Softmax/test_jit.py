@@ -137,46 +137,6 @@ def test_lowered_ir():
     print(ir[:1000])  # Print first 1000 chars
     print("... (truncated)")
 
-def benchmark():
-    """Simple performance comparison."""
-    print("\n=== Performance Benchmark ===")
-    import time
-
-    size = 10000
-    input_arr = np.random.randn(size).astype(np.float32)
-
-    def numpy_softmax(x):
-        exp_x = np.exp(x - np.max(x))
-        return exp_x / np.sum(exp_x)
-
-    # Warmup
-    _ = ch6_softmax.softmax(input_arr)
-    _ = numpy_softmax(input_arr)
-
-    # NumPy benchmark
-    start = time.time()
-    for _ in range(100):
-        result_numpy = numpy_softmax(input_arr)
-    numpy_time = time.time() - start
-
-    # MLIR JIT benchmark
-    start = time.time()
-    for _ in range(100):
-        result_mlir = ch6_softmax.softmax(input_arr)
-    mlir_time = time.time() - start
-
-    print(f"Vector size: {size}")
-    print(f"Iterations: 100")
-    print(f"NumPy time: {numpy_time:.4f}s")
-    print(f"MLIR time: {mlir_time:.4f}s")
-    print(f"Speedup: {numpy_time / mlir_time:.2f}x")
-
-    # Verify correctness
-    if np.allclose(result_numpy, result_mlir, rtol=1e-5):
-        print("✓ Results match")
-    else:
-        print("✗ Results differ!")
-
 if __name__ == "__main__":
     test_softmax_basic()
     test_softmax_large_values()
@@ -184,5 +144,3 @@ if __name__ == "__main__":
     test_softmax_random()
     test_ir_generation()
     test_lowered_ir()
-    benchmark()
-    print("\n=== All tests complete ===")

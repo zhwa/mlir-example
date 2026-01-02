@@ -46,7 +46,7 @@ namespace mlir {
 ///   4. Returns result as a new NumPy array
 ///
 /// Expected shapes: A is M×K, B is K×N, returns C as M×N
-py::array_t<float> gemm(py::array_t<float> A, py::array_t<float> B) {
+py::array_t<float> gemm(const py::array_t<float>& A, const py::array_t<float>& B) {
   // Get buffer info
   auto A_buf = A.request();
   auto B_buf = B.request();

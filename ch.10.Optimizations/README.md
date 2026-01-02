@@ -5,7 +5,7 @@
 Demonstrates **backend optimizations** on Chapter 9's NN dialect:
 - ✅ Same operations (`nn.matmul`, `nn.add`, `nn.relu`)
 - ✅ Same Python API (`forward()`)
-- ✅ **New**: Fusion + explicit vectorization
+- ✅ **New**: Fusion + auto-vectorization
 
 **Key Insight**: Real ML frameworks keep stable APIs while improving backends.
 
@@ -17,7 +17,8 @@ Merges adjacent operations to reduce memory traffic.
 ### 2. Loop Invariant Code Motion
 Hoists computations out of loops to avoid redundancy.
 
-### 3. Explicit Vectorization (NEW!)
+### 3. Auto-Vectorization Support
+Enables LLVM's auto-vectorizer by preparing loops (LICM) and providing vector lowering passes.
 Uses MLIR's `vector` dialect for SIMD instructions - converts scalar loops to vector operations that process 8 floats at once (AVX2).
 
 ## File Structure

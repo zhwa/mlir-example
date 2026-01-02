@@ -15,35 +15,33 @@ static Compiler& getCompiler() {
 }
 
 // Helper to marshal memref arguments (from Chapter 7)
-void marshal_memref_1d(std::vector<void*>& args, py::array_t<float> arr) {
+void marshal_memref_1d(std::vector<void*>& args, const py::array_t<float>& arr) {
     auto buf = arr.request();
     float* data = static_cast<float*>(buf.ptr);
-
-    args.push_back(data);  // allocated_ptr
-    args.push_back(data);  // aligned_ptr
-    args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(0)));  // offset
-    args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[0])));  // size
-    args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(1)));  // stride
+    args.emplace_back(data);  // allocated_ptr
+    args.emplace_back(data);  // aligned_ptr
+    args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(0)));  // offset
+    args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[0])));  // size
+    args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(1)));  // stride
 }
 
 void marshal_memref_2d(std::vector<void*>& args, py::array_t<float> arr) {
     auto buf = arr.request();
     float* data = static_cast<float*>(buf.ptr);
-
-    args.push_back(data);  // allocated_ptr
-    args.push_back(data);  // aligned_ptr
-    args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(0)));  // offset
-    args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[0])));  // size0
-    args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[1])));  // size1
-    args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[1])));  // stride0
-    args.push_back(reinterpret_cast<void*>(static_cast<intptr_t>(1)));  // stride1
+    args.emplace_back(data);  // allocated_ptr
+    args.emplace_back(data);  // aligned_ptr
+    args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(0)));  // offset
+    args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[0])));  // size0
+    args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[1])));  // size1
+    args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(buf.shape[1])));  // stride0
+    args.emplace_back(reinterpret_cast<void*>(static_cast<intptr_t>(1)));  // stride1
 }
 
 // libffi-based execute - handles ANY signature universally
 py::array_t<float> execute(const std::string& mlir_text,
                             const std::string& func_name,
-                            py::list inputs,
-                            py::tuple output_shape) {
+                            const py::list& inputs,
+                            const py::tuple& output_shape) {
     Compiler& compiler = getCompiler();
 
     auto module = compiler.parseMLIR(mlir_text);

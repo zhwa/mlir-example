@@ -5,7 +5,7 @@ This module converts high-level nn operations to standard MLIR:
   - nn.add → arith.addf (element-wise)
   - nn.mul → arith.mulf (element-wise)  
   - nn.matmul → linalg.matmul
-  - nn.relu → scf.for + arith.maximumf
+  - nn.relu → linalg.generic + arith.maximumf
   - nn.softmax → three-pass algorithm (from Chapter 6)
 """
 from graph_builder import Graph, TensorValue
@@ -149,15 +149,63 @@ class MLIRLowering:
 
         size = shape[0]
         memref_type = f"memref<{size}xf32>"
+        scalar_memref_type = "memref<f32>"
 
         # Allocate output
-        lines.append(f"{ind}%{result_id}_alloc = memref.alloc() : {memref_type}")
+        lines.append(f"{ind}%{result_id} = memref.alloc() : {memref_type}")
 
-        # Simplified version: use linalg.softmax if available, or manual implementation
-        # For learning purposes, we'll do a simplified version
-        lines.append(f"{ind}// TODO: Implement three-pass softmax algorithm")
-        lines.append(f"{ind}// For now, using placeholder")
-        lines.append(f"{ind}%{result_id} = memref.cast %{result_id}_alloc : {memref_type} to {memref_type}")
+        # 1. Find Max
+        lines.append(f"{ind}%max_alloc = memref.alloc() : {scalar_memref_type}")
+        lines.append(f"{ind}%neg_inf = arith.constant -3.40282347E+38 : f32")
+        lines.append(f"{ind}memref.store %neg_inf, %max_alloc[] : {scalar_memref_type}")
+        
+        lines.append(f"{ind}linalg.generic {{")
+        lines.append(f"{ind}  indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> ()>],")
+        lines.append(f"{ind}  iterator_types = [\"reduction\"]")
+        lines.append(f"{ind}}} ins(%{input_id} : {memref_type}) outs(%max_alloc : {scalar_memref_type}) {{")
+        lines.append(f"{ind}^bb0(%in: f32, %acc: f32):")
+        lines.append(f"{ind}  %max = arith.maximumf %in, %acc : f32")
+        lines.append(f"{ind}  linalg.yield %max : f32")
+        lines.append(f"{ind}}}")
+
+        # 2. Compute Exp(x - max)
+        lines.append(f"{ind}%exp_alloc = memref.alloc() : {memref_type}")
+        
+        lines.append(f"{ind}linalg.generic {{")
+        lines.append(f"{ind}  indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> ()>, affine_map<(d0) -> (d0)>],")
+        lines.append(f"{ind}  iterator_types = [\"parallel\"]")
+        lines.append(f"{ind}}} ins(%{input_id}, %max_alloc : {memref_type}, {scalar_memref_type})")
+        lines.append(f"{ind}  outs(%exp_alloc : {memref_type}) {{")
+        lines.append(f"{ind}^bb0(%in: f32, %max_val: f32, %dest: f32):")
+        lines.append(f"{ind}  %diff = arith.subf %in, %max_val : f32")
+        lines.append(f"{ind}  %exp = math.exp %diff : f32")
+        lines.append(f"{ind}  linalg.yield %exp : f32")
+        lines.append(f"{ind}}}")
+
+        # 3. Sum Exponentials
+        lines.append(f"{ind}%sum_alloc = memref.alloc() : {scalar_memref_type}")
+        lines.append(f"{ind}%c0 = arith.constant 0.0 : f32")
+        lines.append(f"{ind}memref.store %c0, %sum_alloc[] : {scalar_memref_type}")
+        
+        lines.append(f"{ind}linalg.generic {{")
+        lines.append(f"{ind}  indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> ()>],")
+        lines.append(f"{ind}  iterator_types = [\"reduction\"]")
+        lines.append(f"{ind}}} ins(%exp_alloc : {memref_type}) outs(%sum_alloc : {scalar_memref_type}) {{")
+        lines.append(f"{ind}^bb0(%in: f32, %acc: f32):")
+        lines.append(f"{ind}  %sum = arith.addf %in, %acc : f32")
+        lines.append(f"{ind}  linalg.yield %sum : f32")
+        lines.append(f"{ind}}}")
+
+        # 4. Normalize
+        lines.append(f"{ind}linalg.generic {{")
+        lines.append(f"{ind}  indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> ()>, affine_map<(d0) -> (d0)>],")
+        lines.append(f"{ind}  iterator_types = [\"parallel\"]")
+        lines.append(f"{ind}}} ins(%exp_alloc, %sum_alloc : {memref_type}, {scalar_memref_type})")
+        lines.append(f"{ind}  outs(%{result_id} : {memref_type}) {{")
+        lines.append(f"{ind}^bb0(%exp_val: f32, %sum_val: f32, %dest: f32):")
+        lines.append(f"{ind}  %norm = arith.divf %exp_val, %sum_val : f32")
+        lines.append(f"{ind}  linalg.yield %norm : f32")
+        lines.append(f"{ind}}}")
 
         return lines
 

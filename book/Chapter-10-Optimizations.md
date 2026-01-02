@@ -599,60 +599,62 @@ The pass calculates trip counts (`120 = (128 / 8) * 8`), generates a vectorized 
 
 Previous sections examined individual optimizations in isolation. Production pipelines compose them carefully, exploiting interactions and respecting dependencies. Let's analyze Chapter 10's complete pipeline, understanding why each pass appears where it does and what invariants each stage maintains.
 
-**The Pipeline Code**. From `ch.10.Optimizations/src/bindings.cpp`:
+**The Pipeline Code**. From [src/bindings.cpp](../ch.10.Optimizations/src/bindings.cpp):
 
 ```cpp
-void NNCompiler::lowerToLLVM(mlir::ModuleOp module) {
-  mlir::PassManager pm(&context);
-  
-  // Stage 1: Lower NN dialect to standard dialects
-  pm.addNestedPass<mlir::func::FuncOp>(nn::createConvertNNToStandardPass());
-  pm.addPass(mlir::createCanonicalizerPass());
-  
-  // Stage 2: Linalg optimizations (on tensors)
-  pm.addPass(mlir::createLinalgGeneralizeNamedOpsPass());
-  pm.addPass(mlir::createCanonicalizerPass());
-  pm.addNestedPass<mlir::func::FuncOp>(mlir::createLinalgElementwiseOpFusionPass());
-  pm.addPass(mlir::createCanonicalizerPass());
-  
-  // Stage 3: Bufferization (tensor → memref conversion)
-  DialectRegistry registry;
-  arith::registerBufferizableOpInterfaceExternalModels(registry);
-  linalg::registerBufferizableOpInterfaceExternalModels(registry);
-  tensor::registerBufferizableOpInterfaceExternalModels(registry);
-  bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(registry);
-  context.appendDialectRegistry(registry);
-  
-  bufferization::OneShotBufferizationOptions options;
-  options.bufferizeFunctionBoundaries = true;
-  pm.addPass(bufferization::createOneShotBufferizePass(options));
-  pm.addPass(bufferization::createBufferResultsToOutParamsPass());
-  pm.addPass(mlir::createCanonicalizerPass());
-  
-  // Stage 4: Lower to explicit loops (memrefs → SCF)
-  pm.addPass(mlir::createConvertLinalgToLoopsPass());
-  
-  // Stage 5: Loop optimizations
-  pm.addPass(mlir::createLoopInvariantCodeMotionPass());
-  pm.addPass(mlir::createCanonicalizerPass());
-  
-  // Stage 6: Handle vector operations (if any exist)
-  pm.addPass(mlir::createConvertVectorToSCFPass());
-  pm.addPass(mlir::createCanonicalizerPass());
-  
-  // Stage 7: Lower to LLVM
-  pm.addPass(createConvertVectorToLLVMPass());  // Vector → LLVM first
-  pm.addPass(mlir::createSCFToControlFlowPass());
-  pm.addPass(mlir::createFinalizeMemRefToLLVMConversionPass());
-  pm.addPass(mlir::createConvertFuncToLLVMPass());
-  pm.addPass(mlir::createArithToLLVMConversionPass());
-  pm.addPass(mlir::createConvertVectorToLLVMPass());
-  pm.addPass(mlir::createReconcileUnrealizedCastsPass());
-  
-  if (mlir::failed(pm.run(module))) {
-    llvm::errs() << "Lowering to LLVM failed\n";
-  }
-}
+    bool lowerToLLVM(ModuleOp module) {
+        PassManager pm(&context_);
+
+        // Register bufferization interfaces for tensor operations
+        DialectRegistry registry;
+        arith::registerBufferizableOpInterfaceExternalModels(registry);
+        linalg::registerBufferizableOpInterfaceExternalModels(registry);
+        tensor::registerBufferizableOpInterfaceExternalModels(registry);
+        bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(registry);
+        context_.appendDialectRegistry(registry);
+
+        // 1. Lower NN dialect to standard dialects (tensor-based linalg)
+        pm.addPass(createConvertNNToStandardPass());
+        pm.addPass(mlir::createCanonicalizerPass());
+
+        // 2. Linalg optimizations (on tensors before bufferization)
+        pm.addPass(mlir::createLinalgGeneralizeNamedOpsPass());
+        pm.addPass(mlir::createCanonicalizerPass());
+        pm.addPass(mlir::createLinalgElementwiseOpFusionPass());
+        pm.addPass(mlir::createCanonicalizerPass());
+
+        // 3. Bufferization: tensor → memref conversion
+        bufferization::OneShotBufferizePassOptions bufferizationOptions;
+        bufferizationOptions.bufferizeFunctionBoundaries = true;
+        pm.addPass(bufferization::createOneShotBufferizePass(bufferizationOptions));
+        pm.addPass(bufferization::createBufferResultsToOutParamsPass());
+        pm.addPass(mlir::createCanonicalizerPass());
+
+        // 4. Lower linalg to loops (now on memrefs)
+        pm.addPass(mlir::createConvertLinalgToLoopsPass());
+
+        // 5. SCF optimizations
+        pm.addPass(mlir::createLoopInvariantCodeMotionPass());
+        pm.addPass(mlir::createCanonicalizerPass());
+
+        // 6. Vectorization (NEW! Explicit SIMD)
+        // Convert vector operations to SCF (for unrolling/lowering)
+        pm.addPass(mlir::createConvertVectorToSCFPass());
+        pm.addPass(mlir::createCanonicalizerPass());
+
+        // 7. Lower to LLVM
+        pm.addPass(createConvertVectorToLLVMPass());  // Vector → LLVM first
+        pm.addPass(createConvertMathToLLVMPass());
+        pm.addPass(createConvertMathToLibmPass());
+        pm.addPass(createSCFToControlFlowPass());
+        pm.addPass(createArithToLLVMConversionPass());
+        pm.addPass(createConvertControlFlowToLLVMPass());
+        pm.addPass(createFinalizeMemRefToLLVMConversionPass());
+        pm.addPass(createConvertFuncToLLVMPass());
+        pm.addPass(createReconcileUnrealizedCastsPass());
+
+        return succeeded(pm.run(module));
+    }
 ```
 
 Seven stages, each with specific goals and invariants. Let's walk through them.
@@ -837,94 +839,78 @@ output = ch10.forward(result_tensor)  # Returns NumPy array
 
 The `Tensor` class doesn't compute immediately. Instead, it records operations in a **computation graph**—a directed acyclic graph (DAG) where nodes represent operations and edges represent data dependencies. This deferred execution pattern matches PyTorch's JIT and TensorFlow's graph mode: build a symbolic representation, compile once, execute many times.
 
-**Computation Graph Representation**. From [src/bindings.cpp](ch.10.Optimizations/src/bindings.cpp):
-
-```cpp
-enum class OpType {
-  Input,      // Leaf node: data provided by user
-  Matmul,     // Binary operation: lhs @ rhs
-  Add,        // Binary operation: lhs + rhs
-  Transpose,  // Unary operation: transpose(input)
-  Softmax,    // Unary operation: softmax(input)
-  Scale       // Unary operation: input * scale_factor
-};
-
-struct GraphNode {
-  OpType type;
-  std::vector<std::shared_ptr<GraphNode>> inputs;  // Dependencies
-  py::array_t<float> data;                          // For Input nodes
-  float scale_factor = 1.0f;                        // For Scale nodes
-  std::vector<int64_t> shape;                       // Output shape
-
-  GraphNode(OpType t) : type(t) {}
-};
-```
-
-Each node stores:
-- **Type**: What operation this represents
-- **Inputs**: Pointers to input nodes (empty for `Input` nodes, non-empty for operations)
-- **Data**: For leaf nodes (`Input`), the actual NumPy array
-- **Shape**: The output shape of this operation (inferred from inputs)
-
-**Graph Construction API**. The `Tensor` class provides methods building nodes:
+**Computation Graph Representation**. From [src/bindings.cpp](../ch.10.Optimizations/src/bindings.cpp):
 
 ```cpp
 class Tensor {
 public:
-  std::shared_ptr<GraphNode> node;
-
-  Tensor(py::array_t<float> data) {
-    node = std::make_shared<GraphNode>(OpType::Input);
-    node->data = data;
-    auto buf = data.request();
-    node->shape.resize(buf.ndim);
-    for (int i = 0; i < buf.ndim; i++) {
-      node->shape[i] = static_cast<int64_t>(buf.shape[i]);
+    // Constructor for input tensors (leaf nodes)
+    Tensor(py::array_t<float> data) 
+        : data_(data), op_type_("input"), is_computed_(true) {
+        auto buf = data.request();
+        for (ssize_t i = 0; i < buf.ndim; ++i) {
+            shape_.emplace_back(buf.shape[i]);
+        }
     }
-  }
 
-  Tensor(std::shared_ptr<GraphNode> n) : node(n) {}
+    // Constructor for operation nodes
+    Tensor(std::vector<ssize_t> shape, std::string op_type,
+           std::shared_ptr<Tensor> input1 = nullptr,
+           std::shared_ptr<Tensor> input2 = nullptr)
+        : shape_(shape), op_type_(op_type), is_computed_(false),
+          input1_(input1), input2_(input2) {}
 
-  // Operator overloading for arithmetic
-  Tensor add(const Tensor& other) const {
-    auto result_node = std::make_shared<GraphNode>(OpType::Add);
-    result_node->inputs = {node, other.node};
-    result_node->shape = node->shape;  // Assumes compatible shapes
-    return Tensor(result_node);
-  }
+    // ... accessors ...
 
-  const std::vector<int64_t>& shape() const { return node->shape; }
+private:
+    py::array_t<float> data_;
+    std::vector<ssize_t> shape_;
+    std::string op_type_;
+    bool is_computed_;
+    std::shared_ptr<Tensor> input1_;
+    std::shared_ptr<Tensor> input2_;
 };
 ```
 
-Each method creates a new node pointing to input nodes, returns a new `Tensor` wrapping that node. No computation happens—we're just building the graph.
+Each `Tensor` object represents a node in the graph. It stores:
+- **Op Type**: A string identifying the operation (`"input"`, `"add"`, `"matmul"`, etc.).
+- **Inputs**: Shared pointers to input tensors (dependencies).
+- **Shape**: The output shape of this operation.
+- **Data**: For leaf nodes (`"input"`), the actual NumPy array.
+
+**Graph Construction API**. The `Tensor` class and helper functions build the graph:
+
+```cpp
+// Operator overloading for arithmetic
+std::shared_ptr<Tensor> add(std::shared_ptr<Tensor> a, std::shared_ptr<Tensor> b) {
+    if (a->shape() != b->shape()) {
+        throw std::runtime_error("Shape mismatch for add");
+    }
+    return std::make_shared<Tensor>(a->shape(), "add", a, b);
+}
+
+// Higher-level operations
+std::shared_ptr<Tensor> matmul(std::shared_ptr<Tensor> a, std::shared_ptr<Tensor> b) {
+    // ... shape checks ...
+    std::vector<ssize_t> out_shape = {a->shape()[0], b->shape()[1]};
+    return std::make_shared<Tensor>(out_shape, "matmul", a, b);
+}
+```
+
+Each function creates a new `Tensor` pointing to its inputs, effectively building the DAG node by node. No computation happens—we're just recording the structure.
 
 **Python Bindings**. pybind11 exposes these methods to Python:
 
 ```cpp
-py::class_<Tensor>(m, "Tensor")
-  .def(py::init<py::array_t<float>>())
-  .def("__add__", &Tensor::add)
-  .def("__mul__", &Tensor::mul)
-  .def("shape", &Tensor::shape);
+py::class_<Tensor, std::shared_ptr<Tensor>>(m, "Tensor")
+    .def(py::init<py::array_t<float>>())
+    .def("__add__", &add)
+    .def("__mul__", &mul);
+
+m.def("matmul", &matmul);
 ```
 
-Python's `a + b` calls `Tensor.__add__()`, which calls the C++ `add()` method. This provides natural syntax hiding graph construction complexity.
-
-**Higher-Level Operations**. Operations like matmul, transpose, softmax are module-level functions:
-
-```cpp
-Tensor matmul(const Tensor& lhs, const Tensor& rhs) {
-  auto result_node = std::make_shared<GraphNode>(OpType::Matmul);
-  result_node->inputs = {lhs.node, rhs.node};
-  
-  // Shape inference: (M, K) @ (K, N) -> (M, N)
-  result_node->shape = {lhs.shape()[0], rhs.shape()[1]};
-  return Tensor(result_node);
-}
-```
-
-These functions follow the same pattern: create node, set inputs, infer output shape, return tensor. Shape inference is crucial—we need shapes to generate correct MLIR IR (allocating buffers, setting loop bounds).
+Python's `a + b` calls the C++ `add()` function, which returns a new `Tensor` representing the addition node.
 
 **Composing Operations**. With primitives defined, complex computations become straightforward compositions:
 
@@ -967,7 +953,7 @@ With the computation graph built, we now face the fundamental problem of executi
 
 ## 10.8 Topological Traversal: Ordering Computation Graphs
 
-Before we can execute or compile a computation graph, we must solve a fundamental problem: **determining execution order**. Operations have dependencies—an addition operation that consumes the output of a matrix multiplication cannot execute until the multiplication completes. This dependency structure forms a **directed acyclic graph (DAG)**, and executing it correctly requires **topological sorting**—ordering operations so dependencies execute before dependents. This section explains why topological traversal is essential for compilers, how the algorithm works, and how to implement it efficiently.
+Before we can execute or compile a computation graph, we must solve a fundamental problem: **determining execution order**. Operations have dependencies—an addition operation that consumes the output of a matrix multiplication cannot execute until the multiplication completes. This dependency structure forms a **directed acyclic graph (DAG)**, and executing it correctly requires **topological sorting**—ordering operations so dependencies execute before dependents.
 
 **The Ordering Problem**. Consider a simple computation graph:
 
@@ -977,229 +963,69 @@ a = input("a")
 b = input("b")
 c = matmul(a, b)      # c depends on a, b
 d = add(c, a)         # d depends on c, a
-e = relu(d)          # e depends on d
-result = softmax(e)  # result depends on e
 ```
 
-This defines a DAG:
+This defines a DAG where `d` depends on `c`, and `c` depends on `a` and `b`. We must compute `a` and `b` first, then `c`, then `d`.
 
-```
-  a ----→ c ----→ d ----→ e ----→ result
-  |       ↑
-  b ------┘
-```
+**Our Approach: Recursive DFS**. In our implementation (and frameworks like PyTorch), we build the graph using shared pointers. We hold the final `output` tensor, which points to its inputs, which point to their inputs. This structure naturally supports a **Depth-First Search (DFS)** traversal starting from the output.
 
-Multiple execution orders satisfy dependencies:
-- **Valid**: `[a, b, c, d, e, result]` or `[b, a, c, d, e, result]`
-- **Invalid**: `[c, a, b, ...]` (c before its inputs), `[a, d, b, ...]` (d before c)
+By visiting inputs *before* adding the current node to the list, we ensure a valid topological order.
 
-Compilers must find a valid order. Without it, operations would try reading uncomputed values, producing garbage results or crashing. This isn't theoretical—Chapter 9's `forward()` function (Section 9.8) assumes `graph.nodes` is already topologically sorted. If the graph arrives in arbitrary order, we must sort it first.
-
-**Why Topological Sorting Matters**. Beyond correctness, topological order affects performance:
-
-1. **Memory Efficiency**: Executing dependencies before dependents allows earlier freeing of intermediate buffers. Out-of-order execution forces keeping more values live simultaneously.
-
-2. **Optimization Opportunities**: Many compiler optimizations (fusion, common subexpression elimination) rely on knowing data flow. Topological order makes data dependencies explicit.
-
-3. **Parallelization**: Operations with no path between them in the DAG can execute concurrently. Topological sorting identifies these independent sets, enabling parallel execution.
-
-4. **JIT Compilation**: When compiling Python computation graphs (PyTorch, TensorFlow, JAX), users build graphs in arbitrary order. The compiler must sort before code generation.
-
-Every MLIR-based compiler performs topological sorting somewhere—either when building IR from high-level operations (Chapter 9, 11) or when scheduling passes (MLIR's PassManager does this internally for pass dependencies).
-
-**Kahn's Algorithm**. The standard topological sorting algorithm:
-
-```
-Algorithm: Kahn's Topological Sort
-Input: DAG with nodes N and edges E
-Output: Topologically sorted node list
-
-1. Compute in-degree for each node (number of incoming edges)
-2. Initialize queue Q with all nodes having in-degree 0 (no dependencies)
-3. Initialize empty result list L
-4. While Q is not empty:
-   a. Remove node n from Q
-   b. Append n to L
-   c. For each node m that n points to (n → m):
-      - Decrement m's in-degree
-      - If m's in-degree reaches 0, add m to Q
-5. If L contains all nodes, return L
-   Else, graph has a cycle (error)
-```
-
-The algorithm works by repeatedly selecting nodes with no remaining dependencies, adding them to the result, and "removing" them from the graph (decrementing dependents' in-degrees). This continues until all nodes are processed or a cycle is detected.
-
-**C++ Implementation**. Here's a practical implementation for computation graphs:
+**Implementation**. From [src/bindings.cpp](../ch.10.Optimizations/src/bindings.cpp):
 
 ```cpp
-struct GraphNode {
-  int id;
-  std::string op_type;
-  std::vector<int> inputs;   // IDs of input nodes
-  std::vector<int64_t> shape;
-};
+// Topological sort to get computation order
+std::vector<std::shared_ptr<Tensor>> inputs;
+std::vector<std::shared_ptr<Tensor>> ops;
+std::unordered_map<Tensor*, int> tensor_ids;
 
-struct ComputationGraph {
-  std::vector<GraphNode> nodes;
-  std::unordered_set<int> input_ids;  // Graph inputs (no dependencies)
-};
+std::function<void(std::shared_ptr<Tensor>)> collect;
+collect = [&](std::shared_ptr<Tensor> t) {
+    // 1. Memoization: Don't visit nodes twice
+    if (tensor_ids.find(t.get()) != tensor_ids.end()) return;
 
-// Returns nodes in topological order, or empty vector if cycle detected
-std::vector<GraphNode> topologicalSort(const ComputationGraph& graph) {
-  // Build adjacency list and compute in-degrees
-  std::unordered_map<int, std::vector<int>> adj;  // node_id → dependent_ids
-  std::unordered_map<int, int> in_degree;         // node_id → in_degree
-  std::unordered_map<int, const GraphNode*> node_map;  // id → node
-  
-  // Initialize
-  for (const auto& node : graph.nodes) {
-    node_map[node.id] = &node;
-    in_degree[node.id] = 0;
-  }
-  
-  // Build adjacency list and count in-degrees
-  for (const auto& node : graph.nodes) {
-    for (int input_id : node.inputs) {
-      adj[input_id].push_back(node.id);
-      in_degree[node.id]++;
-    }
-  }
-  
-  // Find all nodes with in-degree 0 (inputs or constants)
-  std::queue<int> ready;
-  for (const auto& [id, degree] : in_degree) {
-    if (degree == 0 || graph.input_ids.count(id)) {
-      ready.push(id);
-    }
-  }
-  
-  // Kahn's algorithm
-  std::vector<GraphNode> sorted;
-  while (!ready.empty()) {
-    int node_id = ready.front();
-    ready.pop();
-    
-    sorted.push_back(*node_map[node_id]);
-    
-    // Process dependents
-    for (int dependent_id : adj[node_id]) {
-      in_degree[dependent_id]--;
-      if (in_degree[dependent_id] == 0) {
-        ready.push(dependent_id);
-      }
-    }
-  }
-  
-  // Check for cycles
-  if (sorted.size() != graph.nodes.size()) {
-    // Cycle detected: some nodes still have in-degree > 0
-    return {};  // Empty vector indicates error
-  }
-  
-  return sorted;
-}
-```
-
-**Using Topological Sort in MLIR**. Chapter 9's `forward()` function can now handle arbitrary graph ordering:
-
-```cpp
-py::array_t<float> forward(const Tensor& output_tensor) {
-  // ... context setup ...
-  
-  // Sort graph topologically
-  auto sorted_nodes = topologicalSort(graph);
-  if (sorted_nodes.empty()) {
-    throw std::runtime_error("Computation graph has a cycle!");
-  }
-  
-  // Build MLIR operations in topological order
-  std::map<int, Value> valueMap;
-  for (const auto& node : sorted_nodes) {
-    if (graph.input_ids.count(node.id)) {
-      // Input node: map to function argument
-      valueMap[node.id] = /* ... function argument ... */;
+    if (t->is_input()) {
+        // Leaf node: Add to inputs list
+        tensor_ids[t.get()] = inputs.size();
+        inputs.emplace_back(t);
     } else {
-      // Operation node: inputs are guaranteed to be in valueMap
-      Value lhs = valueMap[node.inputs[0]];
-      Value rhs = valueMap[node.inputs[1]];
-      Value output = /* ... create operation ... */;
-      valueMap[node.id] = output;
+        // Operation node: Visit children (dependencies) FIRST
+        if (t->input1()) collect(t->input1());
+        if (t->input2()) collect(t->input2());
+        
+        // After children are processed, add self to ops list
+        tensor_ids[t.get()] = inputs.size() + ops.size();
+        ops.emplace_back(t);
     }
-  }
-  
-  // ... compilation and execution ...
-}
+};
+
+// Start traversal from the output node
+collect(output);
 ```
 
-The key insight: after topological sorting, `valueMap[node.inputs[i]]` is guaranteed to exist because input nodes were processed earlier in the sorted order.
+**How It Works**:
+1.  **Start at Output**: We call `collect(output)`.
+2.  **Recursive Descent**: Before processing `output`, we recursively call `collect` on its inputs.
+3.  **Base Case**: When we reach a leaf node (input tensor), we add it to the `inputs` list.
+4.  **Post-Order Collection**: After returning from the recursive calls (meaning all dependencies are processed), we add the current node to the `ops` list.
 
-**Complexity Analysis**. Kahn's algorithm is efficient:
+This guarantees that for any node `N`, all its inputs are in the `inputs` list or `ops` list *before* `N` is added.
 
-- **Time**: O(V + E) where V = number of nodes, E = number of edges. Each node and edge is visited exactly once.
-- **Space**: O(V) for in-degree map and result list.
-
-For typical computation graphs (hundreds to thousands of operations), this is negligible compared to compilation and execution time.
-
-**Alternative: Depth-First Search**. Another topological sorting approach uses post-order DFS:
+**Why This Matters**. This sorted list allows us to generate MLIR linearly:
 
 ```cpp
-void dfsVisit(int node_id, 
-              const std::unordered_map<int, std::vector<int>>& adj,
-              std::unordered_set<int>& visited,
-              std::unordered_set<int>& in_stack,
-              std::vector<int>& post_order) {
-  if (in_stack.count(node_id)) {
-    throw std::runtime_error("Cycle detected");
-  }
-  if (visited.count(node_id)) return;
-  
-  visited.insert(node_id);
-  in_stack.insert(node_id);
-  
-  for (int dependent_id : adj[node_id]) {
-    dfsVisit(dependent_id, adj, visited, in_stack, post_order);
-  }
-  
-  in_stack.erase(node_id);
-  post_order.push_back(node_id);  // Add after all dependents
-}
-
-std::vector<int> topologicalSortDFS(const ComputationGraph& graph) {
-  std::unordered_map<int, std::vector<int>> adj;
-  for (const auto& node : graph.nodes) {
-    for (int input_id : node.inputs) {
-      adj[input_id].push_back(node.id);
-    }
-  }
-  
-  std::unordered_set<int> visited, in_stack;
-  std::vector<int> post_order;
-  
-  for (const auto& node : graph.nodes) {
-    if (!visited.count(node.id)) {
-      dfsVisit(node.id, adj, visited, in_stack, post_order);
-    }
-  }
-  
-  // Post-order traversal is reverse topological order
-  std::reverse(post_order.begin(), post_order.end());
-  return post_order;
+// Build MLIR operations in topological order
+for (size_t i = 0; i < ops.size(); ++i) {
+    auto& op = ops[i];
+    // Inputs are guaranteed to be in valueMap already!
+    Value input1 = valueMap[op->input1().get()];
+    // ... generate op ...
 }
 ```
 
-DFS-based sorting is slightly harder to understand but has the same O(V + E) complexity. Kahn's algorithm is more intuitive ("repeatedly process nodes with no dependencies") and naturally detects cycles, making it preferable for beginners.
+Without this sort, we might try to look up an input in `valueMap` before it has been created, causing a crash.
 
-**Practical Considerations**. In real compilers:
-
-1. **Caching**: If the graph structure doesn't change, cache the sorted order and reuse across compilations.
-
-2. **Incremental Updates**: When adding new operations to a graph, you can update topological order incrementally rather than re-sorting from scratch.
-
-3. **Multiple Valid Orders**: Kahn's algorithm finds one topological order, but many may exist. Some orders may be better for performance (e.g., grouping operations that can fuse). Advanced compilers use heuristics to select good orders.
-
-4. **MLIR's Ordering**: MLIR operations within a block are inherently in topological order (SSA form ensures definitions precede uses). The PassManager uses topological sorting for pass dependencies, not operation scheduling.
-
-Topological sorting is a fundamental algorithm every compiler engineer must understand. It bridges the gap between user-written computation graphs (arbitrary order) and executable IR (dependencies-respecting order), enabling everything else—optimization, parallelization, execution—to work correctly.
+**Comparison with Kahn's Algorithm**. You may see "Kahn's Algorithm" (counting in-degrees) in other contexts. That approach is useful when you have an explicit list of all nodes but don't know the root. In our case, since we hold the `output` node (the root of the DAG), recursive DFS is simpler and more efficient.
 
 ## 10.9 Summary
 

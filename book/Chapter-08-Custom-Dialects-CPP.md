@@ -417,6 +417,26 @@ linalg.generic {
 
 The operation has **one** input and one output (unary operation). The region block receives two arguments: `%arg0` from the input tensor, `%arg1` from the output (unused here). We compute `max(%arg0, 0)` and yield the result. The unary pattern is common for activations, normalizations, and other element-wise transformations. Linalg's generality handles binary, unary, or even ternary operations uniformly—adjust the `ins` and `outs` lists, and the region signature changes accordingly.
 
+**Softmax Lowering**. Softmax is more complex, requiring a three-pass algorithm for numerical stability: (1) find max, (2) compute exp(x-max) and sum, (3) normalize. We implement this by chaining `linalg.generic` operations with reduction iterators.
+
+For the reduction steps (finding max and sum), we use `linalg.generic` with `iterator_types = ["reduction"]`. This tells the compiler that the operation reduces dimensions. For example, finding the maximum value of a 1D tensor:
+
+```mlir
+linalg.generic {
+  indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> ()>],
+  iterator_types = ["reduction"]
+} ins(%input : memref<4xf32>)
+  outs(%max_alloc : memref<f32>) {
+^bb0(%in: f32, %acc: f32):
+  %max = arith.maximumf %in, %acc : f32
+  linalg.yield %max : f32
+}
+```
+
+The indexing maps show that the input is accessed by index `d0`, while the output (scalar accumulator) is accessed by `()`. The reduction iterator implies that `d0` is the reduction dimension. Inside the region, `%acc` holds the running maximum, which we update with `arith.maximumf`.
+
+This pattern—chaining structured operations—is powerful. We build complex algorithms like Softmax from simple, composable primitives (generic, map, reduce) without ever writing a loop.
+
 **Comparison with Chapter 7**. In Chapter 7, we generated ReLU using explicit `scf.for` loops, `memref.load`, `arith.cmpf`, `arith.select`, and `memref.store`. The generated IR involved multiple operations for 2D ReLU. Here, one `linalg.generic` expresses the same computation at a higher level. The difference isn't just verbosity—it's analyzability. Pattern matchers can detect "matmul followed by relu" when both are structured operations. With explicit loops, the pattern is buried in imperative code. Optimizers can fuse the two `linalg.generic` operations (matmul and relu), eliminating the intermediate buffer write. With explicit loops, fusion requires complex dependence analysis.
 
 This demonstrates the custom dialect's value proposition: operations remain at appropriate abstraction levels through multiple compilation stages. High-level `nn` dialect captures user intent, mid-level Linalg captures computational patterns, low-level SCF captures control flow, and LLVM captures machine instructions. Each level enables different optimizations and analyses. MLIR's multi-level design isn't an abstraction for abstraction's sake—it's a tool for managing compilation complexity by separating concerns across layers.
