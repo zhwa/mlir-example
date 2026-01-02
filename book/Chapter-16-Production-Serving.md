@@ -261,7 +261,7 @@ A radix tree is a **compressed trie** where each node stores one token and its c
 
 **Key Properties**. The tree has several important properties enabling efficient prefix sharing. All requests starting with the same prefix share the same nodes—for example, requests beginning with [1, 2, 3] share those three nodes. Each complete path from root to leaf is unique, ensuring unambiguous request identification. Finding a cached prefix takes linear time in sequence length, making lookup $O(m)$ where m is the query sequence length.
 
-Comparison to alternatives:
+**Comparison to Alternative Caching Strategies**:
 
 | Strategy | Structure | Lookup | Memory | Best For |
 |----------|-----------|--------|--------|----------|
@@ -410,7 +410,7 @@ Naive FCFS:
 
 ### 16.5.2 Chunking Strategy
 
-Divide each prompt into fixed-size chunks (e.g., 256 tokens), process round-robin across requests. This provides bounded wait time—no request waits longer than one chunk duration. All requests advance at similar rates with proportional progress, though overhead slightly increases due to multiple kernel launches.
+The solution is to divide each prompt into fixed-size chunks (e.g., 256 tokens) and process them round-robin across all waiting requests. This provides bounded wait time—no request waits longer than one chunk duration. All requests advance at similar rates with proportional progress, though overhead slightly increases due to multiple kernel launches.
 
 Tradeoffs:
 
@@ -503,7 +503,7 @@ Different phases need different batch sizes—small for compute-bound prefill to
 
 ### 16.6.2 Scheduling Fundamentals
 
-Prefill uses FCFS with token budget to maintain fairness while preventing long prompts from monopolizing resources. Decode uses greedy batch formation up to max batch size, maximizing throughput by saturating memory bandwidth.
+The different phase characteristics necessitate different scheduling strategies. Prefill uses FCFS (First-Come-First-Served) with token budget constraints to maintain fairness while preventing long prompts from monopolizing resources. The token budget caps the total tokens processed in a single iteration, ensuring predictable memory usage and latency bounds. Decode uses greedy batch formation up to max batch size, maximizing throughput by saturating memory bandwidth with as many concurrent requests as possible. Since each request generates exactly one token per iteration, the batch size directly determines parallelism.
 
 ### 16.6.3 Implementation: Two-Phase Managers
 
@@ -590,7 +590,13 @@ Requests transition seamlessly from prefill to decode—completed prefills immed
 
 ## 16.7 Complete System Integration
 
+Previous sections introduced individual components—paged KV cache, continuous batching, radix cache, chunked prefill, and two-phase scheduling. This section shows how these pieces fit together into a coherent serving system. The integration is non-trivial: components must cooperate to manage shared resources (GPU memory, compute capacity), coordinate request state transitions (waiting → prefill → decode → finished), and balance competing objectives (throughput vs latency, fairness vs efficiency).
+
+The architecture follows a layered design where each component has well-defined responsibilities and clean interfaces. Higher layers handle scheduling and orchestration using Python for expressiveness and rapid development. Lower layers implement performance-critical operations in C++/MLIR for computational efficiency. This separation of concerns makes the system maintainable—scheduling logic can evolve independently of execution kernels, and execution optimizations don't require modifying scheduling algorithms.
+
 ### 16.7.1 NanoServing Architecture
+
+The serving engine organizes computation as a pipeline where requests flow through multiple stages, each handling a specific aspect of the serving process. Understanding this dataflow is essential to comprehending how production LLM serving works.
 
 ```
 ┌─────────────────────────────────────────────────┐
@@ -616,7 +622,15 @@ Requests transition seamlessly from prefill to decode—completed prefills immed
 └─────────────────────────────────────────────────┘
 ```
 
+The pipeline architecture reveals how serving systems compose simple components into sophisticated behavior. Each stage performs a focused task: the request queue provides a buffer absorbing bursts of incoming requests; radix cache lookup identifies reusable computation from previous requests; KV pool allocation reserves GPU memory for the new request's state; chunked prefill manager ensures fair scheduling across mixed request sizes; decode manager batches running requests for parallel token generation; the model executor runs the actual transformer forward passes; radix cache insertion preserves completed work for future reuse; and the response queue accumulates finished requests for client retrieval.
+
+The vertical flow represents request lifecycle progression. New requests enter at the top and flow downward through processing stages, accumulating computed state (KV cache entries, generated tokens) as they proceed. Requests spending time in prefill and decode stages consume the majority of execution time—these are the hot paths that determine overall system throughput. The radix cache provides a cross-cutting concern, allowing requests to skip computation by reusing cached state from structurally similar predecessors.
+
+Resource management threads through the entire pipeline. The KV pool tracks memory allocation, the radix cache manages sharing and eviction, and the schedulers enforce capacity limits. These components continuously communicate—the prefill manager queries the KV pool before admitting requests, the radix cache may trigger eviction to free memory, and the decode manager adjusts batch size based on available capacity. This coordination ensures the system never exceeds physical limits while maximizing utilization of available resources.
+
 ### 16.7.2 NanoServingEngine Implementation
+
+The `NanoServingEngine` class implements this architecture, coordinating all components through three primary methods: initialization establishes component instances and configures their parameters, request admission handles incoming work by checking cache and allocating memory, and the main serving loop executes iterative processing to make incremental progress on all active requests.
 
 ```python
 class NanoServingEngine:
@@ -669,11 +683,23 @@ class NanoServingEngine:
             self.step()
 ```
 
-The `add_request()` method performs radix cache lookup, page allocation, and prefill queue insertion. The `step()` method executes prefill chunks, handles transitions, runs decode batches, and performs cleanup. The `serve()` method runs a continuous loop maintaining high utilization.
+**Initialization and Configuration**. The constructor establishes the serving infrastructure by instantiating and configuring all subsystems. The model executor wraps the MLIR-compiled GPT from Chapters 1-15, providing a forward pass interface that accepts input token IDs and position indices, returning logits for next token prediction. The KV pool allocates paged memory on the GPU—page size determines granularity (16 tokens is typical), and total pages derive from available GPU memory. The radix cache wraps the KV pool, managing the prefix tree structure and LRU eviction policy. The chunked prefill manager enforces a token budget (typically 512 tokens) to bound per-iteration memory usage and prevent long prefills from monopolizing the GPU. The decode manager specifies maximum batch size (often 128-256 concurrent requests) to saturate memory bandwidth during token generation.
+
+These configuration parameters fundamentally shape system behavior. Smaller token budgets increase scheduling fairness at the cost of slightly reduced throughput, while larger budgets maximize compute efficiency but may create head-of-line blocking. Smaller chunk sizes provide finer-grained interleaving between prefill and decode, improving responsiveness for interactive workloads. Larger batch sizes increase decode throughput by amortizing memory access costs across more requests, but may increase latency for individual requests. Production systems often expose these as tunable parameters, allowing operators to optimize for their specific workload characteristics.
+
+**Request Admission**. The `add_request()` method handles new request arrival through a three-step process. First, radix cache lookup finds the longest matching prefix in the cache tree—this may be zero (cache miss), partial (some prefix cached), or complete (full prompt cached, rare but possible in exact duplicates). The matched length determines how many tokens can skip computation. Second, memory allocation reserves KV pages for uncached tokens plus expected generation length. The allocation may trigger LRU eviction if memory pressure is high—the system preferentially evicts cold prefixes (rarely accessed leaf nodes) while preserving hot prefixes (frequently accessed internal nodes). Third, queue insertion adds the request to the prefill manager, making it eligible for scheduling in subsequent iterations.
+
+The admission logic demonstrates how radix caching provides transparent optimization. From the client's perspective, requests simply get queued for processing. Internally, the system examines structural similarities with previous requests, reusing computation when possible. Requests sharing a 1000-token system prompt might skip 98% of prefill work, but the client sees identical behavior whether the cache hits or misses. This transparency is valuable—serving logic remains simple while opportunistic optimization happens automatically.
+
+**Main Serving Loop**. The `step()` method performs one iteration of the continuous batching cycle, coordinating both prefill and decode phases. Phase 1 processes prefill chunks: the chunked prefill manager selects requests and chunk sizes respecting the token budget, the model executor runs the forward pass computing KV cache for those tokens, and completion detection identifies requests finishing their prefill. Completed requests undergo three actions: sample the first output token from prefill logits, insert the completed prompt into the radix cache for future reuse, and transition to the decode manager for subsequent token generation.
+
+Phase 2 handles decode generation: the decode manager forms a batch from all running requests (up to max batch size), the model executor computes logits using cached KV entries and new tokens, sampling produces next tokens which extend each request's output, and completion detection identifies finished requests. Cleanup deallocates KV pages for finished requests, returning them to the pool for reuse. The critical insight is that both phases execute within a single iteration—the serving loop interleaves prefill chunks with decode batches, ensuring all requests make progress regardless of their current phase.
+
+The `serve()` method implements the outermost loop, continuously calling `step()` to process all queued and running requests. This simple infinite loop represents the core of production serving: iterate forever, processing whatever work exists, maintaining high GPU utilization through dynamic batching and fair scheduling. Real systems add error handling, graceful shutdown, metrics collection, and health checks around this core loop, but the fundamental pattern remains—continuous iteration making incremental progress on the active request set.
 
 ### 16.7.3 Request Dataflow
 
-Complete lifecycle demonstrating all components working together:
+Understanding a concrete example clarifies how abstract components interact during actual request processing. Consider a request with a partially cached prompt.
 
 ```
 1. [Client] Submit: prompt_tokens=[1..10, 20, 21, 22], max_tokens=50
@@ -704,11 +730,17 @@ Complete lifecycle demonstrating all components working together:
    Note: Cached prefix [1..10, 20, 21, 22] remains in tree
 ```
 
-Requests transition through three states (waiting → prefill → decode) with automatic phase transitions based on cached_len.
+This trace reveals several key system behaviors. The radix cache provides automatic optimization—step 2 discovers that 10 of 13 prompt tokens are already cached, reducing prefill work by 77%. This optimization is transparent to the client and opportunistic based on previous request patterns. Memory allocation uses page-level granularity—53 tokens require 4 pages (assuming 16-token pages), with the last page partially filled. This demonstrates how paging trades perfect memory efficiency for allocation flexibility.
+
+The prefill-to-decode transition happens automatically based on state. When `cached_len` reaches `len(prompt_tokens)`, the request has completed prefill and immediately joins the decode batch. No explicit state machine or transition logic—the condition `cached_len == len(prompt_tokens)` serves as the transition predicate. This elegant design avoids complex state tracking; request progress naturally determines phase membership.
+
+Decode iterations show the batching pattern. Step 4 processes 50 iterations generating one token each, but the request shares the batch with other concurrent requests. If 32 requests run simultaneously, each iteration generates 32 tokens total—high GPU utilization through parallel processing. The trace focuses on one request for clarity, but production serving typically processes dozens to hundreds of requests per iteration, amortizing overhead across large batches.
+
+Completion and cleanup demonstrate resource lifecycle management. The request finishes when it reaches max tokens or generates an end-of-sequence marker, triggering deallocation of its KV pages (4 pages returned to the pool). However, the radix cache entry persists—the path [1..10, 20, 21, 22] remains in the tree for future requests to reuse. This persistence is valuable: if 100 requests share this prefix, the first request pays the computation cost while subsequent 99 requests benefit from the cached state.
 
 ### 16.7.4 Performance Summary
 
-Each optimization addresses a specific bottleneck:
+Each algorithmic component addresses a specific performance bottleneck, and their effects compose multiplicatively rather than additively. Understanding the individual contributions clarifies why production serving achieves such dramatic speedups over naive implementations.
 
 **KV Cache**: Eliminates O(N²) redundant attention computation → O(N) incremental updates (5-6× reduction per request).
 
@@ -718,19 +750,34 @@ Each optimization addresses a specific bottleneck:
 
 **Chunked Prefill**: Trades ~10% throughput for 8× better tail latency by preventing long prompts from starving short ones.
 
-**Paged Memory**: Avoids worst-case allocation. Typical capacity increase: 5-10× more concurrent users on same hardware.
+**Paged Memory**: Avoids worst-case allocation, allocating based on actual usage rather than theoretical maximum. Typical capacity increase: 5-10× more concurrent users on same hardware.
 
-**Combined impact**: These techniques compose multiplicatively—naive sequential processing vs. optimized serving shows ~100× improvement on typical production workloads.
+**Combined Impact**. These optimizations compose multiplicatively. Consider a workload with 32 concurrent requests, 100-token prompts with 60% prefix sharing, and 20-token generation lengths. Naive sequential processing would perform 32 × 120 = 3,840 total forward passes (one per token per request). KV caching reduces this to 32 × (100 + 20) since we avoid recomputing attention for cached tokens. Parallel batching with continuous scheduling reduces the iteration count further by processing multiple requests simultaneously—now we need approximately 120 iterations (100 for longest prefill + 20 for decode). Radix caching with 60% sharing reduces prefill cost by nearly 60%, saving around 1,920 forward passes. The cumulative effect yields roughly 30× speedup from combining these techniques.
+
+The multiplicative composition is crucial. Applying only KV caching gives moderate improvement. Adding only continuous batching provides another modest gain. But combining all techniques—paged memory enabling high concurrency, continuous batching maintaining GPU saturation, radix caching eliminating redundant computation, and chunked prefill ensuring fairness—creates the dramatic performance profile users experience in production LLM serving systems. Each optimization unlocks additional capacity that subsequent optimizations can exploit.
+
+**Workload Sensitivity**. The relative impact of each technique depends heavily on workload characteristics. Radix caching shines on workloads with substantial prefix sharing (chatbots, few-shot prompting, document Q&A) but provides little benefit for entirely unique requests (creative writing, diverse queries). Chunked prefill dramatically improves tail latency when request sizes vary widely but adds overhead when all requests are similar length. Continuous batching provides maximum benefit when generation lengths differ substantially, allowing short requests to complete and free capacity for new work. Paged memory helps most when actual usage varies widely from theoretical maximum, reducing waste from over-allocation.
+
+Production serving systems must tune these components for their specific workload patterns. Interactive chat applications prioritize low latency, so they use smaller batch sizes, aggressive chunking, and careful radix cache tuning. Batch document processing prioritizes throughput, favoring larger batches, minimal chunking overhead, and less frequent eviction. Most deployments fall somewhere between these extremes, requiring measurement and profiling to find optimal parameters.
 
 ## 16.8 Conclusion
 
-This chapter demonstrated production LLM serving through concept-implementation pairs:
+This chapter demonstrated production LLM serving through six integrated concepts, each addressing a specific bottleneck in naive implementations:
 
-1. **Request lifecycle**: State tracking abstraction + Request/Batch classes
-2. **Paged KV cache**: Virtual memory analogy + C++ pool with page tables
-3. **Continuous batching**: Dynamic batch formation solving static batching waste
-4. **Radix cache**: Prefix tree structure + arena-based nodes with LRU eviction
-5. **Chunked prefill**: Divisible computation + round-robin scheduling for fairness
-6. **Complete integration**: NanoServingEngine coordinating all components
+1. **Request lifecycle**: The state tracking abstraction (Request and Batch classes) provides clean interfaces for managing user tasks through their lifecycle, encapsulating the complexity of phase transitions and progress tracking.
 
-Paged memory avoids worst-case allocation. Continuous batching maintains GPU utilization through dynamic scheduling. Radix cache exploits prefix sharing in workloads with common prompts. Chunked prefill provides bounded latency through divisible computation. Production systems like vLLM, SGLang, and TensorRT-LLM use these fundamental techniques with hardware-specific optimizations. Understanding the algorithmic core provides the foundation for exploring production implementations.
+2. **Paged KV cache**: Virtual memory techniques applied to attention cache eliminate fragmentation and enable flexible allocation. The page table indirection costs essentially nothing while dramatically improving memory utilization.
+
+3. **Continuous batching**: Dynamic admission and eviction maintains consistently high GPU utilization regardless of varying generation lengths. The key insight—one token per request per iteration—enables seamless batch composition changes.
+
+4. **Radix cache**: Tree-based prefix sharing automatically detects and reuses computation from structurally similar requests. The arena-based implementation provides efficient memory management without complex reference counting.
+
+5. **Chunked prefill**: Breaking long prompts into schedulable chunks prevents head-of-line blocking. The round-robin strategy ensures fairness with minimal overhead.
+
+6. **System integration**: The NanoServingEngine coordinates all components through a clean pipeline architecture, demonstrating how individual optimizations compose into a complete serving system.
+
+The progression from individual techniques to complete integration reveals an important lesson: production systems achieve their performance through composition of orthogonal optimizations. Each technique addresses a different bottleneck, enabling the next optimization to have greater effect. Paged memory enables higher concurrency, continuous batching keeps the GPU saturated with that concurrency, radix caching reduces the actual computation needed, and chunked prefill ensures fairness across heterogeneous workloads.
+
+This chapter completes the journey from compiler foundations to production deployment. Chapters 1-15 built the MLIR infrastructure for efficient model execution—dynamic shapes, bufferization, custom dialects, and GPU concepts. Chapter 16 showed how compiled models integrate into serving systems that orchestrate multiple concurrent requests. The compiler optimizes individual operations; the serving system optimizes resource allocation across requests. Together, they enable the interactive AI applications users experience today.
+
+Production systems like vLLM, SGLang, and TensorRT-LLM extend these foundations with hardware-specific optimizations: custom CUDA kernels for paged attention, multi-GPU tensor parallelism for large models, and sophisticated scheduling policies for complex workloads. Understanding the algorithmic core presented here—the fundamental data structures, scheduling policies, and resource management strategies—provides the foundation for exploring those production implementations with confidence. The techniques are universal; the implementations vary by hardware and workload requirements.
